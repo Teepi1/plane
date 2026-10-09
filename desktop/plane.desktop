@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Plane
+Comment=One window for all your Claude Code sessions
+Exec=@PLANE@ open
+Icon=plane
+Terminal=false
+Categories=Development;
+StartupWMClass=plane

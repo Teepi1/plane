@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Plane recovery check
+Comment=After login, list Claude sessions a crash or reboot cut off, and handoffs still waiting
+Exec=@PLANE@ recover
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

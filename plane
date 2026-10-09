@@ -1,0 +1,1434 @@
+#!/usr/bin/env python3
+"""plane: one kitty window for all your Claude Code sessions.
+
+  plane open                      focus the Plane window, or launch it
+  plane sidebar                   the sidebar TUI (runs inside the Plane window)
+  plane start --cwd DIR           start a background session in the session pane
+  plane focus left|right|up|down  move focus between Plane's panes (Super+arrows)
+  plane handoff add --title T     queue a handoff prompt read from stdin
+  plane statusline                Claude Code statusLine command; records usage
+  plane track start|prompt|end    Claude Code hook: keep the ledger of running sessions
+  plane recover                   at login: notify about interrupted sessions + handoffs
+"""
+import argparse
+import curses
+import json
+import os
+import pty
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+CLAUDE_DIR = HOME / ".claude"
+DATA = HOME / ".local/share/plane"
+HANDOFFS = DATA / "handoffs"
+DONE = HANDOFFS / "done"
+CACHE = HOME / ".cache/plane"
+USAGE = CACHE / "usage.json"
+LIVE = DATA / "live"  # one file per session that was running; one left behind = interrupted
+RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+SOCK = RUNTIME / "plane-kitty.sock"
+CLASS = "plane"
+SIDEBAR_COLS = 38
+SELF = str(Path(__file__).resolve())
+
+
+def claude_bin():
+    return shutil.which("claude") or str(HOME / ".local/bin/claude")
+
+
+def read_json(path, default=None):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.replace(tmp, path)
+
+
+def ppid_of(pid):
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return int(stat.rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def hypr(*args):
+    """Hyprland is optional: without it, window focusing outside Plane is skipped."""
+    try:
+        return subprocess.run(["hyprctl", *args], capture_output=True, text=True, timeout=5)
+    except OSError:
+        return subprocess.CompletedProcess(args, 127, "", "hyprctl not found")
+
+
+def hypr_clients():
+    try:
+        return json.loads(hypr("clients", "-j").stdout)
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return []
+
+
+def hypr_dispatch(lua, *classic):
+    """Hyprland 0.56+ takes Lua dispatches; older versions take the classic form."""
+    r = hypr("dispatch", lua)
+    out = (r.stdout + r.stderr).lower()
+    if r.returncode != 0 or "invalid" in out or "error" in out:
+        hypr("dispatch", *classic)
+
+
+def hypr_focus(selector):
+    hypr_dispatch(f'hl.dsp.focus({{ window = "{selector}" }})', "focuswindow", selector)
+
+
+def hypr_move_focus(direction):
+    hypr_dispatch(f'hl.dsp.focus({{ direction = "{direction}" }})', "movefocus", direction[0])
+
+
+# ---------------------------------------------------------------- open
+
+def cmd_open(_args):
+    if any(c.get("class") == CLASS for c in hypr_clients()):
+        hypr_focus(f"class:^({CLASS})$")
+        return
+    if SOCK.exists() and kitty("focus-window", "--match", "cmdline:sidebar").returncode == 0:
+        return  # already open (no Hyprland to ask): kitty raises it
+    SOCK.unlink(missing_ok=True)
+    subprocess.Popen(
+        ["kitty", "--class", CLASS, "--title", "Plane",
+         "-o", "allow_remote_control=socket-only",
+         "--listen-on", f"unix:{SOCK}",
+         "-o", "enabled_layouts=splits",
+         "--directory", str(HOME),
+         SELF, "sidebar"],
+        start_new_session=True, stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ---------------------------------------------------------------- focus
+
+def cmd_focus(args):
+    """Super+arrows: inside Plane, move between its panes; past its edge or in any other
+    window, plain Hyprland focus. Safe to bind globally."""
+    if shutil.which("hyprctl"):
+        try:
+            active = json.loads(hypr("activewindow", "-j").stdout or "{}").get("class")
+        except ValueError:
+            active = None
+        if active != CLASS:
+            hypr_move_focus(args.dir)
+            return
+    side = {"up": "top", "down": "bottom"}.get(args.dir, args.dir)
+    r = kitty("focus-window", "--match", f"neighbor:{side}")
+    dbg(f"focus {args.dir} rc={r.returncode} {r.stderr.strip()[:120]}")
+    if r.returncode != 0:
+        hypr_move_focus(args.dir)
+
+
+# ---------------------------------------------------------------- statusline
+
+def _window(rl, *names):
+    """Pull (percent, resets_at) for one window out of whatever shape rate_limits has."""
+    if isinstance(rl, dict):
+        for n in names:
+            w = rl.get(n)
+            if isinstance(w, dict):
+                pct = next((w[k] for k in ("used_percentage", "percentUsed", "percent_used",
+                                           "utilization", "used") if k in w), None)
+                reset = next((w[k] for k in ("resets_at", "resetsAt") if k in w), None)
+                if pct is not None:
+                    return {"pct": float(pct), "resetsAt": reset}
+    if isinstance(rl, list):
+        for w in rl:
+            if isinstance(w, dict) and w.get("kind") in names:
+                return {"pct": float(w.get("percentUsed", 0)), "resetsAt": w.get("resetsAt")}
+    return None
+
+
+def cmd_statusline(_args):
+    try:
+        payload = json.load(sys.stdin)
+    except ValueError:
+        payload = {}
+    rl = payload.get("rate_limits") or payload.get("rateLimits")
+    five = _window(rl, "five_hour", "fiveHour", "5h")
+    week = _window(rl, "seven_day", "sevenDay", "weekly", "7d")
+    if five or week:
+        write_json(USAGE, {"five_hour": five, "seven_day": week, "updatedAt": time.time()})
+    parts = []
+    if five:
+        parts.append(f"5h {five['pct']:.0f}%")
+    if week:
+        parts.append(f"wk {week['pct']:.0f}%")
+    print(" · ".join(parts))
+
+
+# ---------------------------------------------------------------- handoff add
+
+def find_source_session():
+    pid = os.getppid()
+    for _ in range(40):
+        if pid <= 1:
+            break
+        info = read_json(CLAUDE_DIR / "sessions" / f"{pid}.json")
+        if info:
+            return info
+        pid = ppid_of(pid)
+    return None
+
+
+def repo_root(cwd):
+    # A handoff starts at the main checkout; the prompt itself moves into the worktree.
+    return cwd.split("/.worktrees/")[0].split("/.claude/worktrees/")[0]
+
+
+def cmd_handoff_add(args):
+    prompt = sys.stdin.read().strip()
+    fence = re.match(r"^```[\w-]*\n(.*)\n```$", prompt, re.S)
+    if fence:
+        prompt = fence.group(1).strip()
+    if not prompt:
+        sys.exit("plane: empty handoff prompt (pass it on stdin)")
+    src = find_source_session() or {}
+    cwd = repo_root(os.path.abspath(args.cwd or src.get("cwd") or os.getcwd()))
+    now = time.time()
+    slug = re.sub(r"[^a-z0-9]+", "-", args.title.lower()).strip("-")[:40] or "handoff"
+    hid = f"{datetime.now():%Y%m%d-%H%M%S}-{slug}"
+    write_json(HANDOFFS / f"{hid}.json", {
+        "id": hid, "title": args.title, "cwd": cwd, "prompt": prompt, "createdAt": now,
+        "sourceSessionId": src.get("sessionId"), "sourceName": src.get("name"),
+        "sourcePid": src.get("pid"), "sourceProcStart": src.get("procStart"),
+    })
+    origin = f" (from session '{src['name']}')" if src.get("name") else ""
+    print(f"Queued handoff '{args.title}' in Plane{origin}.")
+
+
+# ---------------------------------------------------------------- session ledger
+# Every session writes LIVE/<sessionId>.json from its hooks and marks it ended when it
+# exits. A crash, power loss or reboot never gets that far, so a record whose process is
+# gone and that isn't marked ended is a session that was cut off mid-work.
+
+def boot_id():
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return ""
+
+
+def proc_start(pid):
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def proc_alive(pid, start=None):
+    return bool(pid) and proc_start(pid) is not None and (not start or proc_start(pid) == str(start))
+
+
+def cmdline(pid):
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace").split("\0")
+    except OSError:
+        return []
+
+
+def is_headless(pid):
+    return any(a in ("-p", "--print") for a in cmdline(pid))
+
+
+def hook_claude_pid():
+    """The Claude process that ran this hook: the nearest ancestor that is `claude`."""
+    pid = os.getppid()
+    for _ in range(10):
+        if pid <= 1:
+            return 0
+        argv = cmdline(pid)
+        if (CLAUDE_DIR / "sessions" / f"{pid}.json").exists() or (argv and Path(argv[0]).name == "claude"):
+            return pid
+        pid = ppid_of(pid)
+    return 0
+
+
+def shutting_down():
+    """True while the machine or the desktop session is going down (exits then aren't choices)."""
+    checks = (["systemctl", "is-system-running"],
+              ["systemctl", "--user", "is-active", "wayland-session-shutdown.target"],
+              ["systemctl", "--user", "is-active", "graphical-session.target"])
+    for cmd, bad in zip(checks, ({"stopping"}, {"active", "activating"}, {"deactivating", "inactive"})):
+        try:
+            if subprocess.run(cmd, capture_output=True, text=True, timeout=2).stdout.strip() in bad:
+                return True
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return False
+
+
+def ledger_update(sid, pid, **fields):
+    f = LIVE / f"{sid}.json"
+    rec = read_json(f, {}) or {}
+    info = read_json(CLAUDE_DIR / "sessions" / f"{pid}.json", {}) or {}
+    if rec.get("pid") != pid:  # a new process for this conversation (resumed): it's live again
+        rec.pop("ended", None)
+    rec.update({k: v for k, v in fields.items() if v})
+    rec.update(sessionId=sid, pid=pid, procStart=proc_start(pid), bootId=boot_id(), seenAt=time.time())
+    for key in ("kind", "jobId", "name"):
+        if info.get(key):
+            rec[key] = info[key]
+    rec.setdefault("cwd", info.get("cwd") or fields.get("lastCwd") or str(HOME))  # launch dir: where --resume finds it
+    rec.setdefault("startedAt", time.time())
+    write_json(f, rec)
+
+
+def cmd_track(args):
+    """Hook entry point. Prints nothing (hook stdout lands in the conversation) and never fails."""
+    try:
+        payload = json.load(sys.stdin)
+        sid = payload.get("session_id")
+        pid = hook_claude_pid()
+        if not sid or not pid or is_headless(pid):
+            return
+        f = LIVE / f"{sid}.json"
+        if args.event == "end":
+            rec = read_json(f)
+            if rec and not shutting_down():
+                rec.update(ended=time.time(), endReason=payload.get("reason"))
+                write_json(f, rec)
+            return
+        fields = {"lastCwd": payload.get("cwd"), "transcript": payload.get("transcript_path")}
+        if args.event == "prompt":
+            prompt = " ".join(str(payload.get("prompt", "")).split())[:300]
+            fields.update(lastPrompt=prompt, lastActive=time.time())
+            if not (read_json(f, {}) or {}).get("firstPrompt"):
+                fields["firstPrompt"] = prompt
+        ledger_update(sid, pid, **fields)
+    except Exception:
+        pass
+
+
+def ledger_sync():
+    """Record sessions that started before the hooks existed; drop old ended records."""
+    for f in (CLAUDE_DIR / "sessions").glob("*.json"):
+        info = read_json(f, {}) or {}
+        pid, sid = info.get("pid"), info.get("sessionId")
+        if not sid or not proc_alive(pid, info.get("procStart")) or is_headless(pid):
+            continue
+        rec = read_json(LIVE / f"{sid}.json")
+        if rec is None or (rec.get("pid") == pid and not rec.get("ended") and rec.get("name") != info.get("name")):
+            ledger_update(sid, pid, lastCwd=info.get("cwd"))
+    for f in LIVE.glob("*.json"):
+        rec = read_json(f, {}) or {}
+        if rec.get("ended") and time.time() - rec["ended"] > 86400:
+            f.unlink(missing_ok=True)
+
+
+def interrupted_sessions():
+    """Sessions whose process is gone without having ended: newest activity first."""
+    live = set()
+    for f in (CLAUDE_DIR / "sessions").glob("*.json"):
+        info = read_json(f, {}) or {}
+        if proc_alive(info.get("pid"), info.get("procStart")):
+            live.add(info.get("sessionId"))
+    out, boot = [], boot_id()
+    for f in LIVE.glob("*.json"):
+        rec = read_json(f)
+        if not rec or rec.get("ended") or rec.get("sessionId") in live:
+            continue
+        if rec.get("bootId") == boot and proc_alive(rec.get("pid"), rec.get("procStart")):
+            continue
+        rec["path"] = str(f)
+        rec["cause"] = "reboot" if rec.get("bootId") != boot else "crashed"
+        out.append(rec)
+    out.sort(key=lambda r: -(r.get("lastActive") or r.get("seenAt") or 0))
+    return out
+
+
+def lost_label(r):
+    return r.get("name") or r.get("firstPrompt") or Path(r.get("cwd", "")).name or r["sessionId"][:8]
+
+
+def cmd_recover(args):
+    """Login reminder: a notification that stays until clicked, listing what was left open."""
+    time.sleep(args.delay)  # let the notification daemon come up first
+    lost = interrupted_sessions()
+    waiting = [h for h in (read_json(f) for f in sorted(HANDOFFS.glob("*.json"))) if h]
+    if not lost and not waiting:
+        return
+    title = " · ".join(filter(None, (
+        f"{len(lost)} session{'s' * (len(lost) != 1)} cut off" if lost else "",
+        f"{len(waiting)} handoff{'s' * (len(waiting) != 1)} waiting" if waiting else "")))
+    lines = [f"↯ {lost_label(r)[:50]}" for r in lost[:6]] + [f"→ {h.get('title', '?')[:50]}" for h in waiting[:6]]
+    r = subprocess.run(["notify-send", "-a", "Plane", "-i", "plane", "-u", "critical", "-A", "open=Open Plane",
+                        title, "\n".join(lines)], capture_output=True, text=True)
+    if r.stdout.strip() == "open":
+        cmd_open(None)
+
+
+# ---------------------------------------------------------------- data
+
+def git_branch(cwd):
+    m = re.search(r"/\.(?:claude/)?worktrees/([^/]+)", cwd)
+    if m:
+        return m.group(1)
+    git = Path(cwd) / ".git"
+    try:
+        if git.is_file():
+            git = Path(git.read_text().split("gitdir:", 1)[1].strip())
+        head = (git / "HEAD").read_text().strip()
+        return head.rsplit("/", 1)[-1] if head.startswith("ref:") else head[:8]
+    except (OSError, IndexError):
+        return ""
+
+
+def recent_projects(limit=10):
+    seen = []
+    try:
+        lines = (CLAUDE_DIR / "history.jsonl").read_text(errors="replace").splitlines()
+    except OSError:
+        return seen
+    for line in reversed(lines):
+        try:
+            p = json.loads(line).get("project")
+        except ValueError:
+            continue
+        if not p or p in seen or p == str(HOME) or "/.worktrees/" in p:
+            continue
+        if Path(p).is_dir():
+            seen.append(p)
+        if len(seen) >= limit:
+            break
+    return seen
+
+
+def complete_dir(text):
+    """Extend a typed path to the longest folder prefix it uniquely starts."""
+    base = os.path.expanduser(text or "~/")
+    parent, stem = os.path.split(base)
+    try:
+        names = sorted(e.name for e in os.scandir(parent or ".") if e.is_dir()
+                       and e.name.startswith(stem) and (stem.startswith(".") or not e.name.startswith(".")))
+    except OSError:
+        return text
+    if not names:
+        return text
+    common = os.path.commonprefix(names)
+    done = os.path.join(parent, common) + ("/" if len(names) == 1 else "")
+    return done.replace(str(HOME), "~", 1) if text.startswith("~") or not text else done
+
+
+class Store:
+    """Polls sessions, handoffs and usage on a background thread."""
+
+    def __init__(self, on_ready):
+        self.lock = threading.Lock()
+        self.sessions, self.handoffs, self.usage, self.lost = [], [], {}, []
+        self.error = ""
+        self.on_ready = on_ready
+        self._ready_seen = None
+        self._wake = threading.Event()
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def poke(self):
+        self._wake.set()
+
+    def _loop(self):
+        while True:
+            try:
+                self._refresh()
+            except Exception as exc:  # keep polling whatever happens
+                self.error = f"refresh: {exc}"
+            self._wake.wait(2.5)
+            self._wake.clear()
+
+    def _refresh(self):
+        out = subprocess.run([claude_bin(), "agents", "--json", "--all"],
+                             capture_output=True, text=True, timeout=15)
+        raw = json.loads(out.stdout or "[]")
+        sessions, stopped = [], []
+        for s in raw:
+            bg = s.get("kind") == "background"
+            s["bg"] = bg
+            s["branch"] = git_branch(s.get("cwd", ""))
+            files = read_json(CLAUDE_DIR / "sessions" / f"{s.get('pid')}.json", {}) if s.get("pid") else {}
+            s["procStart"] = files.get("procStart")
+            if bg:
+                job = read_json(CLAUDE_DIR / "jobs" / s["id"] / "state.json", {})
+                s["needs"] = job.get("needs") or job.get("detail") or ""
+            alive = bool(s.get("pid")) and Path(f"/proc/{s['pid']}").exists()
+            (sessions if alive else stopped).append(s)
+        sessions.sort(key=lambda s: (not s["bg"], s.get("startedAt", 0)))
+        ledger_sync()
+        lost = interrupted_sessions()
+        lost_ids = {r["sessionId"] for r in lost}
+        stopped = [s for s in stopped if s.get("sessionId") not in lost_ids]  # listed as interrupted
+        stopped.sort(key=lambda s: -s.get("startedAt", 0))
+        for s in stopped:
+            s["stopped"] = True
+
+        handoffs = []
+        for f in sorted(HANDOFFS.glob("*.json")):
+            h = read_json(f)
+            if not h:
+                continue
+            h["path"] = str(f)
+            src = next((s for s in sessions if s.get("pid") == h.get("sourcePid")
+                        and (not h.get("sourceProcStart") or s.get("procStart") == h["sourceProcStart"])),
+                       None) or next((s for s in sessions if s.get("sessionId") == h.get("sourceSessionId")), None)
+            h["source"] = src
+            h["ready"] = src is None or src.get("status") != "busy"
+            handoffs.append(h)
+
+        ready_now = {h["id"] for h in handoffs if h["ready"]}
+        if self._ready_seen is not None:
+            for h in handoffs:
+                if h["id"] in ready_now - self._ready_seen:
+                    self.on_ready(h)
+        self._ready_seen = ready_now
+
+        with self.lock:
+            self.sessions = sessions + stopped
+            self.handoffs = handoffs
+            self.lost = lost
+            self.usage = read_json(USAGE, {}) or {}
+            self.error = "" if out.returncode == 0 else (out.stderr.strip()[:80] or "claude agents failed")
+
+
+# ---------------------------------------------------------------- kitty
+
+def dbg(text):
+    """Event log for troubleshooting, only with PLANE_DEBUG=1: ~/.cache/plane/debug.log."""
+    if not os.environ.get("PLANE_DEBUG"):
+        return
+    CACHE.mkdir(parents=True, exist_ok=True)
+    with open(CACHE / "debug.log", "a") as f:
+        f.write(f"{time.strftime('%H:%M:%S')} [{os.getpid()}] {text}\n")
+
+
+def kitty(*args):
+    if args and args[0] in ("focus-window", "launch", "close-window", "send-text"):
+        dbg(f"kitty {args[:4]}")
+    to = os.environ.get("KITTY_LISTEN_ON") or f"unix:{SOCK}"
+    return subprocess.run(["kitty", "@", "--to", to, *args], capture_output=True, text=True, timeout=10)
+
+
+def kitty_windows():
+    try:
+        data = json.loads(kitty("ls").stdout)
+    except ValueError:
+        return []
+    return [w for o in data for t in o["tabs"] for w in t["windows"]]
+
+
+def attached_id():
+    for w in kitty_windows():
+        if w.get("user_vars", {}).get("plane_role") == "session":
+            return w["user_vars"].get("plane_id")
+    return None
+
+
+def show_in_pane(cmd, cwd, title, pane_id=""):
+    """Replace the right-hand pane with `cmd` (closing it only detaches)."""
+    kitty("close-window", "--match", "var:plane_role=session")
+    r = kitty("launch", "--type=window", "--location=vsplit",
+              "--var", "plane_role=session", "--var", f"plane_id={pane_id}",
+              "--cwd", cwd, "--title", title, *cmd)
+    fit_sidebar()
+    return r.returncode == 0
+
+
+def fit_sidebar():
+    """Pin the sidebar's width; kitty otherwise rescales both panes on every resize."""
+    me = os.environ.get("KITTY_WINDOW_ID")
+    for _ in range(3):  # resizes land in steps; nudge until it sits at the target
+        wins = kitty_windows()
+        if len(wins) < 2:
+            return
+        total = sum(w["columns"] for w in wins)
+        target = SIDEBAR_COLS if total >= 110 else max(24, round(total * 0.34))
+        cols = next((w["columns"] for w in wins if str(w["id"]) == me), None)
+        if cols is None or abs(cols - target) <= 1:
+            return
+        kitty("resize-window", "--match", f"id:{me}", "--axis", "horizontal",
+              "--increment", str(target - cols))
+
+
+# ---------------------------------------------------------------- start
+
+def cmd_start(args):
+    """Runs in the session pane: `claude --bg` on a real terminal, so a folder-trust
+    prompt (always shown for ~) can be answered right there, then attaches in place."""
+    h = read_json(args.handoff) if args.handoff else None
+    cwd = os.path.expanduser((h or {}).get("cwd") or args.cwd or str(HOME))
+    name = (h or {}).get("title", "")[:60] if h else (args.name or "")
+    prompt = (h or {}).get("prompt", "") if h else (args.prompt or "")
+    cmd = ([claude_bin(), "--bg"] + (["--resume", args.resume] if args.resume else [])
+           + (["--name", name] if name else []) + ([prompt] if prompt else []))
+    out = bytearray()
+
+    def tee(fd):
+        data = os.read(fd, 4096)
+        out.extend(data)
+        return data
+
+    os.chdir(cwd)
+    pty.spawn(cmd, tee)
+    text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", out.decode(errors="replace"))
+    m = re.search(r"backgrounded\s*·\s*([0-9a-f]{6,})", text)
+    sid = m and m.group(1)
+    if not sid and args.resume:  # find the job by the conversation it continued
+        for info in (read_json(f, {}) or {} for f in (CLAUDE_DIR / "sessions").glob("*.json")):
+            if info.get("sessionId") == args.resume and info.get("jobId") and proc_alive(info.get("pid")):
+                sid = info["jobId"]
+    if not sid:
+        if h:  # back into the queue so it can be launched again
+            h.pop("launchedAt", None)
+            write_json(HANDOFFS / Path(args.handoff).name, h)
+            Path(args.handoff).unlink(missing_ok=True)
+        input("\nNo session started. Enter to close… ")
+        return
+    if h:
+        h["launchedSessionId"] = sid
+        write_json(args.handoff, h)
+    if args.stop_source:
+        subprocess.run([claude_bin(), "stop", args.stop_source], capture_output=True, timeout=60)
+    kitty("set-user-vars", "--match", f"id:{os.environ.get('KITTY_WINDOW_ID')}", f"plane_id={sid}")
+    os.execvp(cmd[0], [cmd[0], "attach", sid])
+
+
+# ---------------------------------------------------------------- sidebar
+
+C_OK, C_WARN, C_BAD, C_ACCENT, C_DIM = 1, 2, 3, 4, 5
+PASTE_START, PASTE_END = "[200~", "\x1b[201~"
+
+
+class Paste(str):
+    """Text that arrived as a bracketed paste, never to be read as key commands."""
+
+
+def fmt_reset(reset):
+    if reset is None:
+        return ""
+    try:
+        if isinstance(reset, (int, float)):
+            t = datetime.fromtimestamp(reset / 1000 if reset > 1e12 else reset, timezone.utc)
+        else:
+            t = datetime.fromisoformat(str(reset).replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    secs = (t - datetime.now(timezone.utc)).total_seconds()
+    if secs <= 0:
+        return "now"
+    if secs < 86400:
+        h, m = divmod(int(secs // 60), 60)
+        return f"{h}h{m:02d}m" if h else f"{m}m"
+    return t.astimezone().strftime("%a %H:%M")
+
+
+def ago(ts):
+    secs = max(0, time.time() - ts)
+    if secs < 90:
+        return "just now"
+    if secs < 3600:
+        return f"{int(secs // 60)}m ago"
+    if secs < 86400:
+        return f"{int(secs // 3600)}h ago"
+    return f"{int(secs // 86400)}d ago"
+
+
+class Sidebar:
+    def __init__(self, scr):
+        self.scr = scr
+        self.sel = 0
+        self.items = []      # (kind, obj)
+        self.rows = {}       # screen row -> item index
+        self.msg, self.msg_at = "", 0
+        self.last_click = (None, 0)
+        self.attached = None
+        self.store = Store(self.notify_ready)
+        curses.curs_set(0)
+        curses.use_default_colors()
+        for i, c in ((C_OK, curses.COLOR_GREEN), (C_WARN, curses.COLOR_YELLOW),
+                     (C_BAD, curses.COLOR_RED), (C_ACCENT, curses.COLOR_CYAN),
+                     (C_DIM, curses.COLOR_WHITE)):
+            curses.init_pair(i, c, -1)
+        curses.mousemask(curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED
+                         | curses.BUTTON3_CLICKED | curses.BUTTON3_PRESSED
+                         | curses.BUTTON4_PRESSED | getattr(curses, "BUTTON5_PRESSED", 0))
+        curses.mouseinterval(0)
+        self.tmo = 400
+        scr.timeout(self.tmo)
+        scr.keypad(True)
+        sys.stdout.write("\x1b[?2004h")  # bracketed paste: pastes arrive marked, not as keystrokes
+        sys.stdout.flush()
+        self.resized_at = 0
+
+    def set_timeout(self, ms):
+        self.tmo = ms
+        self.scr.timeout(ms)
+
+    def read(self):
+        """Next key: an int (special/ord), or a Paste. Raises curses.error on timeout."""
+        ch = self.scr.get_wch()
+        if ch != "\x1b":
+            return ord(ch) if isinstance(ch, str) else ch
+        self.scr.timeout(30)
+        try:
+            seq = ""
+            while PASTE_START.startswith(seq) and seq != PASTE_START:
+                try:
+                    c = self.scr.get_wch()
+                except curses.error:
+                    break
+                seq += c if isinstance(c, str) else "?"
+            if seq != PASTE_START:
+                return 27  # a plain Esc (an unknown sequence after it is dropped)
+            buf, deadline = "", time.time() + 3
+            while not buf.endswith(PASTE_END) and time.time() < deadline:
+                try:
+                    c = self.scr.get_wch()
+                except curses.error:
+                    continue
+                if isinstance(c, str):
+                    buf += c
+            return Paste(buf[:-len(PASTE_END)] if buf.endswith(PASTE_END) else buf)
+        finally:
+            self.scr.timeout(self.tmo)
+
+    def forward_paste(self, text):
+        """A paste in the sidebar was meant for the session: send it there."""
+        if not attached_id():
+            self.flash("open a session first; pastes go into the session")
+            return
+        kitty("send-text", "--match", "var:plane_role=session", "--bracketed-paste", "auto", "--", text)
+        kitty("focus-window", "--match", "var:plane_role=session")
+
+    # -- helpers
+    def flash(self, text):
+        self.msg, self.msg_at = text, time.time()
+
+    def notify_ready(self, h):
+        subprocess.Popen(["notify-send", "-a", "Plane", "-i", "plane", "Handoff ready", h.get("title", "")],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def put(self, y, x, text, attr=0):
+        h, w = self.scr.getmaxyx()
+        if 0 <= y < h and x < w:
+            try:
+                self.scr.addnstr(y, x, text, max(0, w - x - 1), attr)
+            except curses.error:
+                pass
+
+    def ask(self, question, default="", complete=None):
+        """One-line input at the bottom. Returns None on Esc; Tab runs `complete`."""
+        h, w = self.scr.getmaxyx()
+        buf = list(default)
+        curses.curs_set(1)
+        self.set_timeout(-1)
+        try:
+            while True:
+                text = "".join(buf)
+                self.put(h - 3, 0, " " * w)
+                self.put(h - 2, 0, " " * w)
+                self.put(h - 3, 1, question, curses.color_pair(C_ACCENT) | curses.A_BOLD)
+                shown = text[-(w - 4):]
+                self.put(h - 2, 1, "› " + shown)
+                self.scr.move(h - 2, min(w - 1, 3 + len(shown)))
+                ch = self.read()
+                if isinstance(ch, Paste):
+                    buf.extend(c for c in " ".join(ch.split()) if c.isprintable())
+                elif ch in (10, 13, curses.KEY_ENTER):
+                    return text.strip()
+                elif ch == 27:
+                    return None
+                elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                    if buf:
+                        buf.pop()
+                elif ch == 21:  # ctrl+u
+                    buf.clear()
+                elif ch == 9 and complete:
+                    buf = list(complete(text))
+                elif isinstance(ch, int) and 32 <= ch < 0x110000 and chr(ch).isprintable():
+                    buf.append(chr(ch))
+        finally:
+            curses.curs_set(0)
+            self.set_timeout(400)
+
+    def confirm(self, question):
+        ans = self.ask(f"{question} (y/N)")
+        return bool(ans) and ans.lower().startswith("y")
+
+    def choose(self, title, options):
+        """Pick from a short list with arrows/Enter, or type. Returns str or None."""
+        idx = 0
+        self.set_timeout(-1)
+        try:
+            while True:
+                self.scr.erase()
+                self.put(1, 1, title, curses.color_pair(C_ACCENT) | curses.A_BOLD)
+                for i, (label, _val) in enumerate(options):
+                    attr = curses.A_REVERSE if i == idx else 0
+                    self.put(3 + i, 1, f" {label} ", attr)
+                self.put(4 + len(options), 1, "↑↓ pick · ⏎ ok · esc cancel", curses.A_DIM)
+                self.scr.refresh()
+                ch = self.read()
+                if isinstance(ch, Paste):
+                    continue
+                if ch in (curses.KEY_UP, ord("k")):
+                    idx = (idx - 1) % len(options)
+                elif ch in (curses.KEY_DOWN, ord("j")):
+                    idx = (idx + 1) % len(options)
+                elif ch in (10, 13, curses.KEY_ENTER):
+                    return options[idx][1]
+                elif ch == 27:
+                    return None
+                elif ch == curses.KEY_MOUSE:
+                    try:
+                        _, _, my, _, _ = curses.getmouse()
+                    except curses.error:
+                        continue
+                    if 0 <= my - 3 < len(options):
+                        return options[my - 3][1]
+        finally:
+            self.set_timeout(400)
+
+    def run_claude(self, args, cwd):
+        r = subprocess.run([claude_bin(), *args], cwd=cwd, capture_output=True, text=True, timeout=60)
+        return r.returncode, (r.stdout + r.stderr).strip()
+
+    # -- actions
+    def attach(self, s):
+        if not s["bg"]:
+            pid, pids = s["pid"], {c.get("pid") for c in hypr_clients()}
+            while pid > 1 and pid not in pids:
+                pid = ppid_of(pid)
+            if pid > 1:
+                hypr_focus(f"pid:{pid}")
+            elif not shutil.which("hyprctl"):
+                self.flash("it's in another window (switching to it needs Hyprland)")
+            else:
+                self.flash("couldn't find that session's window")
+            return
+        if self.attached == s["id"]:
+            kitty("focus-window", "--match", "var:plane_role=session")
+            return
+        if show_in_pane([claude_bin(), "attach", s["id"]], s.get("cwd", str(HOME)),
+                        s.get("name") or s["id"], s["id"]):
+            self.attached = s["id"]
+        else:
+            self.flash("couldn't open the session pane")
+
+    def start_bg(self, cwd, title, extra):
+        """Start in the session pane (see cmd_start), where a trust prompt can be answered."""
+        if show_in_pane([SELF, "start", "--cwd", cwd, *extra], cwd, title):
+            self.attached = None
+            self.flash("starting… answer any prompt on the right")
+        else:
+            self.flash("couldn't open the session pane")
+        self.store.poke()
+
+    def new_session(self):
+        opts = [(f"{Path(p).name}  ({p.replace(str(HOME), '~')})", p) for p in recent_projects()]
+        opts += [("~  (home folder)", str(HOME)), ("type a path…", "")]
+        cwd = self.choose("New session in which folder?", opts)
+        if cwd is None:
+            return
+        if not cwd:
+            cwd = self.ask("Folder path (tab completes):", complete=complete_dir)
+            if not cwd:
+                return
+            cwd = os.path.abspath(os.path.expanduser(cwd))
+            if not Path(cwd).is_dir():
+                self.flash(f"no such folder: {cwd}")
+                return
+        name = self.ask("Name (optional):")
+        if name is None:
+            return
+        prompt = self.ask("First message (optional):")
+        if prompt is None:
+            return
+        extra = (["--name", name] if name else []) + (["--prompt", prompt] if prompt else [])
+        self.start_bg(cwd, name or Path(cwd).name or "~", extra)
+
+    def launch_handoff(self, h):
+        if not h["ready"] and not self.confirm("Its session is still working on it. Start anyway?"):
+            return
+        src, extra = h.get("source"), []
+        if src and src.get("bg") and self.confirm(f"Pause '{src.get('name')}' once this starts?"):
+            extra = ["--stop-source", src["id"]]
+        # Claim it first: moving the file out of the queue is atomic, so a second ⏎ or a click
+        # on a row the list hasn't refreshed yet finds nothing and can't launch it again.
+        done = DONE / Path(h["path"]).name
+        try:
+            os.replace(h["path"], done)
+        except FileNotFoundError:
+            self.flash("that handoff was already started")
+            self.store.poke()
+            return
+        h2 = {k: v for k, v in h.items() if k not in ("path", "source", "ready")}
+        h2["launchedAt"] = time.time()
+        write_json(done, h2)
+        with self.store.lock:
+            self.store.handoffs = [x for x in self.store.handoffs if x["id"] != h["id"]]
+        self.start_bg(h["cwd"], h.get("title") or "handoff", ["--handoff", str(done), *extra])
+        if src and not src.get("bg"):
+            self.flash(f"'{src.get('name')}' is in its own window: /exit there to close it")
+
+    def resume_lost(self, r):
+        """Pick up an interrupted session: reattach its background job, or resume the conversation."""
+        name, cwd = r.get("name") or "", r.get("cwd") or str(HOME)
+        if not Path(cwd).is_dir():
+            self.flash(f"its folder is gone: {cwd}")
+            return
+        job = r.get("jobId")
+        if r.get("kind") == "bg" and job and (CLAUDE_DIR / "jobs" / job).is_dir():
+            if show_in_pane([claude_bin(), "attach", job], cwd, name or job, job):
+                self.attached = job
+            self.store.poke()
+            return
+        self.start_bg(cwd, name or lost_label(r)[:40], ["--resume", r["sessionId"]] + (["--name", name] if name else []))
+
+    def close_lost(self, r, everything=False):
+        """Done with a cut-off session: stop offering it (its conversation stays in /resume)."""
+        group = self.store.lost if everything else [r]
+        what = f"all {len(group)} cut-off sessions" if everything else f"'{lost_label(r)[:24]}'"
+        if not self.confirm(f"Close {what}?"):
+            return
+        for x in group:
+            job = x.get("jobId")
+            if x.get("kind") == "bg" and job and (CLAUDE_DIR / "jobs" / job).is_dir():
+                self.run_claude(["rm", job], HOME)  # or it would come back under PAUSED
+            Path(x["path"]).unlink(missing_ok=True)
+        self.flash("closed · conversation kept (claude --resume)")
+        self.store.poke()
+
+    def close(self, s):
+        """Finish a session: it ends and leaves the list. Its conversation is kept, and its
+        worktree is removed only when nothing in it is unpushed."""
+        if not s["bg"]:
+            self.flash("it's in its own window: type /exit there")
+            return
+        if not self.confirm(f"Close '{(s.get('name') or s['id'])[:24]}'?"):
+            return
+        if self.remove(s):
+            self.flash("closed · conversation kept (claude --resume)")
+
+    def remove(self, s):
+        code, out = self.run_claude(["rm", s["id"]], HOME)
+        if code != 0:
+            self.flash(f"not closed: {out.splitlines()[0][:100] if out else 'claude rm failed'}")
+        elif self.attached == s["id"]:
+            self.attached = None
+        self.store.poke()
+        return code == 0
+
+    def handoff_of(self, s):
+        """The started handoff (in done/) that this session came from, if any."""
+        for f in DONE.glob("*.json"):
+            h = read_json(f)
+            if h and h.get("launchedSessionId") == s["id"]:
+                return f
+        return None
+
+    def requeue(self, s):
+        """Undo starting a handoff: close its session and put the handoff back in the queue."""
+        f = self.handoff_of(s)
+        if not f:
+            self.flash("no handoff to put back")
+            return
+        if not self.confirm(f"Close & requeue '{(s.get('name') or s['id'])[:11]}'?"):
+            return
+        if not self.remove(s):  # still running: requeuing now could start it twice
+            return
+        h = read_json(f)
+        for k in ("launchedAt", "launchedSessionId"):
+            h.pop(k, None)
+        write_json(HANDOFFS / f.name, h)
+        f.unlink(missing_ok=True)
+        self.flash("closed · handoff back in the queue")
+        self.store.poke()
+
+    def pause(self, s):
+        """Stop a session but keep it listed under PAUSED, to pick up again later."""
+        if not s["bg"]:
+            self.flash("it's in its own window: type /exit there")
+            return
+        if s.get("stopped"):
+            self.flash("already paused · x closes it")
+            return
+        code, out = self.run_claude(["stop", s["id"]], HOME)
+        self.flash("paused · open it to continue" if code == 0 else f"not paused: {out[:100]}")
+        if self.attached == s["id"]:
+            self.attached = None
+        self.store.poke()
+
+    def discard_handoff(self, h):
+        if self.confirm(f"Discard handoff '{h.get('title', '')[:20]}'?"):
+            Path(h["path"]).unlink(missing_ok=True)
+            self.store.poke()
+
+    def actions_for(self, kind, obj):
+        """The right-click menu: (label, action) for the clicked row."""
+        if kind == "session" and not obj["bg"]:
+            acts = [("Go to its window", lambda: self.attach(obj))]
+        elif kind == "session":
+            acts = [("Continue" if obj.get("stopped") else "Open", lambda: self.attach(obj))]
+            if not obj.get("stopped"):
+                acts.append(("Pause", lambda: self.pause(obj)))
+            acts.append(("Close", lambda: self.close(obj)))
+            if self.handoff_of(obj):
+                acts.append(("Put back in queue", lambda: self.requeue(obj)))
+        elif kind == "lost":
+            acts = [("Resume", lambda: self.resume_lost(obj)),
+                    ("Close", lambda: self.close_lost(obj)),
+                    ("Close all cut-off sessions", lambda: self.close_lost(obj, everything=True))]
+        elif kind == "handoff":
+            acts = [("Start", lambda: self.launch_handoff(obj)),
+                    ("Read prompt", lambda: self.view_handoff(obj)),
+                    ("Discard", lambda: self.discard_handoff(obj))]
+        else:
+            acts = []
+        return acts + [("New session…", self.new_session)]
+
+    def menu(self, y, options):
+        """Popup under row y. Click or ⏎ picks; Esc, right-click or a click outside cancels."""
+        h, w = self.scr.getmaxyx()
+        width = min(w - 2, max(len(label) for label, _ in options) + 4)
+        height = len(options) + 2
+        top, left = max(0, min(y + 1, h - height)), 2
+        win = curses.newwin(height, width, top, left)
+        idx = 0
+        self.set_timeout(-1)
+        try:
+            while True:
+                win.erase()
+                win.attron(curses.color_pair(C_ACCENT))
+                win.box()
+                win.attroff(curses.color_pair(C_ACCENT))
+                for i, (label, _) in enumerate(options):
+                    attr = curses.A_REVERSE if i == idx else 0
+                    if label == "Discard":
+                        attr |= curses.color_pair(C_BAD)
+                    win.addnstr(1 + i, 2, label.ljust(width - 4), width - 4, attr)
+                win.refresh()
+                ch = self.read()
+                if isinstance(ch, Paste):
+                    continue
+                if ch in (curses.KEY_UP, ord("k")):
+                    idx = (idx - 1) % len(options)
+                elif ch in (curses.KEY_DOWN, ord("j")):
+                    idx = (idx + 1) % len(options)
+                elif ch in (10, 13, curses.KEY_ENTER):
+                    break
+                elif ch == 27:
+                    return
+                elif ch == curses.KEY_MOUSE:
+                    try:
+                        _, mx, my, _, bstate = curses.getmouse()
+                    except curses.error:
+                        continue
+                    if not bstate & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED):
+                        if bstate & (curses.BUTTON3_PRESSED | curses.BUTTON3_CLICKED):
+                            return
+                        continue
+                    if top < my < top + height - 1 and left <= mx < left + width:
+                        idx = my - top - 1
+                        break
+                    return
+        finally:
+            del win
+            self.set_timeout(400)
+            self.scr.touchwin()
+        options[idx][1]()
+
+    def view_handoff(self, h):
+        view = CACHE / "handoff-view.txt"
+        view.write_text(f"{h.get('title')}\nfrom {h.get('sourceName') or '?'} · {h['cwd']}\n\n{h['prompt']}\n")
+        show_in_pane(["less", str(view)], h["cwd"], f"handoff: {h.get('title')}")
+        self.attached = None
+
+    # -- drawing
+    def bar(self, y, label, win):
+        w = self.scr.getmaxyx()[1]
+        if not win:
+            self.put(y, 1, f"{label}  --", curses.A_DIM)
+            return
+        pct = win["pct"]
+        color = C_OK if pct < 50 else C_WARN if pct < 80 else C_BAD
+        width = max(6, min(14, w - 24))
+        fill = round(width * min(pct, 100) / 100)
+        self.put(y, 1, f"{label} ", curses.A_BOLD)
+        self.put(y, 4, "█" * fill, curses.color_pair(color))
+        self.put(y, 4 + fill, "░" * (width - fill), curses.A_DIM)
+        self.put(y, 5 + width, f"{pct:>3.0f}%", curses.color_pair(color) | curses.A_BOLD)
+        reset = fmt_reset(win.get("resetsAt"))
+        if reset:
+            self.put(y, 11 + width, f"↻ {reset}", curses.A_DIM)
+
+    def session_line(self, s):
+        if s.get("stopped"):
+            return "○", C_DIM, "failed" if s.get("state") == "failed" else "paused"
+        if s.get("status") == "busy":
+            return "●", C_OK, "working"
+        if s["bg"] and s.get("state") == "blocked":
+            return "!", C_WARN, "needs you"
+        return "○", C_ACCENT, "your turn"
+
+    def draw_item(self, y, w, idx):
+        kind, obj = self.items[idx]
+        attr = curses.A_REVERSE if idx == self.sel else 0
+        self.put(y, 0, " " * (w - 1), attr)
+        if kind == "session":
+            icon, color, state = self.session_line(obj)
+            dim = curses.A_DIM if obj.get("stopped") else 0
+            if obj.get("id") and obj.get("id") == self.attached:
+                self.put(y, 1, "▶", curses.color_pair(C_ACCENT) | attr)
+            self.put(y, 2, icon, curses.color_pair(color) | attr | curses.A_BOLD)
+            name = obj.get("name") or obj.get("id") or "?"
+        elif kind == "lost":
+            color, state, dim = C_WARN, {"crashed": "crash"}.get(obj["cause"], obj["cause"]), 0
+            self.put(y, 2, "↯", curses.color_pair(C_WARN) | attr | curses.A_BOLD)
+            name = lost_label(obj)
+        else:
+            ok = obj["ready"]
+            color, state, dim = (C_OK if ok else C_WARN), ("ready" if ok else "pending"), 0
+            self.put(y, 2, "✓" if ok else "…", curses.color_pair(color) | attr | curses.A_BOLD)
+            name = obj.get("title", "?")
+        room = w - 4 - len(state) - 3
+        self.put(y, 4, name if len(name) <= room else name[:max(3, room - 1)] + "…", attr | dim)
+        self.put(y, w - len(state) - 2, state, curses.color_pair(color) | attr | dim)
+
+    def detail_lines(self, w):
+        if not self.items:
+            return []
+        kind, obj = self.items[self.sel]
+        lines = []
+        if kind == "session":
+            lines.append(obj.get("cwd", "").replace(str(HOME), "~"))
+            if obj.get("branch"):
+                lines.append(f"branch {obj['branch']}")
+            if obj.get("startedAt"):
+                lines.append(f"started {ago(obj['startedAt'] / 1000)}")
+            if obj.get("needs") and obj.get("state") == "blocked":
+                lines.append(f"needs: {obj['needs']}")
+            if not obj["bg"]:
+                lines.append("in its own window · /exit there to close")
+        elif kind == "lost":
+            where = obj.get("lastCwd") or obj.get("cwd", "")
+            lines.append(where.replace(str(HOME), "~"))
+            if git_branch(where):
+                lines.append(f"branch {git_branch(where)}")
+            when = obj.get("lastActive") or obj.get("seenAt")
+            if when:
+                lines.append(f"last active {ago(when)} · cut off by a {'reboot' if obj['cause'] == 'reboot' else 'crash'}")
+            if obj.get("lastPrompt"):
+                lines.append(f"last ask: {obj['lastPrompt']}")
+        else:
+            src = obj.get("source")
+            where = "ended" if not src else ("still working" if src.get("status") == "busy" else "done")
+            lines.append(f"from {obj.get('sourceName') or '?'} ({where})")
+            lines.append(obj.get("cwd", "").replace(str(HOME), "~"))
+            lines.append(f"queued {ago(obj.get('createdAt', time.time()))}")
+            lines += [ln.strip() for ln in obj.get("prompt", "").splitlines() if ln.strip()][:5]
+        return lines
+
+    def draw(self):
+        scr = self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        with self.store.lock:
+            sessions = list(self.store.sessions)
+            handoffs = list(self.store.handoffs)
+            lost = list(self.store.lost)
+            usage = dict(self.store.usage)
+            err = self.store.error
+        mine = [s for s in sessions if s["bg"] and not s.get("stopped")]
+        paused = [s for s in sessions if s["bg"] and s.get("stopped")]
+        windows = [s for s in sessions if not s["bg"]]
+        self.items = ([("lost", r) for r in lost] + [("session", s) for s in mine + paused + windows]
+                      + [("handoff", x) for x in handoffs])
+        self.sel = max(0, min(self.sel, len(self.items) - 1))
+        self.rows = {}
+
+        self.put(0, 1, "PLANE", curses.color_pair(C_ACCENT) | curses.A_BOLD)
+        if usage.get("updatedAt"):
+            self.put(0, 8, f"usage {ago(usage['updatedAt'])}", curses.A_DIM)
+        self.bar(1, "5h", usage.get("five_hour"))
+        self.bar(2, "wk", usage.get("seven_day"))
+
+        # body: section headings and item rows, scrolled to keep the selection visible
+        body, idx = [], 0
+        for title, group, empty in (("CUT OFF BY CRASH/REBOOT", lost, None),
+                                    ("SESSIONS", mine, "none running · n starts one"),
+                                    ("PAUSED", paused, None),
+                                    ("IN OTHER WINDOWS", windows, None),
+                                    ("HANDOFFS", handoffs, "none queued")):
+            if not group and empty is None:
+                continue
+            if body:
+                body.append(("gap", None))
+            body.append(("head", title))
+            if not group:
+                body.append(("note", empty))
+            for _ in group:
+                body.append(("item", idx))
+                idx += 1
+
+        details = self.detail_lines(w)
+        top, bottom = 4, h - 3
+        avail = bottom - top
+        if len(body) + len(details) + 2 <= avail:
+            offset, show_details = 0, True
+        else:
+            sel_row = next((i for i, (k, v) in enumerate(body) if k == "item" and v == self.sel), 0)
+            off = min(max(getattr(self, "offset", 0), sel_row - avail + 1), sel_row)
+            if off == sel_row and off > 0 and body[off - 1][0] == "head":
+                off -= 1  # keep the section heading in view
+            self.offset = offset = off
+            show_details = False
+        y = top
+        for kind, val in body[offset:offset + avail]:
+            if kind == "head":
+                self.put(y, 1, val, curses.A_BOLD | (curses.color_pair(C_WARN) if val.startswith("CUT OFF") else 0))
+            elif kind == "note":
+                self.put(y, 3, val, curses.A_DIM)
+            elif kind == "item":
+                self.draw_item(y, w, val)
+                self.rows[y] = val
+            y += 1
+        if offset > 0:
+            self.put(top - 1, w - 7, "▲ more", curses.A_DIM)
+        if offset + avail < len(body):
+            self.put(bottom, w - 7, "▼ more", curses.A_DIM)
+
+        if show_details and details:
+            y += 1
+            self.put(y, 0, "─" * (w - 1), curses.A_DIM)
+            for ln in details:
+                y += 1
+                if y >= bottom:
+                    break
+                self.put(y, 1, ln[:w - 2], curses.A_DIM)
+
+        if self.msg and time.time() - self.msg_at < 6:
+            self.put(h - 2, 1, self.msg[:w - 2], curses.color_pair(C_WARN))
+        elif err:
+            self.put(h - 2, 1, err[:w - 2], curses.color_pair(C_BAD))
+        kind, obj = self.items[self.sel] if self.items else (None, None)
+        if kind == "handoff":
+            hint = "v read  x discard  n new  ? keys"
+        elif kind == "lost" or (kind == "session" and obj["bg"] and obj.get("stopped")):
+            hint = "x close  n new  ? keys"
+        elif kind == "session" and obj["bg"]:
+            hint = "x close  p pause  n new  ? keys"
+        else:
+            hint = "n new session  ? keys"
+        self.put(h - 1, 1, hint, curses.A_DIM)
+        scr.refresh()
+
+    def help(self):
+        self.scr.erase()
+        rows = [  # the sidebar is ~38 columns: keys in 9, words in 26
+            ("x", "close: done, off the list"),
+            ("", "conversation is kept"),
+            ("p", "pause: stays listed"),
+            ("n", "new session"),
+            ("v", "read a handoff"),
+            ("x", "on a handoff: discard it"),
+            ("⏎ click", "open the selected row"),
+            ("", "handoff: ⏎ or double-click"),
+            ("r-click", "all actions for a row"),
+            ("↑↓ jk", "move the selection"),
+            ("super ←→", "sidebar ⇄ session"),
+            ("r / R", "refresh / reload code"),
+            ("q", "quit (sessions go on)"),
+            ("", ""),
+            (None, "In a session, ← on an empty"),
+            (None, "prompt opens Claude's own"),
+            (None, "list; ⏎ there comes back."),
+        ]
+        self.put(1, 1, "KEYS", curses.color_pair(C_ACCENT) | curses.A_BOLD)
+        for i, (k, d) in enumerate(rows):
+            self.put(3 + i, 1, k or "", curses.A_BOLD)
+            self.put(3 + i, 1 if k is None else 11, d, curses.A_DIM)
+        self.put(4 + len(rows), 1, "any key to go back", curses.A_DIM)
+        self.set_timeout(-1)
+        self.read()
+        self.set_timeout(400)
+
+    def current(self):
+        return self.items[self.sel] if self.items else (None, None)
+
+    def activate(self):
+        kind, obj = self.current()
+        if kind == "session":
+            self.attach(obj)
+        elif kind == "handoff":
+            self.launch_handoff(obj)
+        elif kind == "lost":
+            self.resume_lost(obj)
+
+    def click(self, row):
+        # A handoff starts a whole session, so it needs a double-click (or ⏎) to start.
+        # Both clicks must land on the same handoff entry: keyed by its id, not the row,
+        # because the list can refresh and shift between the two clicks.
+        now = time.time()
+        kind, obj = self.items[row]
+        key = (kind, obj.get("id") if isinstance(obj, dict) else row)
+        prev_key, prev_at = self.last_click
+        if key == prev_key and now - prev_at < 0.08:
+            return  # the same physical click reported twice (pressed + clicked)
+        self.last_click = (key, now)
+        self.sel = row
+        if kind != "handoff":
+            self.activate()
+        elif key == prev_key and now - prev_at < 0.5:
+            self.last_click = (None, 0)
+            self.activate()
+        else:
+            self.flash("double-click or press Enter to start")
+
+    def loop(self):
+        last_sync = 0
+        while True:
+            if time.time() - last_sync > 3:
+                self.attached = attached_id()
+                last_sync = time.time()
+            self.draw()
+            if self.resized_at and time.time() - self.resized_at > 0.3:
+                self.resized_at = 0
+                fit_sidebar()
+            try:
+                ch = self.read()
+            except curses.error:
+                continue
+            except KeyboardInterrupt:
+                return
+            if isinstance(ch, Paste):
+                dbg(f"paste {ch[:40]!r}")
+                self.forward_paste(ch)
+                continue
+            mev = None
+            if ch == curses.KEY_MOUSE:
+                try:
+                    mev = curses.getmouse()
+                except curses.error:
+                    pass
+                dbg(f"mouse {mev} rows={sorted(self.rows)}")
+            else:
+                dbg(f"key {curses.keyname(ch) if isinstance(ch, int) and 0 <= ch < 512 else ch!r}")
+            if ch == curses.KEY_RESIZE:
+                self.resized_at = time.time()
+                continue
+            kind, obj = self.current()
+            if ch in (curses.KEY_UP, ord("k")):
+                self.sel = max(0, self.sel - 1)
+            elif ch in (curses.KEY_DOWN, ord("j")):
+                self.sel = min(len(self.items) - 1, self.sel + 1)
+            elif ch in (curses.KEY_HOME, ord("g")):
+                self.sel = 0
+            elif ch in (curses.KEY_END, ord("G")):
+                self.sel = len(self.items) - 1
+            elif ch in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT, ord("l")):
+                self.activate()
+            elif ch == ord("n"):
+                self.new_session()
+            elif ch in (ord("x"), ord("X"), ord("d")):
+                if kind == "session":
+                    self.close(obj)
+                elif kind == "lost":
+                    self.close_lost(obj)
+                elif kind == "handoff":
+                    self.discard_handoff(obj)
+            elif ch == ord("p") and kind == "session":
+                self.pause(obj)
+            elif ch == ord("v") and kind == "handoff":
+                self.view_handoff(obj)
+            elif ch == ord("r"):
+                self.store.poke()
+            elif ch == ord("R"):  # reload the sidebar's code in place; the session pane stays
+                curses.endwin()
+                os.execv(sys.executable, [sys.executable, SELF, "sidebar"])
+            elif ch == ord("?"):
+                self.help()
+            elif ch == ord("q"):
+                kitty("close-window", "--match", "var:plane_role=session")
+                return
+            elif ch == curses.KEY_MOUSE:
+                if mev is None:
+                    continue
+                _, _, my, _, bstate = mev
+                if bstate & curses.BUTTON4_PRESSED:
+                    self.sel = max(0, self.sel - 1)
+                elif bstate & getattr(curses, "BUTTON5_PRESSED", 0):
+                    self.sel = min(len(self.items) - 1, self.sel + 1)
+                elif bstate & (curses.BUTTON3_PRESSED | curses.BUTTON3_CLICKED):
+                    if my in self.rows:
+                        self.sel = self.rows[my]
+                        self.draw()
+                        self.menu(my, self.actions_for(*self.items[self.sel]))
+                    else:
+                        self.menu(my, self.actions_for(None, None))
+                elif my in self.rows and bstate & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED):
+                    self.click(self.rows[my])
+
+
+def cmd_sidebar(_args):
+    os.environ.setdefault("ESCDELAY", "25")
+    for d in (HANDOFFS, DONE, CACHE, LIVE):
+        d.mkdir(parents=True, exist_ok=True)
+    try:
+        curses.wrapper(lambda scr: Sidebar(scr).loop())
+    finally:
+        sys.stdout.write("\x1b[?2004l")
+        sys.stdout.flush()
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(prog="plane", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("open").set_defaults(fn=cmd_open)
+    sub.add_parser("sidebar").set_defaults(fn=cmd_sidebar)
+    sub.add_parser("statusline").set_defaults(fn=cmd_statusline)
+    st = sub.add_parser("start", help="start a background session (runs in the session pane)")
+    st.add_argument("--cwd")
+    st.add_argument("--name")
+    st.add_argument("--prompt")
+    st.add_argument("--handoff", help="a claimed handoff file in done/")
+    st.add_argument("--stop-source", help="session id to stop once the new one is running")
+    st.add_argument("--resume", help="conversation id to continue as a background session")
+    st.set_defaults(fn=cmd_start)
+    fo = sub.add_parser("focus", help="move focus between Plane's panes")
+    fo.add_argument("dir", choices=["left", "right", "up", "down"])
+    fo.set_defaults(fn=cmd_focus)
+    tr = sub.add_parser("track", help="Claude Code hook: record running sessions")
+    tr.add_argument("event", choices=["start", "prompt", "end"])
+    tr.set_defaults(fn=cmd_track)
+    rc = sub.add_parser("recover", help="notify about interrupted sessions and waiting handoffs")
+    rc.add_argument("--delay", type=float, default=8)
+    rc.set_defaults(fn=cmd_recover)
+    ho = sub.add_parser("handoff").add_subparsers(dest="hcmd", required=True)
+    add = ho.add_parser("add", help="queue a handoff prompt read from stdin")
+    add.add_argument("--title", required=True)
+    add.add_argument("--cwd")
+    add.set_defaults(fn=cmd_handoff_add)
+    args = ap.parse_args()
+    (getattr(args, "fn", None) or cmd_open)(args)
+
+
+if __name__ == "__main__":
+    main()

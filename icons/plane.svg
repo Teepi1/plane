@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1f2a3a"/>
+      <stop offset="1" stop-color="#121923"/>
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#bg)"/>
+  <g transform="translate(33 31) scale(0.9) rotate(45) translate(-32 -32)">
+    <!-- circuit-trace contrails behind the wings and tail -->
+    <g fill="none" stroke="#3fb6c9" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 38 V46 L17 50 V53"/>
+      <path d="M43 38 V46 L47 50 V53"/>
+      <path d="M32 48 V56"/>
+    </g>
+    <g fill="#3fb6c9">
+      <circle cx="17" cy="55" r="2.6"/>
+      <circle cx="47" cy="55" r="2.6"/>
+      <circle cx="32" cy="58" r="2.6"/>
+    </g>
+    <!-- the plane, top view, nose up -->
+    <path fill="#e8f1f8" d="M32 7.5c2 0 3 2.4 3 4.6V24l14.5 8.6v4.2L35 32.6V42l5 3.6v3.2L32 46.6l-8 2.2v-3.2l5-3.6v-9.4l-14.5 4.2v-4.2L29 24V12.1c0-2.2 1-4.6 3-4.6z"/>
+  </g>
+</svg>
