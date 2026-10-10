@@ -280,7 +280,8 @@ def ledger_update(sid, pid, **fields):
     f = LIVE / f"{sid}.json"
     rec = read_json(f, {}) or {}
     info = read_json(CLAUDE_DIR / "sessions" / f"{pid}.json", {}) or {}
-    if rec.get("pid") != pid:  # a new process for this conversation (resumed): it's live again
+    switched = rec.get("pid") != pid
+    if switched:  # a new process for this conversation (resumed): it's live again
         rec.pop("ended", None)
     rec.update({k: v for k, v in fields.items() if v})
     rec.update(sessionId=sid, pid=pid, procStart=proc_start(pid), bootId=boot_id(), seenAt=time.time())
@@ -290,6 +291,20 @@ def ledger_update(sid, pid, **fields):
     rec.setdefault("cwd", info.get("cwd") or fields.get("lastCwd") or str(HOME))  # launch dir: where --resume finds it
     rec.setdefault("startedAt", time.time())
     write_json(f, rec)
+    if switched:
+        retire_replaced(rec)
+
+
+def retire_replaced(rec):
+    """A process runs one conversation at a time. A `--resume` start first reports a throwaway
+    session id, then the resumed one, and the throwaway never gets SessionEnd: end it here,
+    or it would come back as a second, cut-off copy of the session after a reboot."""
+    for f in LIVE.glob("*.json"):
+        old = read_json(f, {}) or {}
+        if (old.get("sessionId") != rec["sessionId"] and not old.get("ended") and old.get("pid") == rec["pid"]
+                and old.get("procStart") == rec["procStart"] and old.get("bootId") == rec["bootId"]):
+            old.update(ended=time.time(), endReason="replaced")
+            write_json(f, old)
 
 
 def cmd_track(args):
@@ -336,15 +351,18 @@ def ledger_sync():
 
 def interrupted_sessions():
     """Sessions whose process is gone without having ended: newest activity first."""
-    live = set()
+    live, live_jobs = set(), set()
     for f in (CLAUDE_DIR / "sessions").glob("*.json"):
         info = read_json(f, {}) or {}
         if proc_alive(info.get("pid"), info.get("procStart")):
             live.add(info.get("sessionId"))
+            live_jobs.add(info.get("jobId"))
     out, boot = [], boot_id()
     for f in LIVE.glob("*.json"):
         rec = read_json(f)
         if not rec or rec.get("ended") or rec.get("sessionId") in live:
+            continue
+        if rec.get("jobId") and rec["jobId"] in live_jobs:  # its background job is running again
             continue
         if rec.get("bootId") == boot and proc_alive(rec.get("pid"), rec.get("procStart")):
             continue
@@ -352,7 +370,11 @@ def interrupted_sessions():
         rec["cause"] = "reboot" if rec.get("bootId") != boot else "crashed"
         out.append(rec)
     out.sort(key=lambda r: -(r.get("lastActive") or r.get("seenAt") or 0))
-    return out
+    best = {}  # one row per background job, the record that holds its conversation
+    for r in out:
+        if r.get("jobId") and (r["jobId"] not in best or r.get("firstPrompt") and not best[r["jobId"]].get("firstPrompt")):
+            best[r["jobId"]] = r
+    return [r for r in out if not r.get("jobId") or best[r["jobId"]] is r]
 
 
 def lost_label(r):
