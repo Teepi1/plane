@@ -96,12 +96,19 @@ name and an optional first message. Right-click any row for all of its actions.
 | ? | all keys |
 | q | quit Plane (sessions keep running) |
 
+Drag the border between the sidebar and the session to make the sidebar wider or narrower.
+It keeps that width until the Plane window itself changes size, for example going from
+half the screen to full, and then goes back to its default.
+
 Pasting into the sidebar sends the paste to the open session, so a misplaced paste can't
 trigger sidebar keys.
 
 ### Sections
 
 - **SESSIONS:** your running background sessions.
+- **STANDBY:** sessions that were waiting on you when Claude Code put them to sleep (it does
+  this to background sessions left idle for a while) or the machine restarted. Nothing was
+  lost: open one and it picks up where it left off.
 - **PAUSED:** sessions you paused. Open one to continue it.
 - **IN OTHER WINDOWS:** Claude Code sessions running in ordinary terminals. Opening one
   switches to its window (on Hyprland).
@@ -148,7 +155,8 @@ same input to both and keep your own output:
 With the hooks from `--claude`, every session keeps a small record in
 `~/.local/share/plane/live/` while it runs, and marks it when it ends normally. A session
 whose record is still open after its process is gone was cut off, so Plane lists it at
-the top of the sidebar, and Enter resumes it. With `--autostart`, a notification at login
+the top of the sidebar, and Enter resumes it. A background session that was waiting on you
+rather than working goes under STANDBY instead, since nothing was interrupted. With `--autostart`, a notification at login
 lists anything that was cut off plus handoffs still waiting.
 
 ## Hyprland

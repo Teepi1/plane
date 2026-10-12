@@ -350,7 +350,8 @@ def ledger_sync():
 
 
 def interrupted_sessions():
-    """Sessions whose process is gone without having ended: newest activity first."""
+    """Sessions whose process is gone without having ended: newest activity first. Those
+    that were waiting on you, not working, come back with cause "standby"."""
     live, live_jobs = set(), set()
     for f in (CLAUDE_DIR / "sessions").glob("*.json"):
         info = read_json(f, {}) or {}
@@ -368,6 +369,11 @@ def interrupted_sessions():
             continue
         rec["path"] = str(f)
         rec["cause"] = "reboot" if rec.get("bootId") != boot else "crashed"
+        job = read_json(CLAUDE_DIR / "jobs" / str(rec.get("jobId")) / "state.json", {}) or {}
+        if rec.get("kind") == "bg" and job.get("state") not in (None, "working", "failed"):
+            # Claude parks a background session that sits waiting on you, and a reboot does the
+            # same to one that wasn't mid-task: nothing was lost, it's on standby.
+            rec.update(cause="standby", jobState=job["state"], needs=job.get("needs") or job.get("detail") or "")
         out.append(rec)
     out.sort(key=lambda r: -(r.get("lastActive") or r.get("seenAt") or 0))
     best = {}  # one row per background job, the record that holds its conversation
@@ -384,7 +390,7 @@ def lost_label(r):
 def cmd_recover(args):
     """Login reminder: a notification that stays until clicked, listing what was left open."""
     time.sleep(args.delay)  # let the notification daemon come up first
-    lost = interrupted_sessions()
+    lost = [r for r in interrupted_sessions() if r["cause"] != "standby"]
     waiting = [h for h in (read_json(f) for f in sorted(HANDOFFS.glob("*.json"))) if h]
     if not lost and not waiting:
         return
@@ -570,20 +576,59 @@ def show_in_pane(cmd, cwd, title, pane_id=""):
     return r.returncode == 0
 
 
+# A width the user dragged the sidebar to: kept while the Plane window stays the same size,
+# dropped (back to the default) once the window itself is resized.
+dragged = {"cols": None, "total": None}
+
+
+def split_cols():
+    """(sidebar columns, both panes' columns), or None while there's no session pane."""
+    wins = kitty_windows()
+    me = os.environ.get("KITTY_WINDOW_ID")
+    cols = next((w["columns"] for w in wins if str(w["id"]) == me), None)
+    if len(wins) < 2 or cols is None:
+        return None
+    return cols, sum(w["columns"] for w in wins)
+
+
+def same_window(total, other):
+    return other is not None and abs(total - other) <= 1  # the two panes' sum wobbles by a cell
+
+
+def default_cols(total):
+    return SIDEBAR_COLS if total >= 110 else max(24, round(total * 0.34))
+
+
 def fit_sidebar():
     """Pin the sidebar's width; kitty otherwise rescales both panes on every resize."""
     me = os.environ.get("KITTY_WINDOW_ID")
     for _ in range(3):  # resizes land in steps; nudge until it sits at the target
-        wins = kitty_windows()
-        if len(wins) < 2:
+        now = split_cols()
+        if not now:
             return
-        total = sum(w["columns"] for w in wins)
-        target = SIDEBAR_COLS if total >= 110 else max(24, round(total * 0.34))
-        cols = next((w["columns"] for w in wins if str(w["id"]) == me), None)
-        if cols is None or abs(cols - target) <= 1:
+        cols, total = now
+        target = dragged["cols"] if dragged["cols"] and same_window(total, dragged["total"]) else default_cols(total)
+        if abs(cols - target) <= 1:
             return
         kitty("resize-window", "--match", f"id:{me}", "--axis", "horizontal",
               "--increment", str(target - cols))
+
+
+def settle_resize(last_total):
+    """After the sidebar's size changed: if the window is the same size, the user dragged the
+    split, so keep that width; if the window changed size, go back to the default width.
+    Returns the panes' total width, to compare against next time."""
+    now = split_cols()
+    if not now:
+        return last_total
+    cols, total = now
+    if same_window(total, last_total):
+        keep = abs(cols - default_cols(total)) > 1
+        dragged.update(cols=cols if keep else None, total=total if keep else None)
+    else:
+        dragged.update(cols=None, total=None)
+        fit_sidebar()
+    return total
 
 
 # ---------------------------------------------------------------- start
@@ -695,6 +740,7 @@ class Sidebar:
         sys.stdout.write("\x1b[?2004h")  # bracketed paste: pastes arrive marked, not as keystrokes
         sys.stdout.flush()
         self.resized_at = 0
+        self.split_total = None  # both panes' width when last settled: tells a drag from a window resize
 
     def set_timeout(self, ms):
         self.tmo = ms
@@ -922,9 +968,11 @@ class Sidebar:
         self.start_bg(cwd, name or lost_label(r)[:40], ["--resume", r["sessionId"]] + (["--name", name] if name else []))
 
     def close_lost(self, r, everything=False):
-        """Done with a cut-off session: stop offering it (its conversation stays in /resume)."""
-        group = self.store.lost if everything else [r]
-        what = f"all {len(group)} cut-off sessions" if everything else f"'{lost_label(r)[:24]}'"
+        """Done with a cut-off or standby session: stop offering it (its conversation stays in /resume)."""
+        standby = r["cause"] == "standby"
+        group = [x for x in self.store.lost if (x["cause"] == "standby") == standby] if everything else [r]
+        what = (f"all {len(group)} {'standby' if standby else 'cut-off'} sessions" if everything
+                else f"'{lost_label(r)[:24]}'")
         if not self.confirm(f"Close {what}?"):
             return
         for x in group:
@@ -1012,9 +1060,11 @@ class Sidebar:
             if self.handoff_of(obj):
                 acts.append(("Put back in queue", lambda: self.requeue(obj)))
         elif kind == "lost":
-            acts = [("Resume", lambda: self.resume_lost(obj)),
+            standby = obj["cause"] == "standby"
+            acts = [("Continue" if standby else "Resume", lambda: self.resume_lost(obj)),
                     ("Close", lambda: self.close_lost(obj)),
-                    ("Close all cut-off sessions", lambda: self.close_lost(obj, everything=True))]
+                    (f"Close all {'standby' if standby else 'cut-off'} sessions",
+                     lambda: self.close_lost(obj, everything=True))]
         elif kind == "handoff":
             acts = [("Start", lambda: self.launch_handoff(obj)),
                     ("Read prompt", lambda: self.view_handoff(obj)),
@@ -1118,6 +1168,12 @@ class Sidebar:
                 self.put(y, 1, "▶", curses.color_pair(C_ACCENT) | attr)
             self.put(y, 2, icon, curses.color_pair(color) | attr | curses.A_BOLD)
             name = obj.get("name") or obj.get("id") or "?"
+        elif kind == "lost" and obj["cause"] == "standby":
+            blocked = obj.get("jobState") == "blocked"
+            icon, color, state = ("!", C_WARN, "needs you") if blocked else ("○", C_ACCENT, "your turn")
+            dim = 0
+            self.put(y, 2, icon, curses.color_pair(color) | attr | curses.A_BOLD)
+            name = lost_label(obj)
         elif kind == "lost":
             color, state, dim = C_WARN, {"crashed": "crash"}.get(obj["cause"], obj["cause"]), 0
             self.put(y, 2, "↯", curses.color_pair(C_WARN) | attr | curses.A_BOLD)
@@ -1152,7 +1208,12 @@ class Sidebar:
             if git_branch(where):
                 lines.append(f"branch {git_branch(where)}")
             when = obj.get("lastActive") or obj.get("seenAt")
-            if when:
+            if obj["cause"] == "standby":
+                lines.append(f"last active {ago(when)} · on standby" if when else "on standby")
+                lines.append("picks up where it left off")
+                if obj.get("needs") and obj.get("jobState") == "blocked":
+                    lines.append(f"needs: {obj['needs']}")
+            elif when:
                 lines.append(f"last active {ago(when)} · cut off by a {'reboot' if obj['cause'] == 'reboot' else 'crash'}")
             if obj.get("lastPrompt"):
                 lines.append(f"last ask: {obj['lastPrompt']}")
@@ -1172,14 +1233,15 @@ class Sidebar:
         with self.store.lock:
             sessions = list(self.store.sessions)
             handoffs = list(self.store.handoffs)
-            lost = list(self.store.lost)
+            lost = [r for r in self.store.lost if r["cause"] != "standby"]
+            standby = [r for r in self.store.lost if r["cause"] == "standby"]
             usage = dict(self.store.usage)
             err = self.store.error
         mine = [s for s in sessions if s["bg"] and not s.get("stopped")]
         paused = [s for s in sessions if s["bg"] and s.get("stopped")]
         windows = [s for s in sessions if not s["bg"]]
-        self.items = ([("lost", r) for r in lost] + [("session", s) for s in mine + paused + windows]
-                      + [("handoff", x) for x in handoffs])
+        self.items = ([("lost", r) for r in lost] + [("session", s) for s in mine] + [("lost", r) for r in standby]
+                      + [("session", s) for s in paused + windows] + [("handoff", x) for x in handoffs])
         self.sel = max(0, min(self.sel, len(self.items) - 1))
         self.rows = {}
 
@@ -1193,6 +1255,7 @@ class Sidebar:
         body, idx = [], 0
         for title, group, empty in (("CUT OFF BY CRASH/REBOOT", lost, None),
                                     ("SESSIONS", mine, "none running · n starts one"),
+                                    ("STANDBY", standby, None),
                                     ("PAUSED", paused, None),
                                     ("IN OTHER WINDOWS", windows, None),
                                     ("HANDOFFS", handoffs, "none queued")):
@@ -1330,7 +1393,7 @@ class Sidebar:
             self.draw()
             if self.resized_at and time.time() - self.resized_at > 0.3:
                 self.resized_at = 0
-                fit_sidebar()
+                self.split_total = settle_resize(self.split_total)
             try:
                 ch = self.read()
             except curses.error:
