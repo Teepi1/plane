@@ -307,6 +307,16 @@ def retire_replaced(rec):
             write_json(f, old)
 
 
+def ledger_end(job_id, reason):
+    """`claude rm` ends a background session without SessionEnd reaching our hook: mark its
+    records ended here, or a session you closed would come back as cut off by a crash."""
+    for f in LIVE.glob("*.json"):
+        rec = read_json(f, {}) or {}
+        if not rec.get("ended") and job_id in (rec.get("jobId"), rec.get("sessionId")):
+            rec.update(ended=time.time(), endReason=reason)
+            write_json(f, rec)
+
+
 def cmd_track(args):
     """Hook entry point. Prints nothing (hook stdout lands in the conversation) and never fails."""
     try:
@@ -364,6 +374,11 @@ def interrupted_sessions():
         if not rec or rec.get("ended") or rec.get("sessionId") in live:
             continue
         if rec.get("jobId") and rec["jobId"] in live_jobs:  # its background job is running again
+            continue
+        if rec.get("kind") == "bg" and rec.get("jobId") and not (CLAUDE_DIR / "jobs" / rec["jobId"]).is_dir():
+            # a crash or reboot leaves the job dir; only `claude rm` (closed, anywhere) removes it
+            rec.update(ended=time.time(), endReason="removed")
+            write_json(f, rec)
             continue
         if rec.get("bootId") == boot and proc_alive(rec.get("pid"), rec.get("procStart")):
             continue
@@ -998,8 +1013,10 @@ class Sidebar:
         code, out = self.run_claude(["rm", s["id"]], HOME)
         if code != 0:
             self.flash(f"not closed: {out.splitlines()[0][:100] if out else 'claude rm failed'}")
-        elif self.attached == s["id"]:
-            self.attached = None
+        else:
+            ledger_end(s["id"], "closed")
+            if self.attached == s["id"]:
+                self.attached = None
         self.store.poke()
         return code == 0
 
