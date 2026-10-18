@@ -471,15 +471,28 @@ def complete_dir(text):
     return done.replace(str(HOME), "~", 1) if text.startswith("~") or not text else done
 
 
+def session_state(s):
+    """What the sidebar says about a session: working, needs you, your turn, paused or failed."""
+    if s.get("stopped"):
+        return "failed" if s.get("state") == "failed" else "paused"
+    if s.get("status") == "busy":
+        return "working"
+    if s["bg"] and s.get("state") == "blocked":
+        return "needs you"
+    return "your turn"
+
+
 class Store:
     """Polls sessions, handoffs and usage on a background thread."""
 
-    def __init__(self, on_ready):
+    def __init__(self, on_ready, on_waiting):
         self.lock = threading.Lock()
         self.sessions, self.handoffs, self.usage, self.lost = [], [], {}, []
         self.error = ""
         self.on_ready = on_ready
+        self.on_waiting = on_waiting
         self._ready_seen = None
+        self._state_seen = None
         self._wake = threading.Event()
         threading.Thread(target=self._loop, daemon=True).start()
 
@@ -539,6 +552,15 @@ class Store:
                 if h["id"] in ready_now - self._ready_seen:
                     self.on_ready(h)
         self._ready_seen = ready_now
+
+        # a background session that just stopped working is waiting on you
+        states = {s["id"]: session_state(s) for s in sessions if s["bg"]}
+        if self._state_seen is not None:
+            for s in sessions:
+                state, before = states.get(s.get("id")), self._state_seen.get(s.get("id"))
+                if state in ("needs you", "your turn") and before not in (None, state):
+                    self.on_waiting(s, state)
+        self._state_seen = states
 
         with self.lock:
             self.sessions = sessions + stopped
@@ -738,7 +760,9 @@ class Sidebar:
         self.msg, self.msg_at = "", 0
         self.last_click = (None, 0)
         self.attached = None
-        self.store = Store(self.notify_ready)
+        self.open_request = None  # session id from a notification's Open button
+        self.notes = {}           # session id -> its notification's id, so a newer one replaces it
+        self.store = Store(self.notify_ready, self.notify_waiting)
         curses.curs_set(0)
         curses.use_default_colors()
         for i, c in ((C_OK, curses.COLOR_GREEN), (C_WARN, curses.COLOR_YELLOW),
@@ -804,6 +828,33 @@ class Sidebar:
     def notify_ready(self, h):
         subprocess.Popen(["notify-send", "-a", "Plane", "-i", "plane", "Handoff ready", h.get("title", "")],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def notify_waiting(self, s, state):
+        """Called on the poll thread. Skipped while you're looking at Plane: the sidebar shows it."""
+        try:
+            if json.loads(hypr("activewindow", "-j").stdout or "{}").get("class") == CLASS:
+                return
+        except ValueError:
+            pass
+        sid = s["id"]
+        name = s.get("name") or sid
+        title = f"{name} needs you" if state == "needs you" else f"Your turn: {name}"
+        cmd = ["notify-send", "-a", "Plane", "-i", "plane", "-p", "-A", "open=Open",
+               title, s.get("needs", "") if state == "needs you" else ""]
+        if self.notes.get(sid):
+            cmd[1:1] = ["-r", self.notes[sid]]
+        threading.Thread(target=self._notification, args=(sid, cmd), daemon=True).start()
+
+    def _notification(self, sid, cmd):
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        except OSError:
+            return
+        self.notes[sid] = proc.stdout.readline().strip()  # -p prints the id now, the action on click
+        if proc.stdout.readline().strip() == "open":
+            hypr_focus(f"class:^({CLASS})$")
+            self.open_request = sid
+        proc.wait()
 
     def put(self, y, x, text, attr=0):
         h, w = self.scr.getmaxyx()
@@ -1166,13 +1217,9 @@ class Sidebar:
             self.put(y, 11 + width, f"↻ {reset}", curses.A_DIM)
 
     def session_line(self, s):
-        if s.get("stopped"):
-            return "○", C_DIM, "failed" if s.get("state") == "failed" else "paused"
-        if s.get("status") == "busy":
-            return "●", C_OK, "working"
-        if s["bg"] and s.get("state") == "blocked":
-            return "!", C_WARN, "needs you"
-        return "○", C_ACCENT, "your turn"
+        state = session_state(s)
+        return {"working": ("●", C_OK), "needs you": ("!", C_WARN),
+                "your turn": ("○", C_ACCENT)}.get(state, ("○", C_DIM)) + (state,)
 
     def draw_item(self, y, w, idx):
         kind, obj = self.items[idx]
@@ -1407,6 +1454,12 @@ class Sidebar:
             if time.time() - last_sync > 3:
                 self.attached = attached_id()
                 last_sync = time.time()
+            if self.open_request:
+                sid, self.open_request = self.open_request, None
+                with self.store.lock:
+                    s = next((s for s in self.store.sessions if s.get("id") == sid and not s.get("stopped")), None)
+                if s:
+                    self.attach(s)
             self.draw()
             if self.resized_at and time.time() - self.resized_at > 0.3:
                 self.resized_at = 0
