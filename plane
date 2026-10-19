@@ -705,8 +705,6 @@ def cmd_start(args):
     if h:
         h["launchedSessionId"] = sid
         write_json(args.handoff, h)
-    if args.stop_source:
-        subprocess.run([claude_bin(), "stop", args.stop_source], capture_output=True, timeout=60)
     kitty("set-user-vars", "--match", f"id:{os.environ.get('KITTY_WINDOW_ID')}", f"plane_id={sid}")
     os.execvp(cmd[0], [cmd[0], "attach", sid])
 
@@ -998,9 +996,7 @@ class Sidebar:
     def launch_handoff(self, h):
         if not h["ready"] and not self.confirm("Its session is still working on it. Start anyway?"):
             return
-        src, extra = h.get("source"), []
-        if src and src.get("bg") and self.confirm(f"Pause '{src.get('name')}' once this starts?"):
-            extra = ["--stop-source", src["id"]]
+        src = h.get("source")
         # Claim it first: moving the file out of the queue is atomic, so a second ⏎ or a click
         # on a row the list hasn't refreshed yet finds nothing and can't launch it again.
         done = DONE / Path(h["path"]).name
@@ -1015,7 +1011,7 @@ class Sidebar:
         write_json(done, h2)
         with self.store.lock:
             self.store.handoffs = [x for x in self.store.handoffs if x["id"] != h["id"]]
-        self.start_bg(h["cwd"], h.get("title") or "handoff", ["--handoff", str(done), *extra])
+        self.start_bg(h["cwd"], h.get("title") or "handoff", ["--handoff", str(done)])
         if src and not src.get("bg"):
             self.flash(f"'{src.get('name')}' is in its own window: /exit there to close it")
 
@@ -1564,7 +1560,6 @@ def main():
     st.add_argument("--name")
     st.add_argument("--prompt")
     st.add_argument("--handoff", help="a claimed handoff file in done/")
-    st.add_argument("--stop-source", help="session id to stop once the new one is running")
     st.add_argument("--resume", help="conversation id to continue as a background session")
     st.set_defaults(fn=cmd_start)
     fo = sub.add_parser("focus", help="move focus between Plane's panes")
