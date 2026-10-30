@@ -29,6 +29,8 @@ CLAUDE_DIR = HOME / ".claude"
 DATA = HOME / ".local/share/plane"
 HANDOFFS = DATA / "handoffs"
 DONE = HANDOFFS / "done"
+DISCARDED = HANDOFFS / "discarded"  # discarded handoffs wait here, then are deleted
+DISCARD_KEEP_DAYS = 14
 CACHE = HOME / ".cache/plane"
 USAGE = CACHE / "usage.json"
 LIVE = DATA / "live"  # one file per session that was running; one left behind = interrupted
@@ -482,6 +484,17 @@ def session_state(s):
     return "your turn"
 
 
+def purge_discarded():
+    """Delete discarded handoffs older than DISCARD_KEEP_DAYS (their file time is the discard time)."""
+    cutoff = time.time() - DISCARD_KEEP_DAYS * 86400
+    for f in DISCARDED.glob("*.json"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            pass
+
+
 class Store:
     """Polls sessions, handoffs and usage on a background thread."""
 
@@ -500,7 +513,11 @@ class Store:
         self._wake.set()
 
     def _loop(self):
+        purged = 0.0
         while True:
+            if time.time() - purged > 3600:
+                purge_discarded()
+                purged = time.time()
             try:
                 self._refresh()
             except Exception as exc:  # keep polling whatever happens
@@ -1109,7 +1126,13 @@ class Sidebar:
 
     def discard_handoff(self, h):
         if self.confirm(f"Discard handoff '{h.get('title', '')[:20]}'?"):
-            Path(h["path"]).unlink(missing_ok=True)
+            src = Path(h["path"])
+            DISCARDED.mkdir(parents=True, exist_ok=True)
+            try:
+                os.replace(src, DISCARDED / src.name)
+                os.utime(DISCARDED / src.name)  # the 14 days count from now
+            except FileNotFoundError:
+                pass
             self.store.poke()
 
     def actions_for(self, kind, obj):

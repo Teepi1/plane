@@ -91,7 +91,7 @@ name and an optional first message. Right-click any row for all of its actions.
 | p | pause: the session stops but stays listed under PAUSED |
 | x | close: the session ends and leaves the list (the conversation is kept, `claude --resume` finds it) |
 | v | read a handoff's prompt |
-| x on a handoff | discard it |
+| x on a handoff | discard it (kept in `handoffs/discarded/` for 14 days, then deleted) |
 | r / R | refresh / reload Plane's own code in place |
 | ? | all keys |
 | q | quit Plane (sessions keep running) |
