@@ -854,6 +854,20 @@ def project_name(cwd):
     return "~" if not cwd or path == P.HOME else path.name
 
 
+def session_locked():
+    """The lock screen is up (logind's LockedHint, which Noctalia sets)."""
+    try:
+        sid = subprocess.run(["loginctl", "show-user", str(os.getuid()), "-p", "Display", "--value"],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+        if not sid:
+            return False
+        out = subprocess.run(["loginctl", "show-session", sid, "-p", "LockedHint", "--value"],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+        return out == "yes"
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def cheap_signature():
     """Changes when a session changes state, starts/ends, or a handoff comes or goes, without
     running `claude agents` (which costs half a second of CPU)."""
@@ -942,21 +956,39 @@ class Hub:
             pass
 
     def laptop_watching(self):
+        """You're at the laptop looking at Plane: it's the focused window, the screen isn't
+        locked, and there's been input lately. Plane is focused most of the time it's open,
+        including after you walk away, so focus alone says nothing."""
+        if (P.RUNTIME / "plane-away").exists():  # Noctalia's idle "plane-away": 2 min without input
+            return False
+        if session_locked():
+            return False
         try:
             return json.loads(P.hypr("activewindow", "-j").stdout or "{}").get("class") == P.CLASS
         except (ValueError, AttributeError):
             return False
 
+    def quiet_reason(self):
+        if self.phone_open():
+            return "the app is open on the phone"
+        if self.laptop_watching():
+            return "you're in Plane on the laptop"
+        return ""
+
     def on_waiting(self, s, state):
-        if self.phone_open() or self.laptop_watching():
-            return
         name = s.get("name") or s["id"]
         title = f"{name} needs you" if state == "needs you" else f"Your turn: {name}"
+        why = self.quiet_reason()
+        log(f"push skipped ({why}): {title}" if why else f"push: {title}")
+        if why:
+            return
         body = (s.get("needs") or "") if state == "needs you" else ""
         self.push.send({"title": title, "body": body[:240], "url": f"#s/{s['id']}", "tag": s["id"]}, topic=s["id"])
 
     def on_ready(self, h):
-        if self.phone_open() or self.laptop_watching():
+        why = self.quiet_reason()
+        log(f"push skipped ({why}): handoff ready" if why else f"push: handoff ready: {h.get('title', '')}")
+        if why:
             return
         self.push.send({"title": "Handoff ready", "body": h.get("title", ""), "url": f"#h/{Path(h['path']).stem}",
                         "tag": "h-" + Path(h["path"]).stem}, topic="h" + Path(h["path"]).stem[-30:])

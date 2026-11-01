@@ -184,8 +184,21 @@ pause, close, resume and put back in queue. Each session opens as a chat. When C
 asks something on its screen (a permission, a worktree, a plan to approve, a question,
 whether to trust a folder), the options turn into buttons. **Terminal** shows the real
 `claude attach` for anything else. With notifications on, the phone buzzes when a session
-needs you or it's your turn, unless Plane is the active window on the computer or the app
-is open on the phone.
+needs you or it's your turn. It stays quiet while the app is open on the phone, or while
+you're using Plane on the computer: Plane focused, screen unlocked, and input in the last
+couple of minutes. For that last part, have your idle daemon create
+`$XDG_RUNTIME_DIR/plane-away` after two idle minutes and delete it when you're back.
+Without that file, an unlocked computer with Plane focused counts as you being there.
+For Noctalia:
+
+```toml
+[idle.behavior.plane-away]
+action = "custom"
+command = "touch /run/user/1000/plane-away"
+resume_command = "rm -f /run/user/1000/plane-away"
+enabled = true
+timeout = 120.0
+```
 
 **Add** sends photos and files with a message. They're saved on the computer in
 `~/.local/share/plane/uploads/` (kept 30 days), and the message gives Claude their paths.
