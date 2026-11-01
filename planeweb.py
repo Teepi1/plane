@@ -825,8 +825,9 @@ def cheap_signature():
     parts = []
     for f in sorted((P.CLAUDE_DIR / "jobs").glob("*/state.json")):
         st = P.read_json(f, {}) or {}
-        parts.append((f.parent.name, st.get("state")))
-    parts.append(tuple(sorted(f.name for f in (P.CLAUDE_DIR / "sessions").glob("*.json"))))
+        parts.append((f.parent.name, st.get("state"), st.get("tempo")))
+    for f in sorted((P.CLAUDE_DIR / "sessions").glob("*.json")):  # status: busy / shell / waiting / idle
+        parts.append((f.name, (P.read_json(f, {}) or {}).get("status")))
     parts.append(tuple(sorted(f.name for f in P.HANDOFFS.glob("*.json"))))
     try:
         parts.append(P.USAGE.stat().st_mtime_ns)
@@ -862,6 +863,7 @@ class Hub:
                 purged, last, sig = 0.0, 0.0, None
                 while True:
                     now = time.time()
+                    hub.mark_phone()
                     if now - purged > 3600 and hasattr(P, "purge_discarded"):
                         P.purge_discarded()
                         purged = now
@@ -882,10 +884,25 @@ class Hub:
                         sig = None
                     self._wake.clear()
 
-        return WebStore(self.on_ready, self.on_waiting)
+        return WebStore(self.on_ready, self.on_waiting, lambda sid: None)
 
     def phone_open(self):
         return bool(self.event_queues or self.viewers)
+
+    def mark_phone(self):
+        """Tell the sidebar the app is open on a phone (it then skips its own notifications):
+        a file touched every few seconds while a phone is connected, removed when none is."""
+        flag = P.PHONE_FLAG
+        try:
+            if self.phone_open():
+                if time.time() - getattr(self, "_flagged", 0) > 5:
+                    flag.touch()
+                    self._flagged = time.time()
+            elif getattr(self, "_flagged", 0):
+                flag.unlink(missing_ok=True)
+                self._flagged = 0
+        except OSError:
+            pass
 
     def laptop_watching(self):
         try:
@@ -1528,6 +1545,10 @@ def serve(plane_module=None, port=PORT):
             attaches = list(hub.attaches.values())
         for a in attaches:
             a.close()
+        try:
+            P.PHONE_FLAG.unlink(missing_ok=True)
+        except (OSError, AttributeError):
+            pass
         os._exit(0)
 
     signal.signal(signal.SIGTERM, stop)
