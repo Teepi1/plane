@@ -111,14 +111,20 @@ trigger sidebar keys.
 
 ### Sections
 
-- **SESSIONS:** your running background sessions.
-- **STANDBY:** sessions that were waiting on you when Claude Code put them to sleep (it does
-  this to background sessions left idle for a while) or the machine restarted. Nothing was
-  lost: open one and it picks up where it left off.
+- **SESSIONS:** your background sessions, the one you used last at the top (the last one
+  you sent a message to or opened). Below them come sessions on standby: ones that were
+  waiting on you when Claude Code put them to sleep (it does this to background sessions
+  left idle for a while) or the machine restarted. Nothing was lost: open one and it picks
+  up where it left off.
 - **PAUSED:** sessions you paused. Open one to continue it.
 - **IN OTHER WINDOWS:** Claude Code sessions running in ordinary terminals. Opening one
   switches to its window (on Hyprland).
-- **HANDOFFS:** queued prompts waiting to start as new sessions.
+- **HANDOFFS:** queued prompts waiting to start as new sessions, newest first. Only the
+  newest four are listed until you open the "N more handoffs" row.
+
+A session that ends its turn while one of its own tasks still runs (a background shell, a CI
+watch) shows *needs you* when it asked you something, and *working* when it's only waiting
+on that task. When a session goes back to work or you open it, its notification goes away.
 - **CUT OFF BY CRASH/REBOOT:** sessions that were working when the machine went down.
 
 ## Handoffs
@@ -162,7 +168,7 @@ With the hooks from `--claude`, every session keeps a small record in
 `~/.local/share/plane/live/` while it runs, and marks it when it ends normally. A session
 whose record is still open after its process is gone was cut off, so Plane lists it at
 the top of the sidebar, and Enter resumes it. A background session that was waiting on you
-rather than working goes under STANDBY instead, since nothing was interrupted. With `--autostart`, a notification at login
+rather than working is listed under SESSIONS on standby instead, since nothing was interrupted. With `--autostart`, a notification at login
 lists anything that was cut off plus handoffs still waiting.
 
 ## Hyprland

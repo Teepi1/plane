@@ -33,6 +33,8 @@ DISCARDED = HANDOFFS / "discarded"  # discarded handoffs wait here, then are del
 DISCARD_KEEP_DAYS = 14
 CACHE = HOME / ".cache/plane"
 USAGE = CACHE / "usage.json"
+OPENED = CACHE / "opened.json"  # session id -> when you last opened it in Plane
+NOTES = CACHE / "notes.json"    # session id -> id of its "your turn"/"needs you" notification
 LIVE = DATA / "live"  # one file per session that was running; one left behind = interrupted
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
 SOCK = RUNTIME / "plane-kitty.sock"
@@ -477,11 +479,53 @@ def session_state(s):
     """What the sidebar says about a session: working, needs you, your turn, paused or failed."""
     if s.get("stopped"):
         return "failed" if s.get("state") == "failed" else "paused"
-    if s.get("status") == "busy":
-        return "working"
-    if s["bg"] and s.get("state") == "blocked":
+    if not s["bg"] or not s.get("procStatus"):
+        if s.get("status") == "busy":
+            return "working"
+        return "needs you" if s["bg"] and s.get("state") == "blocked" else "your turn"
+    # A background session reports "busy" (`claude agents`) for as long as any of its tasks
+    # runs, a background shell or a CI watch included, even after its turn has ended with a
+    # question for you. Its own status file tells "busy" (thinking) from "shell" (only a task
+    # running), and its job file says whether the turn ended blocked on you.
+    proc, job, tempo = s["procStatus"], s.get("jobState"), s.get("tempo")
+    if proc == "waiting":  # a permission prompt
         return "needs you"
+    if proc == "busy":
+        return "working"
+    if tempo == "blocked" or (job == "blocked" and tempo != "active"):
+        return "needs you"
+    if proc == "shell" and job == "working":  # waiting on its own task; it carries on after
+        return "working"
     return "your turn"
+
+
+def last_used(s, opened):
+    """When you last used a session: your last message to it (the ledger's lastActive) or
+    the last time you opened it in Plane, whichever is later; its start if neither."""
+    rec = read_json(LIVE / f"{s.get('sessionId')}.json", {}) or {} if s.get("sessionId") else {}
+    started = (s.get("startedAt") or 0) / 1000
+    return max(rec.get("lastActive") or 0, opened.get(s.get("id") or "", 0), started)
+
+
+def close_notification(nid):
+    if not nid or not str(nid).isdigit():
+        return
+    try:
+        subprocess.run(["gdbus", "call", "--session", "--dest", "org.freedesktop.Notifications",
+                        "--object-path", "/org/freedesktop/Notifications",
+                        "--method", "org.freedesktop.Notifications.CloseNotification", str(nid)],
+                       capture_output=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def mark_opened(sid):
+    if not sid:
+        return
+    opened = read_json(OPENED, {}) or {}
+    opened[sid] = time.time()
+    cutoff = time.time() - 30 * 86400
+    write_json(OPENED, {k: v for k, v in opened.items() if v > cutoff})
 
 
 def purge_discarded():
@@ -498,12 +542,13 @@ def purge_discarded():
 class Store:
     """Polls sessions, handoffs and usage on a background thread."""
 
-    def __init__(self, on_ready, on_waiting):
+    def __init__(self, on_ready, on_waiting, on_settled):
         self.lock = threading.Lock()
         self.sessions, self.handoffs, self.usage, self.lost = [], [], {}, []
         self.error = ""
         self.on_ready = on_ready
         self.on_waiting = on_waiting
+        self.on_settled = on_settled
         self._ready_seen = None
         self._state_seen = None
         self._wake = threading.Event()
@@ -534,14 +579,19 @@ class Store:
             bg = s.get("kind") == "background"
             s["bg"] = bg
             s["branch"] = git_branch(s.get("cwd", ""))
-            files = read_json(CLAUDE_DIR / "sessions" / f"{s.get('pid')}.json", {}) if s.get("pid") else {}
+            files = read_json(CLAUDE_DIR / "sessions" / f"{s.get('pid')}.json", {}) or {} if s.get("pid") else {}
             s["procStart"] = files.get("procStart")
             if bg:
-                job = read_json(CLAUDE_DIR / "jobs" / s["id"] / "state.json", {})
+                job = read_json(CLAUDE_DIR / "jobs" / s["id"] / "state.json", {}) or {}
                 s["needs"] = job.get("needs") or job.get("detail") or ""
+                s["procStatus"] = files.get("status")  # busy / shell / waiting / idle
+                s["jobState"], s["tempo"] = job.get("state"), job.get("tempo")
             alive = bool(s.get("pid")) and Path(f"/proc/{s['pid']}").exists()
             (sessions if alive else stopped).append(s)
-        sessions.sort(key=lambda s: (not s["bg"], s.get("startedAt", 0)))
+        opened = read_json(OPENED, {}) or {}
+        for s in sessions + stopped:
+            s["usedAt"] = last_used(s, opened)
+        sessions.sort(key=lambda s: (not s["bg"], -s["usedAt"]))  # most recently used first
         ledger_sync()
         lost = interrupted_sessions()
         lost_ids = {r["sessionId"] for r in lost}
@@ -577,6 +627,13 @@ class Store:
                 state, before = states.get(s.get("id")), self._state_seen.get(s.get("id"))
                 if state in ("needs you", "your turn") and before not in (None, state):
                     self.on_waiting(s, state)
+            parked = {r.get("jobId") for r in lost if r["cause"] == "standby"}  # still waiting on you
+            for sid, before in self._state_seen.items():
+                # it went back to work, was paused or closed: its notification is out of date
+                now = states.get(sid)
+                if before in ("needs you", "your turn") and now not in ("needs you", "your turn") \
+                        and not (now is None and sid in parked):
+                    self.on_settled(sid)
         self._state_seen = states
 
         with self.lock:
@@ -732,6 +789,7 @@ C_OK, C_WARN, C_BAD, C_ACCENT, C_DIM, C_TEXT = 1, 2, 3, 4, 5, 6
 SEL = 10  # pair + SEL: the same color on the selected row's band
 PASTE_START, PASTE_END = "[200~", "\x1b[201~"
 TONES = {"info": C_ACCENT, "warn": C_WARN, "bad": C_BAD}
+HANDOFFS_SHOWN = 4  # newest handoffs listed before "N more handoffs"
 
 
 def short_needs(text, limit=140):
@@ -809,11 +867,14 @@ class Sidebar:
         self.msg, self.msg_at, self.msg_tone = "", 0, "info"
         self.sel_key = None       # the selected item's identity, so a refresh can't move the selection
         self.last_discard = None  # path in discarded/, for u to bring it back
+        self.handoffs_open = False  # the handoff list shows HANDOFFS_SHOWN until you open the rest
+        self.pending_key = None     # an item to select on the next draw
         self.last_click = (None, 0)
         self.attached = None
         self.open_request = None  # session id from a notification's Open button
         self.notes = {}           # session id -> its notification's id, so a newer one replaces it
-        self.store = Store(self.notify_ready, self.notify_waiting)
+        self.clear_stale_notes()
+        self.store = Store(self.notify_ready, self.notify_waiting, self.clear_note)
         curses.curs_set(0)
         curses.use_default_colors()
         # The selected row sits on a band of the theme's color 0, a step up from the
@@ -897,20 +958,56 @@ class Sidebar:
         title = f"{name} needs you" if state == "needs you" else f"Your turn: {name}"
         cmd = ["notify-send", "-a", "Plane", "-i", "plane", "-p", "-A", "open=Open",
                title, short_needs(s.get("needs")) if state == "needs you" else ""]
-        if self.notes.get(sid):
-            cmd[1:1] = ["-r", self.notes[sid]]
-        threading.Thread(target=self._notification, args=(sid, cmd), daemon=True).start()
+        old = self.notes.get(sid)
+        if old and old.get("id"):
+            cmd[1:1] = ["-r", old["id"]]  # one notification per session, updated in place
+        threading.Thread(target=self._notification, args=(sid, cmd, old), daemon=True).start()
 
-    def _notification(self, sid, cmd):
+    def _notification(self, sid, cmd, old):
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         except OSError:
             return
-        self.notes[sid] = proc.stdout.readline().strip()  # -p prints the id now, the action on click
+        note = {"proc": proc, "id": proc.stdout.readline().strip()}  # -p prints the id now, the action on click
+        self.notes[sid] = note
+        if old and old.get("proc"):
+            old["proc"].kill()  # the replaced notification's waiter would otherwise wait forever
+        self.save_notes()
         if proc.stdout.readline().strip() == "open":
             hypr_focus(f"class:^({CLASS})$")
             self.open_request = sid
         proc.wait()
+        if self.notes.get(sid) is note:
+            self.notes.pop(sid, None)
+            self.save_notes()
+
+    def save_notes(self):
+        write_json(NOTES, {sid: n["id"] for sid, n in list(self.notes.items()) if n.get("id")})
+
+    def clear_note(self, sid):
+        """Take back a session's notification: it was opened, or it's no longer waiting on you.
+        Without this, a stale "Your turn" stays up until you click it."""
+        note = self.notes.pop(sid, None)
+        if not note:
+            return
+        self.save_notes()
+        close_notification(note.get("id"))
+        if note.get("proc"):
+            note["proc"].kill()
+
+    def clear_stale_notes(self):
+        """At start: notifications from before a restart or reload can't be answered any more
+        (nothing is listening for their Open button), so take them all back."""
+        for nid in (read_json(NOTES, {}) or {}).values():
+            close_notification(nid)
+        NOTES.unlink(missing_ok=True)
+        for pid in os.listdir("/proc"):
+            argv = cmdline(pid) if pid.isdigit() else []
+            if argv and Path(argv[0]).name == "notify-send" and "Plane" in argv and "-p" in argv:
+                try:
+                    os.kill(int(pid), 15)
+                except OSError:
+                    pass
 
     def put(self, y, x, text, attr=0):
         h, w = self.scr.getmaxyx()
@@ -1046,6 +1143,8 @@ class Sidebar:
             else:
                 self.flash("couldn't find that session's window", "bad")
             return
+        mark_opened(s["id"])
+        self.clear_note(s["id"])  # you're looking at it now: its "your turn" note is done
         if self.attached == s["id"]:
             kitty("focus-window", "--match", "var:plane_role=session")
             return
@@ -1117,6 +1216,7 @@ class Sidebar:
             self.flash(f"its folder is gone: {cwd}", "bad")
             return
         job = r.get("jobId")
+        mark_opened(job)
         if r.get("kind") == "bg" and job and (CLAUDE_DIR / "jobs" / job).is_dir():
             if show_in_pane([claude_bin(), "attach", job], cwd, name or job, job):
                 self.attached = job
@@ -1246,6 +1346,8 @@ class Sidebar:
             acts = [("Start", lambda: self.launch_handoff(obj)),
                     ("Read prompt", lambda: self.view_handoff(obj)),
                     ("Discard", lambda: self.discard_handoff(obj))]
+        elif kind == "more":
+            acts = [("Show all handoffs" if obj["hidden"] else "Show fewer", self.toggle_handoffs)]
         else:
             acts = []
         return acts + ([(None, None)] if acts else []) + [("New session…", self.new_session)]
@@ -1363,6 +1465,10 @@ class Sidebar:
             return "○", C_ACCENT, lost_label(obj), "your turn", C_ACCENT, ""
         if kind == "lost":
             return "↯", C_WARN, lost_label(obj), {"crashed": "crash"}.get(obj["cause"], obj["cause"]), C_WARN, ""
+        if kind == "more":
+            if obj["hidden"]:
+                return "+", C_DIM, f"{obj['hidden']} more handoffs", "", C_DIM, "dim"
+            return "−", C_DIM, "show fewer", "", C_DIM, "dim"
         if obj["ready"]:  # handoffs: ready is the normal case, so only "not ready" gets a word
             return "→", C_ACCENT, obj.get("title", "?"), "", C_ACCENT, ""
         return "…", C_WARN, obj.get("title", "?"), "not ready", C_WARN, "dim"
@@ -1409,7 +1515,7 @@ class Sidebar:
             else:  # too long for one line: each gets its own
                 for bit in bits:
                     add(bit, max_lines=1)
-            if obj.get("needs") and obj.get("state") == "blocked":
+            if obj.get("needs") and session_state(obj) == "needs you":
                 add(f"needs you: {short_needs(obj['needs'], 300)}", "warn", 4)
             if not obj["bg"]:
                 add("in its own window · /exit there to close")
@@ -1429,6 +1535,8 @@ class Sidebar:
                 add(f"cut off by {cause}" + (f" {ago(when)}" if when else ""), "warn")
             if obj.get("lastPrompt"):
                 add(f"last ask: {obj['lastPrompt']}")
+        elif kind == "more":
+            add("open it to list every handoff" if obj["hidden"] else "open it to show only the newest")
         else:
             src = obj.get("source")
             state = "has ended" if not src else ("is still writing it" if src.get("status") == "busy" else "is done")
@@ -1461,12 +1569,21 @@ class Sidebar:
         mine = [s for s in sessions if s["bg"] and not s.get("stopped")]
         paused = [s for s in sessions if s["bg"] and s.get("stopped")]
         windows = [s for s in sessions if not s["bg"]]
+        # handoffs: newest first, and only the first few unless you open the rest
+        handoffs.sort(key=lambda x: -(x.get("createdAt") or 0))
+        hand_rows = [("handoff", x) for x in handoffs]
+        if len(handoffs) > HANDOFFS_SHOWN + 1:
+            hidden = 0 if self.handoffs_open else len(handoffs) - HANDOFFS_SHOWN
+            hand_rows = hand_rows[:len(handoffs) - hidden] + [("more", {"id": "handoffs", "hidden": hidden})]
         # self.sel indexes the list as it was last drawn: carry the selection to the same
         # item in the fresh list, so a session coming or going doesn't move it
         old = self.items
         key = self.item_key(old[self.sel]) if 0 <= self.sel < len(old) else None
+        key, self.pending_key = self.pending_key or key, None
+        # standby sessions are parked by Claude while they wait on you: they're listed with
+        # the running ones, below them
         self.items = ([("lost", r) for r in lost] + [("session", s) for s in mine] + [("lost", r) for r in standby]
-                      + [("session", s) for s in paused + windows] + [("handoff", x) for x in handoffs])
+                      + [("session", s) for s in paused + windows] + hand_rows)
         keys = [self.item_key(it) for it in self.items]
         self.sel = keys.index(key) if key in keys else max(0, min(self.sel, len(self.items) - 1))
         self.rows = {}
@@ -1486,17 +1603,17 @@ class Sidebar:
 
         # body: section headings and item rows, scrolled to keep the selection visible
         body, idx = [], 0
-        for title, group, empty in (("CUT OFF BY CRASH/REBOOT", lost, None),
-                                    ("SESSIONS", mine, "none running · n starts one"),
-                                    ("STANDBY", standby, None),
-                                    ("PAUSED", paused, None),
-                                    ("IN OTHER WINDOWS", windows, None),
-                                    ("HANDOFFS", handoffs, "none queued")):
+        for title, group, count, empty in (("CUT OFF BY CRASH/REBOOT", lost, len(lost), None),
+                                           ("SESSIONS", mine + standby, len(mine) + len(standby),
+                                            "none running · n starts one"),
+                                           ("PAUSED", paused, len(paused), None),
+                                           ("IN OTHER WINDOWS", windows, len(windows), None),
+                                           ("HANDOFFS", hand_rows, len(handoffs), "none queued")):
             if not group and empty is None:
                 continue
             if body:
                 body.append(("gap", None))
-            body.append(("head", (title, len(group))))
+            body.append(("head", (title, count)))
             if not group:
                 body.append(("note", empty))
             for _ in group:
@@ -1623,6 +1740,18 @@ class Sidebar:
             self.launch_handoff(obj)
         elif kind == "lost":
             self.resume_lost(obj)
+        elif kind == "more":
+            self.toggle_handoffs()
+
+    def toggle_handoffs(self):
+        """Open the rest of the handoff list (selecting the first one it shows), or fold it."""
+        self.handoffs_open = not self.handoffs_open
+        if self.handoffs_open:
+            shown = [o for k, o in self.items if k == "handoff"]
+            with self.store.lock:
+                rest = sorted(self.store.handoffs, key=lambda x: -(x.get("createdAt") or 0))[len(shown):]
+            if rest:
+                self.pending_key = ("handoff", rest[0].get("id"))
 
     def click(self, row):
         # A handoff starts a whole session, so it needs a double-click (or ⏎) to start.
