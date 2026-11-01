@@ -145,9 +145,21 @@ def parse_prompt(lines):
     lines = [ln.rstrip() for ln in lines]
     while lines and not lines[-1].strip():
         lines.pop()
+    # Claude pins the session's name rule ("──── my-session ─") to the bottom of the screen,
+    # with empty rows between it and the menu
+    if lines and SOLID.match(lines[-1]):
+        lines.pop()
+        while lines and not lines[-1].strip():
+            lines.pop()
     hint = next((i for i in range(len(lines) - 1, max(-1, len(lines) - 14), -1) if HINT.search(lines[i])), None)
-    if hint is None:
-        return None
+    bare = hint is None  # a menu with no hint under it: the "Ready to submit your answers?" review
+    if bare:
+        if not lines or not OPT_NUM.match(lines[-1]):
+            return None
+        hint = len(lines)
+    # on a narrow screen the hint wraps: "Enter to select · Tab/Arrow keys to navigate ·" / "Esc to cancel"
+    while not bare and hint > 0 and lines[hint - 1].strip() and (HINT.search(lines[hint - 1]) or lines[hint - 1].endswith("·")):
+        hint -= 1
     opts, pending = [], []
     i, num_col, skipped = hint - 1, None, 0
     # numbered options, read upward: "❯ 1. Yes", descriptions indented under them
@@ -185,6 +197,11 @@ def parse_prompt(lines):
         # numbers must run 1..N
         if [o["n"] for o in opts] != list(range(1, len(opts) + 1)):
             return None
+        # without a hint, only a real menu: two or more options with the cursor on one
+        if bare and (len(opts) < 2 or not any(o["selected"] for o in opts)):
+            return None
+    elif bare:
+        return None
     else:
         # plain menu (the folder-trust prompt): "❯ No, exit" with its siblings at the same column
         sel = next((j for j in range(hint - 1, max(-1, hint - 12), -1) if SELECTOR.match(lines[j])), None)
@@ -214,6 +231,10 @@ def parse_prompt(lines):
             in_code = not in_code
         elif ln.strip():
             text = re.sub(r"^\s*│\s?", "", ln).strip()
+            if text.startswith("←") and text.endswith("→"):  # the tabs of a several-question ask
+                tabs = [t for t in re.split(r"\s{2,}", text.strip("←→ ")) if t]
+                text = " · ".join(re.sub(r"^[☐✔]\s*", "", t) if not t.startswith("☒") else t[1:].strip() + " ✓"
+                                  for t in tabs)
             ctx.append({"t": "code" if in_code else "text", "s": text})
         j -= 1
     ctx.reverse()
@@ -229,7 +250,7 @@ def parse_prompt(lines):
         merged = [{"t": "text", "s": "…"}] + merged[-13:]
     selected = next((k for k, o in enumerate(opts) if o["selected"]), 0)
     body = json.dumps([merged, [o["label"] for o in opts]], ensure_ascii=False)
-    return {"context": merged, "options": opts, "selected": selected, "hint": lines[hint].strip(),
+    return {"context": merged, "options": opts, "selected": selected, "hint": "" if bare else lines[hint].strip(),
             "sig": hashlib.sha1(body.encode()).hexdigest()[:12]}
 
 

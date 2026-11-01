@@ -11,7 +11,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
-sys.modules.setdefault("pyte", types.ModuleType("pyte"))
+sys.modules.setdefault("pyte", None)
 import planeweb  # noqa: E402
 
 try:

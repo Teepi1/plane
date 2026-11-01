@@ -1,0 +1,50 @@
+
+ ▐▛███▛█   Claude Code v2.1.316
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   ~/…/9e38a013/tmp/spike/ws
+
+
+❯ Use the AskUserQuestion tool right
+  away to ask me two questions in one
+  call: 1) favourite colour (options
+  Red, Blue) 2) favourite fruit
+  (options Apple, Pear). Do nothing
+  else.
+
+● User answered Claude's questions:
+  ⎿  · What is your favourite colour? →
+     Red
+     · What is your favourite fruit? →
+     Pear
+
+● Your answers are Red for favourite
+  colour and Pear for favourite fruit.
+  That was the only action, as you
+  asked.
+
+✻ Worked for 7s · done 11:14 AM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+──────────────────── plane-prompt-test ─
+❯
+────────────────────────────────────────
+  5h 30% · wk 56%
+  ⏵⏵ auto mode on (shift+tab to cycle)
