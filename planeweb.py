@@ -460,11 +460,21 @@ class PtyScreen:
 class Attach(PtyScreen):
     """`claude attach <id>` for the phones looking at one session."""
 
-    def __init__(self, hub, job):
+    def __init__(self, hub, job, size=(100, 50)):
         self.hub, self.job = hub, job
         self.idle_since = time.time()
         self.started = time.time()
-        super().__init__([P.claude_bin(), "attach", job], str(P.HOME))
+        self.left_at = 0.0     # when the last phone viewing it left (0: never had one, or one is here)
+        self.last_input = 0.0  # when the phone last typed into it
+        super().__init__([P.claude_bin(), "attach", job], str(P.HOME), *size)
+
+    def write(self, data):
+        super().write(data)
+        self.last_input = time.time()
+
+    def term_open(self):
+        with self.lock:
+            return any(getattr(q, "term", False) for q in self.listeners)
 
     def input_line(self):
         """The text in Claude's input box (the last "❯" line near the bottom), or None."""
@@ -1104,6 +1114,7 @@ class Hub:
         self.push = Push(contact)
         self.store = self._make_store()
         threading.Thread(target=self._janitor, daemon=True).start()
+        threading.Thread(target=self._match_laptop, daemon=True).start()
 
     # -- polling
     def _make_store(self):
@@ -1287,7 +1298,7 @@ class Hub:
                 return None
             if pyte is None:
                 raise RuntimeError("python-pyte isn't installed, so Plane can't open the session")
-            a = self.attaches[job] = Attach(self, job)
+            a = self.attaches[job] = Attach(self, job, self.chat_size(job))
             for q in self.viewers.get(job, ()):
                 a.listeners.add(q)
             log(f"attached {job}")
@@ -1306,7 +1317,45 @@ class Hub:
         if a:
             with a.lock:
                 a.listeners.add(q)
+                a.left_at = 0.0
         self.store.poke()
+
+    # -- staying the same size as the laptop
+    # Two views of one session at different sizes garble the narrower one: Claude's text comes
+    # out split at its right edge, and a redraw comes out the same, until the other view goes.
+    # So while the laptop's pane shows a session, the phone's copy of it takes the pane's size
+    # (the chat only reads Claude's menus off it, which works at any width). The phone's
+    # Terminal needs the phone's own size; the laptop puts up with it while that's open.
+
+    def laptop_pane(self):
+        """(session id, cols, rows) of the session in Plane's pane on the laptop, or None."""
+        try:
+            for w in P.kitty_windows():
+                uv = w.get("user_vars") or {}
+                if uv.get("plane_role") == "session" and uv.get("plane_id"):
+                    return uv["plane_id"], int(w["columns"]), int(w["lines"])
+        except (OSError, subprocess.SubprocessError, KeyError, TypeError, ValueError):
+            pass
+        return None
+
+    def chat_size(self, job, pane=False):
+        pane = self.laptop_pane() if pane is False else pane
+        if not pane or pane[0] != job:
+            return 100, 50
+        return max(30, min(pane[1], 240)), max(10, min(pane[2], 120))  # as PtyScreen.resize allows
+
+    def _match_laptop(self):
+        while True:
+            time.sleep(1.5)
+            with self.lock:
+                attaches = [a for a in self.attaches.values() if not a.dead]
+            if not attaches:
+                continue
+            pane = self.laptop_pane()
+            for a in attaches:
+                size = self.chat_size(a.job, pane)
+                if not a.term_open() and (a.cols, a.rows) != size:
+                    a.resize(*size)
 
     def unwatch(self, job, q):
         with self.lock:
@@ -1319,6 +1368,8 @@ class Hub:
             with a.lock:
                 a.listeners.discard(q)
                 a.idle_since = time.time()
+                if not vs:
+                    a.left_at = time.time()
             if getattr(q, "term", False):
                 threading.Thread(target=self._unterm, args=(a,), daemon=True).start()
 
@@ -1327,20 +1378,23 @@ class Hub:
         """Back to the size the prompt reader likes, unless a terminal view came right back
         (it reconnects on every rotation)."""
         time.sleep(2)
-        with a.lock:
-            if any(getattr(x, "term", False) for x in a.listeners):
-                return
-        if not a.dead:
-            a.resize(100, 50)
+        if not a.dead and not a.term_open():
+            a.resize(*a.hub.chat_size(a.job))
+
+    LEAVE_GRACE = 15  # seconds a session stays attached after the phone leaves it
 
     def _janitor(self):
-        """Detach from sessions nobody has looked at for two minutes; forget old starters."""
+        """Detach from a session soon after the phone leaves it: while attached, the laptop's
+        view of it can garble (see _match_laptop). The grace covers a quick trip out of the
+        app. One the phone only woke, never opened, goes after two quiet minutes. Also
+        forget old starters."""
         while True:
-            time.sleep(15)
+            time.sleep(5)
             now = time.time()
             with self.lock:
-                idle = [a for job, a in self.attaches.items() if not self.viewers.get(job)
-                        and now - max(a.idle_since, a.last_output) > 120]
+                idle = [a for job, a in self.attaches.items() if not self.viewers.get(job) and (
+                    (a.left_at and now - max(a.left_at, a.last_input + 20) > self.LEAVE_GRACE)
+                    or now - max(a.idle_since, a.last_output) > 120)]
                 for k, s in list(self.starters.items()):
                     if s.dead and now - s.created > 900:
                         del self.starters[k]
