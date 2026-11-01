@@ -111,8 +111,10 @@ trigger sidebar keys.
 
 ### Sections
 
-- **SESSIONS:** your background sessions, the one you used last at the top (the last one
-  you sent a message to or opened). Below them come sessions on standby: ones that were
+- **SESSIONS:** your background sessions, the one you last sent a message to at the top.
+  Rows don't move while you're in the sidebar (states still update in place), so a click
+  always lands on what you see; the new order shows once you go back to a session. Below
+  them come sessions on standby: ones that were
   waiting on you when Claude Code put them to sleep (it does this to background sessions
   left idle for a while) or the machine restarted. Nothing was lost: open one and it picks
   up where it left off.

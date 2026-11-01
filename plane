@@ -33,7 +33,6 @@ DISCARDED = HANDOFFS / "discarded"  # discarded handoffs wait here, then are del
 DISCARD_KEEP_DAYS = 14
 CACHE = HOME / ".cache/plane"
 USAGE = CACHE / "usage.json"
-OPENED = CACHE / "opened.json"  # session id -> when you last opened it in Plane
 NOTES = CACHE / "notes.json"    # session id -> id of its "your turn"/"needs you" notification
 LIVE = DATA / "live"  # one file per session that was running; one left behind = interrupted
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
@@ -499,12 +498,26 @@ def session_state(s):
     return "your turn"
 
 
-def last_used(s, opened):
-    """When you last used a session: your last message to it (the ledger's lastActive) or
-    the last time you opened it in Plane, whichever is later; its start if neither."""
+def last_used(s):
+    """When you last used a session: your last message to it (the ledger's lastActive), or
+    its start. Opening one doesn't count: browsing would reshuffle the list under you."""
     rec = read_json(LIVE / f"{s.get('sessionId')}.json", {}) or {} if s.get("sessionId") else {}
     started = (s.get("startedAt") or 0) / 1000
-    return max(rec.get("lastActive") or 0, opened.get(s.get("id") or "", 0), started)
+    return max(rec.get("lastActive") or 0, started)
+
+
+def changes_signature():
+    """Changes whenever a session's status, a job's state, the ledger, the handoff queue or
+    the usage numbers change: the files and their modification times."""
+    files = [*(CLAUDE_DIR / "sessions").glob("*.json"), *(CLAUDE_DIR / "jobs").glob("*/state.json"),
+             *LIVE.glob("*.json"), *HANDOFFS.glob("*.json"), USAGE]
+    sig = []
+    for f in files:
+        try:
+            sig.append((str(f), f.stat().st_mtime_ns))
+        except OSError:
+            pass
+    return sorted(sig)
 
 
 def close_notification(nid):
@@ -517,15 +530,6 @@ def close_notification(nid):
                        capture_output=True, timeout=3)
     except (OSError, subprocess.SubprocessError):
         pass
-
-
-def mark_opened(sid):
-    if not sid:
-        return
-    opened = read_json(OPENED, {}) or {}
-    opened[sid] = time.time()
-    cutoff = time.time() - 30 * 86400
-    write_json(OPENED, {k: v for k, v in opened.items() if v > cutoff})
 
 
 def purge_discarded():
@@ -567,8 +571,15 @@ class Store:
                 self._refresh()
             except Exception as exc:  # keep polling whatever happens
                 self.error = f"refresh: {exc}"
-            self._wake.wait(2.5)
+            # `claude agents` costs ~0.4 s of CPU, so don't run it on a timer: watch the files
+            # sessions write when their state changes (a stat each, every 0.3 s) and refresh
+            # as soon as one does, with a full refresh every 10 s as a backstop
+            seen, since = changes_signature(), time.time()
+            while not self._wake.wait(0.3):
+                if changes_signature() != seen or time.time() - since > 10:
+                    break
             self._wake.clear()
+            time.sleep(max(0.0, since + 1 - time.time()))  # at most one refresh a second
 
     def _refresh(self):
         out = subprocess.run([claude_bin(), "agents", "--json", "--all"],
@@ -588,9 +599,8 @@ class Store:
                 s["jobState"], s["tempo"] = job.get("state"), job.get("tempo")
             alive = bool(s.get("pid")) and Path(f"/proc/{s['pid']}").exists()
             (sessions if alive else stopped).append(s)
-        opened = read_json(OPENED, {}) or {}
         for s in sessions + stopped:
-            s["usedAt"] = last_used(s, opened)
+            s["usedAt"] = last_used(s)
         sessions.sort(key=lambda s: (not s["bg"], -s["usedAt"]))  # most recently used first
         ledger_sync()
         lost = interrupted_sessions()
@@ -788,6 +798,7 @@ def cmd_start(args):
 C_OK, C_WARN, C_BAD, C_ACCENT, C_DIM, C_TEXT = 1, 2, 3, 4, 5, 6
 SEL = 10  # pair + SEL: the same color on the selected row's band
 PASTE_START, PASTE_END = "[200~", "\x1b[201~"
+FOCUS_IN, FOCUS_OUT = -1001, -1002  # what read() returns for the terminal's focus reports
 TONES = {"info": C_ACCENT, "warn": C_WARN, "bad": C_BAD}
 HANDOFFS_SHOWN = 4  # newest handoffs listed before "N more handoffs"
 
@@ -892,8 +903,13 @@ class Sidebar:
         self.tmo = 400
         scr.timeout(self.tmo)
         scr.keypad(True)
-        sys.stdout.write("\x1b[?2004h")  # bracketed paste: pastes arrive marked, not as keystrokes
+        # bracketed paste: pastes arrive marked, not as keystrokes; focus reports: the terminal
+        # says when you move into or out of the sidebar
+        sys.stdout.write("\x1b[?2004h\x1b[?1004h")
         sys.stdout.flush()
+        self.focused = True  # it starts focused: it's the window that was just opened
+        self.shown = {}      # item key -> its position on screen, last time it was drawn
+        self.last_keys, self.prev_keys, self.moved_at = [], [], 0.0  # the list's order, and when it last changed
         self.resized_at = 0
         self.split_total = None  # both panes' width when last settled: tells a drag from a window resize
 
@@ -902,7 +918,23 @@ class Sidebar:
         self.scr.timeout(ms)
 
     def read(self):
-        """Next key: an int (special/ord), or a Paste. Raises curses.error on timeout."""
+        """Next key: an int (special/ord), or a Paste. Raises curses.error on timeout.
+        Focus reports are taken here (they set self.focused) and never returned as keys."""
+        while True:
+            ch = self._read_one()
+            if isinstance(ch, int) and ch >= 512 and not isinstance(ch, Paste):
+                # ncurses turns the focus report into a key of its own when the terminfo
+                # names it (kitty's and xterm's do), with a code that differs between them
+                try:
+                    ch = {b"kxIN": FOCUS_IN, b"kxOUT": FOCUS_OUT}.get(curses.keyname(ch), ch)
+                except ValueError:
+                    pass
+            if ch not in (FOCUS_IN, FOCUS_OUT):
+                return ch
+            self.focused = ch == FOCUS_IN
+            dbg(f"focus {'in' if self.focused else 'out'}")
+
+    def _read_one(self):
         ch = self.scr.get_wch()
         if ch != "\x1b":
             return ord(ch) if isinstance(ch, str) else ch
@@ -915,6 +947,8 @@ class Sidebar:
                 except curses.error:
                     break
                 seq += c if isinstance(c, str) else "?"
+            if seq in ("[I", "[O"):  # kitty's focus report (mode 1004)
+                return FOCUS_IN if seq == "[I" else FOCUS_OUT
             if seq != PASTE_START:
                 return 27  # a plain Esc (an unknown sequence after it is dropped)
             buf, deadline = "", time.time() + 3
@@ -1143,7 +1177,6 @@ class Sidebar:
             else:
                 self.flash("couldn't find that session's window", "bad")
             return
-        mark_opened(s["id"])
         self.clear_note(s["id"])  # you're looking at it now: its "your turn" note is done
         if self.attached == s["id"]:
             kitty("focus-window", "--match", "var:plane_role=session")
@@ -1151,6 +1184,7 @@ class Sidebar:
         if show_in_pane([claude_bin(), "attach", s["id"]], s.get("cwd", str(HOME)),
                         s.get("name") or s["id"], s["id"]):
             self.attached = s["id"]
+            self.store.poke()  # fresh states now, not at the next poll
         else:
             self.flash("couldn't open the session pane", "bad")
 
@@ -1216,7 +1250,6 @@ class Sidebar:
             self.flash(f"its folder is gone: {cwd}", "bad")
             return
         job = r.get("jobId")
-        mark_opened(job)
         if r.get("kind") == "bg" and job and (CLAUDE_DIR / "jobs" / job).is_dir():
             if show_in_pane([claude_bin(), "attach", job], cwd, name or job, job):
                 self.attached = job
@@ -1571,8 +1604,16 @@ class Sidebar:
         mine = [s for s in sessions if s["bg"] and not s.get("stopped")]
         paused = [s for s in sessions if s["bg"] and s.get("stopped")]
         windows = [s for s in sessions if not s["bg"]]
-        # handoffs: newest first, and only the first few unless you open the rest
-        handoffs.sort(key=lambda x: -(x.get("createdAt") or 0))
+        handoffs.sort(key=lambda x: -(x.get("createdAt") or 0))  # newest first
+        if self.focused and self.shown:
+            # You're in the sidebar: rows keep the places you see them in, so a click can't
+            # land on a row that just moved. States still update in place; anything new goes
+            # to the end of its section; the fresh order applies once you leave the sidebar.
+            def hold(kind, group):
+                return sorted(group, key=lambda o: self.shown.get(self.item_key((kind, o)), len(self.shown)))
+            lost, mine, standby = hold("lost", lost), hold("session", mine), hold("lost", standby)
+            paused, windows, handoffs = hold("session", paused), hold("session", windows), hold("handoff", handoffs)
+        # only the first few handoffs unless you open the rest
         hand_rows = [("handoff", x) for x in handoffs]
         if len(handoffs) > HANDOFFS_SHOWN + 1:
             hidden = 0 if self.handoffs_open else len(handoffs) - HANDOFFS_SHOWN
@@ -1587,6 +1628,9 @@ class Sidebar:
         self.items = ([("lost", r) for r in lost] + [("session", s) for s in mine] + [("lost", r) for r in standby]
                       + [("session", s) for s in paused + windows] + hand_rows)
         keys = [self.item_key(it) for it in self.items]
+        self.shown = {k: i for i, k in enumerate(keys)}
+        if keys != self.last_keys:  # remember the order before a change, for click()
+            self.prev_keys, self.last_keys, self.moved_at = self.last_keys, keys, time.time()
         self.sel = keys.index(key) if key in keys else max(0, min(self.sel, len(self.items) - 1))
         self.rows = {}
 
@@ -1764,6 +1808,12 @@ class Sidebar:
         # because the list can refresh and shift between the two clicks.
         now = time.time()
         kind, obj = self.items[row]
+        if (now - self.moved_at < 0.7 and row < len(self.prev_keys)
+                and self.prev_keys[row] != self.item_key(self.items[row])):
+            # the list changed just before this click, and this row now holds something
+            # else: you were aiming at what used to be here, so don't open the wrong one
+            self.flash("the list just changed: click again", "warn")
+            return
         key = (kind, obj.get("id") if isinstance(obj, dict) else row)
         prev_key, prev_at = self.last_click
         if key == prev_key and now - prev_at < 0.08:
@@ -1881,7 +1931,7 @@ def cmd_sidebar(_args):
     try:
         curses.wrapper(lambda scr: Sidebar(scr).loop())
     finally:
-        sys.stdout.write("\x1b[?2004l")
+        sys.stdout.write("\x1b[?2004l\x1b[?1004l")
         sys.stdout.flush()
 
 
