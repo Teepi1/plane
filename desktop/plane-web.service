@@ -1,0 +1,12 @@
+[Unit]
+Description=Plane on your phone (served on your tailnet by tailscale serve)
+After=network-online.target
+
+[Service]
+ExecStart=@PLANE@ web
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
