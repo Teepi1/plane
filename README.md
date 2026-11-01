@@ -55,6 +55,7 @@ one [kitty](https://sw.kovidgoyal.net/kitty/) window:
 - Optional: **Hyprland**, to jump to sessions running in other windows and to move focus
   with Super+arrows. Everything else works on any desktop.
 - Optional: **notify-send** (libnotify), for "handoff ready" and login reminders.
+- Optional, for the phone app: **Tailscale**, **python-pyte** and **python-cryptography**.
 
 ## Install
 
@@ -69,6 +70,7 @@ cd plane
 | *(none)*      | `plane` in `~/.local/bin` (a symlink, so `git pull` updates it), the icon and an app-menu launcher |
 | `--claude`    | Plane's status line and hooks in `~/.claude/settings.json` (backed up first; an existing status line is left alone) |
 | `--autostart` | the recovery check at login |
+| `--web`       | the phone app: a user service, put on your tailnet with `tailscale serve` (see [On your phone](#on-your-phone)) |
 
 Then open it from your app menu, or run `plane open`. It's best bound to a key, for example
 in `hyprland.conf`:
@@ -170,6 +172,38 @@ whose record is still open after its process is gone was cut off, so Plane lists
 the top of the sidebar, and Enter resumes it. A background session that was waiting on you
 rather than working is listed under SESSIONS on standby instead, since nothing was interrupted. With `--autostart`, a notification at login
 lists anything that was cut off plus handoffs still waiting.
+
+## On your phone
+
+`plane web` serves a Home Screen app for your phone. Your sessions keep running on this
+computer, and the phone watches them and types into them. It shows the same list as the
+sidebar, with sessions waiting on you at the top. It can start sessions and handoffs,
+pause, close, resume and put back in queue. Each session opens as a chat. When Claude
+asks something on its screen (a permission, a worktree, a plan to approve, a question,
+whether to trust a folder), the options turn into buttons. **Terminal** shows the real
+`claude attach` for anything else. With notifications on, the phone buzzes when a session
+needs you or it's your turn, unless Plane is the active window on the computer or the app
+is open on the phone.
+
+It needs [Tailscale](https://tailscale.com) on both, with **HTTPS Certificates** turned on
+(admin console › DNS), plus `python-pyte` and `python-cryptography`. Then:
+
+```sh
+./install.sh --web
+```
+
+That installs `plane-web.service` (a user service on `127.0.0.1:8377`) and runs
+`tailscale serve`, which puts it at `https://<this computer>.<tailnet>.ts.net` for your
+tailnet only. On the phone, open that address in Safari, tap Share › Add to Home Screen,
+open Plane from there and tap **Turn on** for notifications (iOS 16.4 or later).
+
+Who gets in: `tailscale serve` tells the app which Tailscale login is asking, and only
+the login that owns this computer is let in. `--web` also writes
+`~/.config/plane/web.json` listing your phones and tablets by tailnet name, and only those
+devices may connect. Edit the list to add or remove one (`{"devices": []}` allows all of
+your devices). Nothing listens on a public interface.
+
+The computer has to be awake. If it isn't, the app opens and says it can't reach it.
 
 ## Hyprland
 

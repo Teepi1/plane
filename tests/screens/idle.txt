@@ -1,0 +1,40 @@
+
+
+● hello
+
+✻ Cooked for 9s · done 11:02 PM
+
+❯ Use the AskUserQuestion tool to ask me one question: tea or coffee? Offer those two options.
+
+● User answered Claude's questions:
+  ⎿  · Tea or coffee? → Coffee
+
+● You chose coffee.
+
+✻ Worked for 12s · done 11:04 PM
+
+❯ Use the Write tool to create the file /home/you/code/demo/outside.txt
+  containing the word hi. Do not use Bash.
+
+● Write(~/code/demo/outside.txt)
+  ⎿  Wrote 1 line to ~/code/demo/outside.txt
+      1 hi
+  ⎿  Allowed by auto mode
+
+● I created /home/you/code/demo/outside.txt with the word hi, using the Write
+  tool.
+
+✻ Worked for 11s · done 11:05 PM
+
+❯ Use the Bash tool to run: mkdir -p /home/you/code/demo/made-by-bash
+
+  Ran 1 shell command
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Sautéed for 2s · done 11:06 PM
+                                                                                ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────── plane-web spike ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  5h 32% · wk 50%
+  ⏸ manual mode on · ← 2 agents

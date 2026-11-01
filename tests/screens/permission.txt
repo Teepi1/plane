@@ -1,0 +1,40 @@
+
+
+✻ Worked for 12s · done 11:04 PM
+
+❯ Use the Write tool to create the file /home/you/code/demo/outside.txt
+  containing the word hi. Do not use Bash.
+
+● Write(~/code/demo/outside.txt)
+  ⎿  Wrote 1 line to ~/code/demo/outside.txt
+      1 hi
+  ⎿  Allowed by auto mode
+
+● I created /home/you/code/demo/outside.txt with the word hi, using the Write
+  tool.
+
+✻ Worked for 11s · done 11:05 PM
+
+❯ Use the Bash tool to run: mkdir -p /home/you/code/demo/made-by-bash
+
+● Running 1 shell command…
+  ⎿  $ mkdir -p /home/you/code/demo/made-by-bash
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Tip: auto mode handles these prompts for you — choose "switch to auto mode" below
+ Create the made-by-bash directory under the spike folder
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ mkdir -p /home/you/code/demo/made-by-bash
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ Claude requested permissions to edit /home/you/code/demo/made-by-bash
+ │ which is a sensitive file.
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to /home/you/code/demo from this project
+   3. Yes, and switch to auto mode · auto mode handles these prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend
+────────────────────────────────────────────────────────────────────────────────── plane-web spike ─

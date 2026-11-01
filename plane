@@ -9,6 +9,7 @@
   plane statusline                Claude Code statusLine command; records usage
   plane track start|prompt|end    Claude Code hook: keep the ledger of running sessions
   plane recover                   at login: notify about interrupted sessions + handoffs
+  plane web [--port 8377]         the phone app's server (see planeweb.py)
 """
 import argparse
 import curses
@@ -38,6 +39,7 @@ NOTES = CACHE / "notes.json"    # session id -> id of its "your turn"/"needs you
 LIVE = DATA / "live"  # one file per session that was running; one left behind = interrupted
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
 SOCK = RUNTIME / "plane-kitty.sock"
+PHONE_FLAG = RUNTIME / "plane-phone-open"  # touched by `plane web` while the app is open on a phone
 CLASS = "plane"
 SIDEBAR_COLS = 38
 SELF = str(Path(__file__).resolve())
@@ -406,6 +408,13 @@ def lost_label(r):
     return r.get("name") or r.get("firstPrompt") or Path(r.get("cwd", "")).name or r["sessionId"][:8]
 
 
+def cmd_web(args):
+    """The phone app: planeweb.py, next to this file, reusing this module."""
+    sys.path.insert(0, str(Path(SELF).parent))
+    import planeweb
+    planeweb.serve(sys.modules[__name__], args.port)
+
+
 def cmd_recover(args):
     """Login reminder: a notification that stays until clicked, listing what was left open."""
     time.sleep(args.delay)  # let the notification daemon come up first
@@ -526,6 +535,14 @@ def mark_opened(sid):
     opened[sid] = time.time()
     cutoff = time.time() - 30 * 86400
     write_json(OPENED, {k: v for k, v in opened.items() if v > cutoff})
+
+
+def phone_watching():
+    """The phone app is open right now (`plane web` touches the flag every few seconds)."""
+    try:
+        return time.time() - PHONE_FLAG.stat().st_mtime < 20
+    except OSError:
+        return False
 
 
 def purge_discarded():
@@ -943,11 +960,16 @@ class Sidebar:
         self.msg, self.msg_at, self.msg_tone = text, time.time(), tone
 
     def notify_ready(self, h):
+        if phone_watching():  # the phone shows it
+            return
         subprocess.Popen(["notify-send", "-a", "Plane", "-i", "plane", "Handoff ready", h.get("title", "")],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def notify_waiting(self, s, state):
-        """Called on the poll thread. Skipped while you're looking at Plane: the sidebar shows it."""
+        """Called on the poll thread. Skipped while you're looking at Plane, on this screen or
+        in the phone app: it shows there."""
+        if phone_watching():
+            return
         try:
             if json.loads(hypr("activewindow", "-j").stdout or "{}").get("class") == CLASS:
                 return
@@ -1907,6 +1929,9 @@ def main():
     tr = sub.add_parser("track", help="Claude Code hook: record running sessions")
     tr.add_argument("event", choices=["start", "prompt", "end"])
     tr.set_defaults(fn=cmd_track)
+    wb = sub.add_parser("web", help="serve the phone app on 127.0.0.1 (put it on Tailscale with tailscale serve)")
+    wb.add_argument("--port", type=int, default=8377)
+    wb.set_defaults(fn=cmd_web)
     rc = sub.add_parser("recover", help="notify about interrupted sessions and waiting handoffs")
     rc.add_argument("--delay", type=float, default=8)
     rc.set_defaults(fn=cmd_recover)
