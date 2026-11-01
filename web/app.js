@@ -97,7 +97,7 @@ function fileChip(p) {
 function md(src) {
   const blocks = [];
   let text = String(src ?? "").replace(/```[^\n]*\n([\s\S]*?)(```|$)/g, (_, code) => {
-    blocks.push(`<pre><code>${esc(code.replace(/\n$/, ""))}</code></pre>`);
+    blocks.push(`<div class="codeblock"><pre><code>${esc(code.replace(/\n$/, ""))}</code></pre><button class="copy" data-act="copy" aria-label="Copy this code"><span>Copy</span></button></div>`);
     return `\u0000${blocks.length - 1}\u0000`;
   });
   const inline = t => esc(t)
@@ -124,6 +124,40 @@ function md(src) {
     out.push(`<p>${lines.map(l => /^#{1,6}\s/.test(l) ? `<strong>${inline(l.replace(/^#+\s*/, ""))}</strong>` : inline(l)).join("<br>")}</p>`);
   }
   return out.join("").replace(/\u0000(\d+)\u0000/g, (_, i) => blocks[+i]);
+}
+
+// Copy a code block's text. The clipboard API first; the old select-and-copy where it's refused.
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch { /* fall through */ }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.cssText = "position:fixed;top:0;left:0;opacity:0";
+  document.body.append(ta);
+  ta.select();
+  ta.setSelectionRange(0, text.length);
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch { ok = false; }
+  ta.remove();
+  return ok;
+}
+
+async function copyBlock(btn) {
+  const code = btn.closest(".codeblock")?.querySelector("code");
+  const label = btn.querySelector("span");
+  if (!code || !label) return;
+  const ok = await copyText(code.textContent);
+  label.textContent = ok ? "Copied" : "Couldn't copy";
+  btn.classList.toggle("done", ok);
+  if (!ok) {  // leave it selected, so press-and-hold › Copy works
+    const r = document.createRange();
+    r.selectNodeContents(code);
+    const sel = getSelection();
+    sel.removeAllRanges();
+    sel.addRange(r);
+  }
+  clearTimeout(btn._t);
+  btn._t = setTimeout(() => { label.textContent = "Copy"; btn.classList.remove("done"); }, ok ? 2000 : 4000);
 }
 
 let toastTimer;
@@ -283,6 +317,81 @@ function tipHtml() {
     <span class="err" hidden></span><button class="x" data-act="tipOff">Not now</button></div>`;
 }
 
+// The notifications row under the session list: whether they're on, and a test that
+// follows one push all the way to this phone. N survives the list being redrawn.
+const N = { msg: "", bad: false, busy: "", reset: false };
+
+function notifHtml() {
+  if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) return "";
+  if (isIOS() && !isStandalone()) return "";
+  const perm = Notification.permission;
+  if (perm === "default" && !store("plane:tipOff")) return "";  // the tip at the top asks
+  let text, btn = "";
+  if (perm === "denied") {
+    text = "Notifications are blocked for Plane. Turn them on in Settings › Notifications › Plane.";
+  } else if (perm === "default") {
+    text = "Notifications are off.";
+    btn = `<button class="small" data-act="notifOn">Turn on</button>`;
+  } else {
+    text = N.msg || "Notifications are on.";
+    btn = N.busy ? `<button class="small" disabled>${esc(N.busy)}</button>` : `<button class="small" data-act="notifTest">Send test</button>`;
+  }
+  return `<div class="notif" role="status"><span class="${N.bad ? "st-bad" : ""}">${N.bad ? "⚠ " : ""}${esc(text)}</span>${btn}
+    <span class="err" hidden></span>${N.reset && !N.busy ? `<button class="x" data-act="notifReset">Set up again</button>` : ""}</div>`;
+}
+
+function notifSet(o) { Object.assign(N, o); S.view && S.view.update && S.view.update(); }
+
+async function testPush() {
+  notifSet({ busy: "Sending…", bad: false, reset: false,
+    msg: "A test is coming in 5 seconds. Go to the Home Screen or lock the phone to see it arrive." });
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription();
+    if (!sub) return notifSet({ busy: "", bad: true, reset: true, msg: "This phone isn't signed up for notifications." });
+    await api("/api/push/subscribe", { subscription: sub.toJSON() });  // in case the laptop dropped it
+    const { id } = await api("/api/push/test", { endpoint: sub.endpoint, delay: 5 });
+    notifSet({ busy: "Waiting…" });
+    const until = Date.now() + 30000;
+    let r = {};
+    while (Date.now() < until) {
+      await new Promise(res => setTimeout(res, 1500));
+      r = await api(`/api/push/result?id=${id}`).catch(() => r);
+      if (r.seen) break;
+    }
+    const refused = (r.apple || []).filter(s => s !== 201);
+    if (r.seen && r.shown) {
+      notifSet({ busy: "", msg: "It arrived: this phone got the test and showed it. Didn't see it? Check Focus, and Settings › Notifications › Plane." });
+    } else if (r.seen) {
+      notifSet({ busy: "", bad: true, msg: `This phone got the test but couldn't show it${r.error ? ` (${r.error})` : ""}.` });
+    } else if (!r.sent) {
+      notifSet({ busy: "", bad: true, msg: "The laptop didn't send it. Try again." });
+    } else if (refused.length) {
+      notifSet({ busy: "", bad: true, reset: true, msg: `Apple turned it away (${refused.join(", ")}). Set up again to sign this phone up fresh.` });
+    } else {
+      notifSet({ busy: "", bad: true, reset: true, msg: "Apple took it, but it never reached this phone. Set up again to sign this phone up fresh." });
+    }
+  } catch (e) {
+    notifSet({ busy: "", bad: true, reset: /signed up/.test(e.message), msg: e.message });
+  }
+}
+
+async function resetPush() {
+  notifSet({ busy: "Setting up…", bad: false, reset: false, msg: "Signing this phone up again…" });
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const old = await reg.pushManager.getSubscription();
+    if (old) {
+      await old.unsubscribe().catch(() => {});
+      api("/api/push/unsubscribe", { endpoint: old.endpoint }).catch(() => {});
+    }
+    await subscribe();
+    notifSet({ busy: "", msg: "Signed up again. Send a test to check." });
+  } catch (e) {
+    notifSet({ busy: "", bad: true, reset: true, msg: e.message });
+  }
+}
+
 function homeView() {
   app.innerHTML = `<div class="top"><div class="top-row"><h1>Plane</h1><span class="live" id="live"></span></div><div class="usage" id="usage"></div></div>
     <div class="scroll" id="list"></div>
@@ -321,6 +430,7 @@ function homeView() {
       + (parked.length || standby.length ? `<div class="sec">Paused &amp; standby</div>${parked.map(o => rowHtml("session", o)).join("")}${standby.map(o => rowHtml("lost", o)).join("")}` : "")
       + sec("Handoffs", snap.handoffs || [], "handoff")  // after paused, as in the sidebar
       + sec("In laptop windows", windows, "session")
+      + (off ? "" : notifHtml())
       + `<div class="updated" id="updated"></div></div>`;
     list.scrollTop = scroll;
     stamp();
@@ -914,6 +1024,9 @@ document.addEventListener("click", async e => {
   if (!a) return;
   if (a.dataset.act === "tipOff") { store("plane:tipOff", true); S.view.update && S.view.update(); }
   if (a.dataset.act === "retry") { a.textContent = "Trying…"; location.reload(); }
+  if (a.dataset.act === "copy") copyBlock(a);
+  if (a.dataset.act === "notifTest" && !N.busy) testPush();
+  if (a.dataset.act === "notifReset" && !N.busy) resetPush();
   if (a.dataset.act === "notifOn") {
     a.disabled = true; a.textContent = "Turning on…";
     try { await enablePush(); store("plane:tipOff", true); toast("Notifications are on"); S.view.update && S.view.update(); }

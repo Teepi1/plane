@@ -1,6 +1,6 @@
 // Plane's service worker: shows push notifications, and keeps the app's own files so it
 // still opens (and says so) when the laptop can't be reached.
-const CACHE = "plane-v2";
+const CACHE = "plane-v3";
 const SHELL = ["./", "index.html", "app.css", "app.js", "manifest.webmanifest", "icons/icon-192.png", "icons/apple-touch-icon.png"];
 
 self.addEventListener("install", e => {
@@ -25,10 +25,19 @@ self.addEventListener("fetch", e => {
 self.addEventListener("push", e => {
   let data = {};
   try { data = e.data ? e.data.json() : {}; } catch { data = { title: "Plane", body: e.data ? e.data.text() : "" }; }
-  e.waitUntil(self.registration.showNotification(data.title || "Plane", {
+  const title = data.title || "Plane";
+  // Tell the laptop it arrived (and whether it showed), so a missing notification can be traced.
+  const report = (shown, error) => data.id ? fetch("api/push/seen", {
+    method: "POST", headers: { "Content-Type": "application/json", "X-Plane": "1" },
+    body: JSON.stringify({ id: data.id, shown, error: error ? String(error) : "" }),
+  }).catch(() => {}) : Promise.resolve();
+  e.waitUntil(self.registration.showNotification(title, {
     body: data.body || "", tag: data.tag || undefined, renotify: true,
     icon: "icons/icon-192.png", badge: "icons/icon-192.png", data: { url: data.url || "#" },
-  }));
+  }).then(() => report(true), err =>
+    // the plainest notification, if the full one was refused
+    self.registration.showNotification(title, { body: data.body || "" })
+      .then(() => report(true, err), err2 => report(false, err2))));
 });
 
 self.addEventListener("notificationclick", e => {

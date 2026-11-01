@@ -66,6 +66,68 @@ def test_jwt_shape():
     p.key.public_key().verify(der, f"{head}.{body}".encode(), ec.ECDSA(hashes.SHA256()))
 
 
+def bare_push(tmp):
+    """A Push with no key and no network: subscriptions in `tmp`, sends recorded."""
+    import threading
+    import json as _json
+    p = planeweb.Push.__new__(planeweb.Push)
+    p.ok, p.why, p.contact = True, "", "me@example.com"
+    p.subs_path, p.subs, p.lock, p.results = Path(tmp) / "subs.json", [], threading.Lock(), {}
+    p.sent = []
+
+    def fake_send_one(sub, data, topic, pid=None):
+        p.sent.append((sub["endpoint"], _json.loads(data)))
+        p.results[pid]["apple"].append(201)
+    p._send_one = fake_send_one
+    return p
+
+
+class FakeP:
+    @staticmethod
+    def write_json(path, data):
+        import json as _json
+        Path(path).write_text(_json.dumps(data))
+
+
+def with_tmp(fn):
+    import tempfile
+    old_p, old_log = planeweb.P, planeweb.log
+    planeweb.P, planeweb.log = FakeP, lambda text: None
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            fn(bare_push(tmp))
+    finally:
+        planeweb.P, planeweb.log = old_p, old_log
+
+
+def test_one_subscription_per_device():
+    def run(p):
+        sub = lambda n: {"endpoint": f"https://web.push.apple.com/{n}", "keys": {"p256dh": "x", "auth": "y"}}
+        p.subs = [dict(sub("legacy"))]  # saved before devices were recorded
+        p.subscribe(sub("ipad"), "100.0.0.2")
+        p.subscribe(sub("old-icon"), "100.0.0.1")
+        p.subscribe(sub("new-icon"), "100.0.0.1")
+        p.subscribe(sub("new-icon"), "100.0.0.1")  # every app load signs up again
+        assert sorted(s["endpoint"].rsplit("/", 1)[1] for s in p.subs) == ["ipad", "new-icon"], p.subs
+    with_tmp(run)
+
+
+def test_send_only_and_seen():
+    def run(p):
+        for n, ip in (("a", "1"), ("b", "2")):
+            p.subscribe({"endpoint": f"https://e/{n}", "keys": {}}, ip)
+        pid = p.send({"title": "T"}, only="https://e/b", pid="abc")
+        assert pid == "abc" and [e for e, _ in p.sent] == ["https://e/b"]
+        assert p.sent[0][1]["id"] == "abc"  # the phone reports back with it
+        assert p.results["abc"]["apple"] == [201] and not p.results["abc"].get("seen")
+        p.seen("abc", True)
+        assert p.results["abc"]["seen"] and p.results["abc"]["shown"]
+        p.seen("nope", True)  # unknown ids are ignored
+        everyone = p.send({"title": "U"})
+        assert len([e for e, d in p.sent if d["id"] == everyone]) == 2
+    with_tmp(run)
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in list(globals().items()):

@@ -774,6 +774,8 @@ class Push:
         self.subs_path = state_dir() / "subscriptions.json"
         self.subs = P.read_json(self.subs_path, []) or []
         self.lock = threading.Lock()
+        # id -> what happened to one push: Apple's answer per device, and whether the phone got it
+        self.results = {}
         try:
             from cryptography.hazmat.primitives import serialization
             from cryptography.hazmat.primitives.asymmetric import ec
@@ -793,12 +795,34 @@ class Push:
                                                               serialization.PublicFormat.UncompressedPoint))
         self.ok = True
 
-    def subscribe(self, sub):
+    def subscribe(self, sub, ip=""):
+        """Keep one subscription per device: re-adding Plane to the Home Screen makes a new
+        one, and the old icon's keeps being accepted by Apple and goes nowhere."""
         if not isinstance(sub, dict) or not str(sub.get("endpoint", "")).startswith("https://"):
             raise ValueError("not a push subscription")
+        sub = {"endpoint": sub["endpoint"], "keys": sub.get("keys") or {}, "ip": ip, "at": int(time.time())}
         with self.lock:
-            self.subs = [s for s in self.subs if s.get("endpoint") != sub["endpoint"]] + [sub]
+            # also drop ones saved before devices were recorded: each device signs up again on load
+            keep = [s for s in self.subs if s.get("endpoint") != sub["endpoint"]
+                    and not (ip and s.get("ip", "") in (ip, ""))]
+            dropped = len(self.subs) - len(keep) - (1 if any(s.get("endpoint") == sub["endpoint"] for s in self.subs) else 0)
+            self.subs = keep + [sub]
             P.write_json(self.subs_path, self.subs)
+        if dropped:
+            log(f"push: dropped {dropped} old subscription(s) from {ip}")
+
+    def has(self, endpoint):
+        with self.lock:
+            return any(s.get("endpoint") == endpoint for s in self.subs)
+
+    def seen(self, pid, shown, error=""):
+        """The phone's service worker says it got push `pid` (and showed it, or couldn't)."""
+        r = self.results.get(pid)
+        if r is None:
+            return
+        r.update(seen=time.time(), shown=bool(shown), error=str(error)[:300])
+        what = "showed" if shown else f"got but couldn't show ({error})"
+        log(f"push: the phone {what}: {r.get('title', '')}")
 
     def unsubscribe(self, endpoint):
         with self.lock:
@@ -834,16 +858,24 @@ class Push:
         body = AESGCM(cek).encrypt(nonce, payload + b"\x02", None)
         return salt + struct.pack(">I", 4096) + bytes([len(as_pub)]) + as_pub + body
 
-    def send(self, payload, topic=""):
+    def send(self, payload, topic="", only=None, pid=None):
+        """Send to every subscribed device (or just the endpoint `only`). Returns the push's id."""
         if not self.ok:
-            return
-        data = json.dumps(payload).encode()
+            return None
+        pid = pid or secrets.token_hex(6)
+        data = json.dumps(dict(payload, id=pid)).encode()
         with self.lock:
-            subs = list(self.subs)
+            subs = [s for s in self.subs if only is None or s.get("endpoint") == only]
+            now = time.time()
+            for k in [k for k, r in self.results.items() if now - r["at"] > 3600]:
+                del self.results[k]
+            self.results[pid] = {"at": now, "title": payload.get("title", ""), "apple": [], "devices": len(subs)}
         for sub in subs:
-            threading.Thread(target=self._send_one, args=(sub, data, topic), daemon=True).start()
+            threading.Thread(target=self._send_one, args=(sub, data, topic, pid), daemon=True).start()
+        return pid
 
-    def _send_one(self, sub, data, topic):
+    def _send_one(self, sub, data, topic, pid=None):
+        status = "failed"
         try:
             ep = sub["endpoint"]
             u = urlparse(ep)
@@ -853,13 +885,19 @@ class Push:
             if topic:
                 headers["Topic"] = re.sub(r"[^A-Za-z0-9_-]", "", topic)[:32]
             req = urllib.request.Request(ep, data=body, headers=headers, method="POST")
-            urllib.request.urlopen(req, timeout=15).close()
+            with urllib.request.urlopen(req, timeout=15) as res:
+                status = res.status
         except urllib.error.HTTPError as e:
+            status = e.code
             if e.code in (404, 410):  # the phone dropped this subscription
                 self.unsubscribe(sub.get("endpoint"))
             log(f"push: {e.code} {e.reason}")
         except Exception as e:  # never let a push take the server down
+            status = f"failed: {e}"
             log(f"push failed: {e}")
+        r = self.results.get(pid)
+        if r is not None:
+            r["apple"].append(status)
 
 
 # ---------------------------------------------------------------- the hub
@@ -1375,6 +1413,9 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def client_ip(self):
+        return (self.headers.get("X-Forwarded-For") or self.client_address[0]).split(",")[0].strip()
+
     def same_origin(self):
         origin = self.headers.get("Origin")
         host = self.headers.get("X-Forwarded-Host") or self.headers.get("Host") or ""
@@ -1401,6 +1442,11 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/push/key":
                 return self.send_json({"key": self.hub.push.public if self.hub.push.ok else None,
                                        "why": self.hub.push.why})
+            if path == "/api/push/result":  # what happened to one push (the app's test)
+                r = self.hub.push.results.get(q.get("id", ""))
+                return self.send_json({"sent": False} if r is None else
+                                      {"sent": True, "apple": r["apple"], "devices": r["devices"],
+                                       "seen": bool(r.get("seen")), "shown": r.get("shown"), "error": r.get("error", "")})
             m = re.fullmatch(r"/api/session/([\w-]+)/stream", path)
             if m:
                 return self.session_stream(m.group(1), q)
@@ -1587,14 +1633,30 @@ class Handler(BaseHTTPRequestHandler):
                 op_close_lost(hub, m.group(1))
                 return self.send_json({"ok": True})
             if path == "/api/push/subscribe":
-                hub.push.subscribe(b.get("subscription"))
+                hub.push.subscribe(b.get("subscription"), self.client_ip())
                 return self.send_json({"ok": True})
             if path == "/api/push/unsubscribe":
                 hub.push.unsubscribe(str(b.get("endpoint", "")))
                 return self.send_json({"ok": True})
+            if path == "/api/push/seen":  # from the phone's service worker
+                hub.push.seen(str(b.get("id", "")), b.get("shown"), b.get("error") or "")
+                return self.send_json({"ok": True})
             if path == "/api/push/test":
-                hub.push.send({"title": "Plane", "body": "Notifications work.", "url": "#", "tag": "test"})
-                return self.send_json({"ok": hub.push.ok, "why": hub.push.why})
+                # to this phone only, a few seconds from now, so there's time to leave the app
+                if not hub.push.ok:
+                    return self.fail(409, f"Notifications aren't set up on the laptop ({hub.push.why}).")
+                ep = str(b.get("endpoint", ""))
+                if not hub.push.has(ep):
+                    return self.fail(409, "The laptop doesn't have this phone signed up. Tap Set up again.")
+                pid, delay = secrets.token_hex(6), max(0.0, min(float(b.get("delay", 5)), 15.0))
+
+                def later():
+                    time.sleep(delay)
+                    hub.push.send({"title": "Plane", "body": "Test notification. They work.", "url": "#",
+                                   "tag": "test"}, only=ep, pid=pid)
+                threading.Thread(target=later, daemon=True).start()
+                log(f"push: test for {self.client_ip()} in {delay:g}s")
+                return self.send_json({"id": pid})
             return self.fail(404, "Not found")
         except LookupError as e:
             return self.fail(409, str(e).strip("'\""))
