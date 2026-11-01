@@ -84,6 +84,11 @@ bind = SUPER SHIFT, C, exec, plane open
 Click a session to open it. **n** starts a new one: pick a recent project folder, give it a
 name and an optional first message. Right-click any row for all of its actions.
 
+The top line counts the sessions waiting on you. The panel at the bottom shows the selected
+row in full: its whole name, folder and branch, what a blocked session is asking, or a
+handoff's prompt. It stays there however long the list gets; the list scrolls above it.
+Closing or discarding asks once: press **y** to go ahead, anything else to back out.
+
 | Key | |
 |-----|---|
 | Click, Enter | open the selected session (handoffs need a double-click or Enter) |
@@ -94,6 +99,7 @@ name and an optional first message. Right-click any row for all of its actions.
 | x | close: the session ends and leaves the list (the conversation is kept, `claude --resume` finds it) |
 | v | read a handoff's prompt |
 | x on a handoff | discard it (kept in `handoffs/discarded/` for 14 days, then deleted) |
+| u | bring back the handoff you just discarded |
 | r / R | refresh / reload Plane's own code in place |
 | ? | all keys |
 | q | quit Plane (sessions keep running) |
@@ -107,14 +113,20 @@ trigger sidebar keys.
 
 ### Sections
 
-- **SESSIONS:** your running background sessions.
-- **STANDBY:** sessions that were waiting on you when Claude Code put them to sleep (it does
-  this to background sessions left idle for a while) or the machine restarted. Nothing was
-  lost: open one and it picks up where it left off.
+- **SESSIONS:** your background sessions, the one you used last at the top (the last one
+  you sent a message to or opened). Below them come sessions on standby: ones that were
+  waiting on you when Claude Code put them to sleep (it does this to background sessions
+  left idle for a while) or the machine restarted. Nothing was lost: open one and it picks
+  up where it left off.
 - **PAUSED:** sessions you paused. Open one to continue it.
 - **IN OTHER WINDOWS:** Claude Code sessions running in ordinary terminals. Opening one
   switches to its window (on Hyprland).
-- **HANDOFFS:** queued prompts waiting to start as new sessions.
+- **HANDOFFS:** queued prompts waiting to start as new sessions, newest first. Only the
+  newest four are listed until you open the "N more handoffs" row.
+
+A session that ends its turn while one of its own tasks still runs (a background shell, a CI
+watch) shows *needs you* when it asked you something, and *working* when it's only waiting
+on that task. When a session goes back to work or you open it, its notification goes away.
 - **CUT OFF BY CRASH/REBOOT:** sessions that were working when the machine went down.
 
 ## Handoffs
@@ -129,8 +141,8 @@ Write the v2.4 release notes from the merged PRs ...
 EOF
 ```
 
-Plane notes which session queued it and marks the handoff *ready* once that session
-stops working. Starting it opens a new session with the prompt as its first message.
+Plane notes which session queued it and marks the handoff *not ready* while that session
+is still working. Starting it opens a new session with the prompt as its first message.
 If you start one by accident, right-click the new session and choose **Put back in
 queue**.
 
@@ -158,7 +170,7 @@ With the hooks from `--claude`, every session keeps a small record in
 `~/.local/share/plane/live/` while it runs, and marks it when it ends normally. A session
 whose record is still open after its process is gone was cut off, so Plane lists it at
 the top of the sidebar, and Enter resumes it. A background session that was waiting on you
-rather than working goes under STANDBY instead, since nothing was interrupted. With `--autostart`, a notification at login
+rather than working is listed under SESSIONS on standby instead, since nothing was interrupted. With `--autostart`, a notification at login
 lists anything that was cut off plus handoffs still waiting.
 
 ## On your phone

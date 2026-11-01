@@ -34,6 +34,8 @@ DISCARDED = HANDOFFS / "discarded"  # discarded handoffs wait here, then are del
 DISCARD_KEEP_DAYS = 14
 CACHE = HOME / ".cache/plane"
 USAGE = CACHE / "usage.json"
+OPENED = CACHE / "opened.json"  # session id -> when you last opened it in Plane
+NOTES = CACHE / "notes.json"    # session id -> id of its "your turn"/"needs you" notification
 LIVE = DATA / "live"  # one file per session that was running; one left behind = interrupted
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
 SOCK = RUNTIME / "plane-kitty.sock"
@@ -485,11 +487,53 @@ def session_state(s):
     """What the sidebar says about a session: working, needs you, your turn, paused or failed."""
     if s.get("stopped"):
         return "failed" if s.get("state") == "failed" else "paused"
-    if s.get("status") == "busy":
-        return "working"
-    if s["bg"] and s.get("state") == "blocked":
+    if not s["bg"] or not s.get("procStatus"):
+        if s.get("status") == "busy":
+            return "working"
+        return "needs you" if s["bg"] and s.get("state") == "blocked" else "your turn"
+    # A background session reports "busy" (`claude agents`) for as long as any of its tasks
+    # runs, a background shell or a CI watch included, even after its turn has ended with a
+    # question for you. Its own status file tells "busy" (thinking) from "shell" (only a task
+    # running), and its job file says whether the turn ended blocked on you.
+    proc, job, tempo = s["procStatus"], s.get("jobState"), s.get("tempo")
+    if proc == "waiting":  # a permission prompt
         return "needs you"
+    if proc == "busy":
+        return "working"
+    if tempo == "blocked" or (job == "blocked" and tempo != "active"):
+        return "needs you"
+    if proc == "shell" and job == "working":  # waiting on its own task; it carries on after
+        return "working"
     return "your turn"
+
+
+def last_used(s, opened):
+    """When you last used a session: your last message to it (the ledger's lastActive) or
+    the last time you opened it in Plane, whichever is later; its start if neither."""
+    rec = read_json(LIVE / f"{s.get('sessionId')}.json", {}) or {} if s.get("sessionId") else {}
+    started = (s.get("startedAt") or 0) / 1000
+    return max(rec.get("lastActive") or 0, opened.get(s.get("id") or "", 0), started)
+
+
+def close_notification(nid):
+    if not nid or not str(nid).isdigit():
+        return
+    try:
+        subprocess.run(["gdbus", "call", "--session", "--dest", "org.freedesktop.Notifications",
+                        "--object-path", "/org/freedesktop/Notifications",
+                        "--method", "org.freedesktop.Notifications.CloseNotification", str(nid)],
+                       capture_output=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def mark_opened(sid):
+    if not sid:
+        return
+    opened = read_json(OPENED, {}) or {}
+    opened[sid] = time.time()
+    cutoff = time.time() - 30 * 86400
+    write_json(OPENED, {k: v for k, v in opened.items() if v > cutoff})
 
 
 def purge_discarded():
@@ -506,12 +550,13 @@ def purge_discarded():
 class Store:
     """Polls sessions, handoffs and usage on a background thread."""
 
-    def __init__(self, on_ready, on_waiting):
+    def __init__(self, on_ready, on_waiting, on_settled):
         self.lock = threading.Lock()
         self.sessions, self.handoffs, self.usage, self.lost = [], [], {}, []
         self.error = ""
         self.on_ready = on_ready
         self.on_waiting = on_waiting
+        self.on_settled = on_settled
         self._ready_seen = None
         self._state_seen = None
         self._wake = threading.Event()
@@ -542,14 +587,19 @@ class Store:
             bg = s.get("kind") == "background"
             s["bg"] = bg
             s["branch"] = git_branch(s.get("cwd", ""))
-            files = read_json(CLAUDE_DIR / "sessions" / f"{s.get('pid')}.json", {}) if s.get("pid") else {}
+            files = read_json(CLAUDE_DIR / "sessions" / f"{s.get('pid')}.json", {}) or {} if s.get("pid") else {}
             s["procStart"] = files.get("procStart")
             if bg:
-                job = read_json(CLAUDE_DIR / "jobs" / s["id"] / "state.json", {})
+                job = read_json(CLAUDE_DIR / "jobs" / s["id"] / "state.json", {}) or {}
                 s["needs"] = job.get("needs") or job.get("detail") or ""
+                s["procStatus"] = files.get("status")  # busy / shell / waiting / idle
+                s["jobState"], s["tempo"] = job.get("state"), job.get("tempo")
             alive = bool(s.get("pid")) and Path(f"/proc/{s['pid']}").exists()
             (sessions if alive else stopped).append(s)
-        sessions.sort(key=lambda s: (not s["bg"], s.get("startedAt", 0)))
+        opened = read_json(OPENED, {}) or {}
+        for s in sessions + stopped:
+            s["usedAt"] = last_used(s, opened)
+        sessions.sort(key=lambda s: (not s["bg"], -s["usedAt"]))  # most recently used first
         ledger_sync()
         lost = interrupted_sessions()
         lost_ids = {r["sessionId"] for r in lost}
@@ -585,6 +635,13 @@ class Store:
                 state, before = states.get(s.get("id")), self._state_seen.get(s.get("id"))
                 if state in ("needs you", "your turn") and before not in (None, state):
                     self.on_waiting(s, state)
+            parked = {r.get("jobId") for r in lost if r["cause"] == "standby"}  # still waiting on you
+            for sid, before in self._state_seen.items():
+                # it went back to work, was paused or closed: its notification is out of date
+                now = states.get(sid)
+                if before in ("needs you", "your turn") and now not in ("needs you", "your turn") \
+                        and not (now is None and sid in parked):
+                    self.on_settled(sid)
         self._state_seen = states
 
         with self.lock:
@@ -736,8 +793,43 @@ def cmd_start(args):
 
 # ---------------------------------------------------------------- sidebar
 
-C_OK, C_WARN, C_BAD, C_ACCENT, C_DIM = 1, 2, 3, 4, 5
+C_OK, C_WARN, C_BAD, C_ACCENT, C_DIM, C_TEXT = 1, 2, 3, 4, 5, 6
+SEL = 10  # pair + SEL: the same color on the selected row's band
 PASTE_START, PASTE_END = "[200~", "\x1b[201~"
+TONES = {"info": C_ACCENT, "warn": C_WARN, "bad": C_BAD}
+HANDOFFS_SHOWN = 4  # newest handoffs listed before "N more handoffs"
+
+
+def short_needs(text, limit=140):
+    """What a blocked session is asking, short enough to read: a tool approval keeps the
+    tool's name and the start of its first line, not a whole script."""
+    text = " ".join(str(text or "").split("\n")[0].split())
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def wrap(text, width, max_lines=3):
+    """Word-wrap one line of detail text into at most `max_lines` lines."""
+    words, lines, cur = text.split(), [], ""
+    for word in words:
+        while len(word) > width:  # a path or command longer than the line
+            if cur:
+                lines.append(cur)
+                cur = ""
+            lines.append(word[:width])
+            word = word[width:]
+        if not cur:
+            cur = word
+        elif len(cur) + 1 + len(word) <= width:
+            cur += " " + word
+        else:
+            lines.append(cur)
+            cur = word
+    if cur:
+        lines.append(cur)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1][:width - 1].rstrip() + "…"
+    return lines or [""]
 
 
 class Paste(str):
@@ -780,18 +872,27 @@ class Sidebar:
         self.sel = 0
         self.items = []      # (kind, obj)
         self.rows = {}       # screen row -> item index
-        self.msg, self.msg_at = "", 0
+        self.msg, self.msg_at, self.msg_tone = "", 0, "info"
+        self.sel_key = None       # the selected item's identity, so a refresh can't move the selection
+        self.last_discard = None  # path in discarded/, for u to bring it back
+        self.handoffs_open = False  # the handoff list shows HANDOFFS_SHOWN until you open the rest
+        self.pending_key = None     # an item to select on the next draw
         self.last_click = (None, 0)
         self.attached = None
         self.open_request = None  # session id from a notification's Open button
         self.notes = {}           # session id -> its notification's id, so a newer one replaces it
-        self.store = Store(self.notify_ready, self.notify_waiting)
+        self.clear_stale_notes()
+        self.store = Store(self.notify_ready, self.notify_waiting, self.clear_note)
         curses.curs_set(0)
         curses.use_default_colors()
+        # The selected row sits on a band of the theme's color 0, a step up from the
+        # background in dark themes; its text uses color 15 so it reads in light themes too.
+        bright = 15 if curses.COLORS >= 16 else curses.COLOR_WHITE
         for i, c in ((C_OK, curses.COLOR_GREEN), (C_WARN, curses.COLOR_YELLOW),
                      (C_BAD, curses.COLOR_RED), (C_ACCENT, curses.COLOR_CYAN),
-                     (C_DIM, curses.COLOR_WHITE)):
+                     (C_DIM, curses.COLOR_WHITE), (C_TEXT, -1)):
             curses.init_pair(i, c, -1)
+            curses.init_pair(i + SEL, bright if c == -1 else c, curses.COLOR_BLACK)
         curses.mousemask(curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED
                          | curses.BUTTON3_CLICKED | curses.BUTTON3_PRESSED
                          | curses.BUTTON4_PRESSED | getattr(curses, "BUTTON5_PRESSED", 0))
@@ -839,14 +940,15 @@ class Sidebar:
     def forward_paste(self, text):
         """A paste in the sidebar was meant for the session: send it there."""
         if not attached_id():
-            self.flash("open a session first; pastes go into the session")
+            self.flash("open a session first; pastes go into the session", "warn")
             return
         kitty("send-text", "--match", "var:plane_role=session", "--bracketed-paste", "auto", "--", text)
         kitty("focus-window", "--match", "var:plane_role=session")
 
     # -- helpers
-    def flash(self, text):
-        self.msg, self.msg_at = text, time.time()
+    def flash(self, text, tone="info"):
+        """A short message above the key hints: info (done, or what happens next), warn, or bad."""
+        self.msg, self.msg_at, self.msg_tone = text, time.time(), tone
 
     def notify_ready(self, h):
         subprocess.Popen(["notify-send", "-a", "Plane", "-i", "plane", "Handoff ready", h.get("title", "")],
@@ -863,21 +965,57 @@ class Sidebar:
         name = s.get("name") or sid
         title = f"{name} needs you" if state == "needs you" else f"Your turn: {name}"
         cmd = ["notify-send", "-a", "Plane", "-i", "plane", "-p", "-A", "open=Open",
-               title, s.get("needs", "") if state == "needs you" else ""]
-        if self.notes.get(sid):
-            cmd[1:1] = ["-r", self.notes[sid]]
-        threading.Thread(target=self._notification, args=(sid, cmd), daemon=True).start()
+               title, short_needs(s.get("needs")) if state == "needs you" else ""]
+        old = self.notes.get(sid)
+        if old and old.get("id"):
+            cmd[1:1] = ["-r", old["id"]]  # one notification per session, updated in place
+        threading.Thread(target=self._notification, args=(sid, cmd, old), daemon=True).start()
 
-    def _notification(self, sid, cmd):
+    def _notification(self, sid, cmd, old):
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         except OSError:
             return
-        self.notes[sid] = proc.stdout.readline().strip()  # -p prints the id now, the action on click
+        note = {"proc": proc, "id": proc.stdout.readline().strip()}  # -p prints the id now, the action on click
+        self.notes[sid] = note
+        if old and old.get("proc"):
+            old["proc"].kill()  # the replaced notification's waiter would otherwise wait forever
+        self.save_notes()
         if proc.stdout.readline().strip() == "open":
             hypr_focus(f"class:^({CLASS})$")
             self.open_request = sid
         proc.wait()
+        if self.notes.get(sid) is note:
+            self.notes.pop(sid, None)
+            self.save_notes()
+
+    def save_notes(self):
+        write_json(NOTES, {sid: n["id"] for sid, n in list(self.notes.items()) if n.get("id")})
+
+    def clear_note(self, sid):
+        """Take back a session's notification: it was opened, or it's no longer waiting on you.
+        Without this, a stale "Your turn" stays up until you click it."""
+        note = self.notes.pop(sid, None)
+        if not note:
+            return
+        self.save_notes()
+        close_notification(note.get("id"))
+        if note.get("proc"):
+            note["proc"].kill()
+
+    def clear_stale_notes(self):
+        """At start: notifications from before a restart or reload can't be answered any more
+        (nothing is listening for their Open button), so take them all back."""
+        for nid in (read_json(NOTES, {}) or {}).values():
+            close_notification(nid)
+        NOTES.unlink(missing_ok=True)
+        for pid in os.listdir("/proc"):
+            argv = cmdline(pid) if pid.isdigit() else []
+            if argv and Path(argv[0]).name == "notify-send" and "Plane" in argv and "-p" in argv:
+                try:
+                    os.kill(int(pid), 15)
+                except OSError:
+                    pass
 
     def put(self, y, x, text, attr=0):
         h, w = self.scr.getmaxyx()
@@ -887,8 +1025,9 @@ class Sidebar:
             except curses.error:
                 pass
 
-    def ask(self, question, default="", complete=None):
+    def ask(self, question, default="", complete=None, hint="esc cancels"):
         """One-line input at the bottom. Returns None on Esc; Tab runs `complete`."""
+        self.draw()  # the list stays in view above the input (a chooser may have covered it)
         h, w = self.scr.getmaxyx()
         buf = list(default)
         curses.curs_set(1)
@@ -896,12 +1035,14 @@ class Sidebar:
         try:
             while True:
                 text = "".join(buf)
-                self.put(h - 3, 0, " " * w)
-                self.put(h - 2, 0, " " * w)
-                self.put(h - 3, 1, question, curses.color_pair(C_ACCENT) | curses.A_BOLD)
-                shown = text[-(w - 4):]
-                self.put(h - 2, 1, "› " + shown)
-                self.scr.move(h - 2, min(w - 1, 3 + len(shown)))
+                for y in (h - 4, h - 3, h - 2, h - 1):
+                    self.put(y, 0, " " * w)
+                self.put(h - 4, 1, question[:w - 2], curses.color_pair(C_ACCENT) | curses.A_BOLD)
+                shown = text[-(w - 5):]
+                self.put(h - 3, 1, "›", curses.color_pair(C_ACCENT) | curses.A_BOLD)
+                self.put(h - 3, 3, shown.ljust(w - 5), curses.color_pair(C_TEXT + SEL))
+                self.put(h - 1, 1, hint[:w - 2], curses.A_DIM)
+                self.scr.move(h - 3, min(w - 2, 3 + len(shown)))
                 ch = self.read()
                 if isinstance(ch, Paste):
                     buf.extend(c for c in " ".join(ch.split()) if c.isprintable())
@@ -922,22 +1063,55 @@ class Sidebar:
             curses.curs_set(0)
             self.set_timeout(400)
 
-    def confirm(self, question):
-        ans = self.ask(f"{question} (y/N)")
-        return bool(ans) and ans.lower().startswith("y")
+    def confirm(self, question, yes="yes"):
+        """One keypress: y does it, anything else (n, Esc, a click) backs out."""
+        h, w = self.scr.getmaxyx()
+        self.draw()
+        for y in (h - 3, h - 2, h - 1):
+            self.put(y, 0, " " * w)
+        self.put(h - 3, 1, question[:w - 2], curses.color_pair(C_WARN) | curses.A_BOLD)
+        self.put(h - 2, 1, "y", curses.A_BOLD)
+        self.put(h - 2, 3, yes)
+        self.put(h - 2, 5 + len(yes), "n", curses.A_BOLD)
+        self.put(h - 2, 7 + len(yes), "cancel", curses.A_DIM)
+        self.scr.refresh()
+        self.set_timeout(-1)
+        try:
+            while True:
+                ch = self.read()
+                if ch == curses.KEY_MOUSE:
+                    try:  # drain it and keep waiting: the release of the click that
+                        curses.getmouse()  # picked a menu item arrives here too
+                    except curses.error:
+                        pass
+                elif ch == curses.KEY_RESIZE:
+                    continue
+                return not isinstance(ch, Paste) and ch in (ord("y"), ord("Y"))
+        finally:
+            self.set_timeout(400)
 
-    def choose(self, title, options):
-        """Pick from a short list with arrows/Enter, or type. Returns str or None."""
+    def choose(self, title, options, step=""):
+        """Pick from a short list with arrows/Enter, or type. Returns str or None.
+        Options are (label, value) or (label, value, note): the note is shown dim after it."""
         idx = 0
         self.set_timeout(-1)
         try:
             while True:
                 self.scr.erase()
+                w = self.scr.getmaxyx()[1]
+                if step:
+                    self.put(0, 1, step, curses.A_DIM)
                 self.put(1, 1, title, curses.color_pair(C_ACCENT) | curses.A_BOLD)
-                for i, (label, _val) in enumerate(options):
-                    attr = curses.A_REVERSE if i == idx else 0
-                    self.put(3 + i, 1, f" {label} ", attr)
-                self.put(4 + len(options), 1, "↑↓ pick · ⏎ ok · esc cancel", curses.A_DIM)
+                for i, (label, _val, *note) in enumerate(options):
+                    sel = i == idx
+                    self.put(3 + i, 0, " " * (w - 1), curses.color_pair(C_TEXT + SEL) if sel else 0)
+                    if sel:
+                        self.put(3 + i, 0, "▌", curses.color_pair(C_ACCENT + SEL))
+                    self.put(3 + i, 2, label, curses.color_pair(C_TEXT + SEL if sel else C_TEXT) | (curses.A_BOLD if sel else 0))
+                    if note and len(label) + 4 < w - 2:
+                        self.put(3 + i, 3 + len(label), note[0][:w - len(label) - 5],
+                                 curses.color_pair(C_DIM + SEL if sel else C_DIM) | curses.A_DIM)
+                self.put(4 + len(options), 1, "esc cancels", curses.A_DIM)
                 self.scr.refresh()
                 ch = self.read()
                 if isinstance(ch, Paste):
@@ -975,8 +1149,10 @@ class Sidebar:
             elif not shutil.which("hyprctl"):
                 self.flash("it's in another window (switching to it needs Hyprland)")
             else:
-                self.flash("couldn't find that session's window")
+                self.flash("couldn't find that session's window", "bad")
             return
+        mark_opened(s["id"])
+        self.clear_note(s["id"])  # you're looking at it now: its "your turn" note is done
         if self.attached == s["id"]:
             kitty("focus-window", "--match", "var:plane_role=session")
             return
@@ -984,7 +1160,7 @@ class Sidebar:
                         s.get("name") or s["id"], s["id"]):
             self.attached = s["id"]
         else:
-            self.flash("couldn't open the session pane")
+            self.flash("couldn't open the session pane", "bad")
 
     def start_bg(self, cwd, title, extra):
         """Start in the session pane (see cmd_start), where a trust prompt can be answered."""
@@ -992,34 +1168,35 @@ class Sidebar:
             self.attached = None
             self.flash("starting… answer any prompt on the right")
         else:
-            self.flash("couldn't open the session pane")
+            self.flash("couldn't open the session pane", "bad")
         self.store.poke()
 
     def new_session(self):
-        opts = [(f"{Path(p).name}  ({p.replace(str(HOME), '~')})", p) for p in recent_projects()]
-        opts += [("~  (home folder)", str(HOME)), ("type a path…", "")]
-        cwd = self.choose("New session in which folder?", opts)
+        opts = [(Path(p).name, p, str(Path(p).parent).replace(str(HOME), "~")) for p in recent_projects()]
+        opts += [("~", str(HOME), "home folder"), ("Type a path…", "")]
+        cwd = self.choose("Which folder?", opts, step="NEW SESSION · 1 of 3")
         if cwd is None:
             return
         if not cwd:
-            cwd = self.ask("Folder path (tab completes):", complete=complete_dir)
+            cwd = self.ask("Folder path", complete=complete_dir, hint="tab completes · esc cancels")
             if not cwd:
                 return
             cwd = os.path.abspath(os.path.expanduser(cwd))
             if not Path(cwd).is_dir():
-                self.flash(f"no such folder: {cwd}")
+                self.flash(f"no such folder: {cwd}", "bad")
                 return
-        name = self.ask("Name (optional):")
+        where = cwd.replace(str(HOME), "~")
+        name = self.ask(f"2 of 3 · Name it ({where})", hint="leave empty to skip · esc cancels")
         if name is None:
             return
-        prompt = self.ask("First message (optional):")
+        prompt = self.ask("3 of 3 · First message", hint="leave empty to skip · esc cancels")
         if prompt is None:
             return
         extra = (["--name", name] if name else []) + (["--prompt", prompt] if prompt else [])
         self.start_bg(cwd, name or Path(cwd).name or "~", extra)
 
     def launch_handoff(self, h):
-        if not h["ready"] and not self.confirm("Its session is still working on it. Start anyway?"):
+        if not h["ready"] and not self.confirm("Its session is still writing it. Start anyway?", "start"):
             return
         src = h.get("source")
         # Claim it first: moving the file out of the queue is atomic, so a second ⏎ or a click
@@ -1028,7 +1205,7 @@ class Sidebar:
         try:
             os.replace(h["path"], done)
         except FileNotFoundError:
-            self.flash("that handoff was already started")
+            self.flash("that handoff was already started", "warn")
             self.store.poke()
             return
         h2 = {k: v for k, v in h.items() if k not in ("path", "source", "ready")}
@@ -1044,9 +1221,10 @@ class Sidebar:
         """Pick up an interrupted session: reattach its background job, or resume the conversation."""
         name, cwd = r.get("name") or "", r.get("cwd") or str(HOME)
         if not Path(cwd).is_dir():
-            self.flash(f"its folder is gone: {cwd}")
+            self.flash(f"its folder is gone: {cwd}", "bad")
             return
         job = r.get("jobId")
+        mark_opened(job)
         if r.get("kind") == "bg" and job and (CLAUDE_DIR / "jobs" / job).is_dir():
             if show_in_pane([claude_bin(), "attach", job], cwd, name or job, job):
                 self.attached = job
@@ -1060,7 +1238,7 @@ class Sidebar:
         group = [x for x in self.store.lost if (x["cause"] == "standby") == standby] if everything else [r]
         what = (f"all {len(group)} {'standby' if standby else 'cut-off'} sessions" if everything
                 else f"'{lost_label(r)[:24]}'")
-        if not self.confirm(f"Close {what}?"):
+        if not self.confirm(f"Close {what}?", "close"):
             return
         for x in group:
             job = x.get("jobId")
@@ -1076,7 +1254,7 @@ class Sidebar:
         if not s["bg"]:
             self.flash("it's in its own window: type /exit there")
             return
-        if not self.confirm(f"Close '{(s.get('name') or s['id'])[:24]}'?"):
+        if not self.confirm(f"Close '{(s.get('name') or s['id'])[:26]}'?", "close"):
             return
         if self.remove(s):
             self.flash("closed · conversation kept (claude --resume)")
@@ -1084,7 +1262,7 @@ class Sidebar:
     def remove(self, s):
         code, out = self.run_claude(["rm", s["id"]], HOME)
         if code != 0:
-            self.flash(f"not closed: {out.splitlines()[0][:100] if out else 'claude rm failed'}")
+            self.flash(f"not closed: {out.splitlines()[0][:100] if out else 'claude rm failed'}", "bad")
         else:
             ledger_end(s["id"], "closed")
             if self.attached == s["id"]:
@@ -1104,9 +1282,9 @@ class Sidebar:
         """Undo starting a handoff: close its session and put the handoff back in the queue."""
         f = self.handoff_of(s)
         if not f:
-            self.flash("no handoff to put back")
+            self.flash("no handoff to put back", "warn")
             return
-        if not self.confirm(f"Close & requeue '{(s.get('name') or s['id'])[:11]}'?"):
+        if not self.confirm("Close it and put the handoff back?", "put back"):
             return
         if not self.remove(s):  # still running: requeuing now could start it twice
             return
@@ -1127,21 +1305,33 @@ class Sidebar:
             self.flash("already paused · x closes it")
             return
         code, out = self.run_claude(["stop", s["id"]], HOME)
-        self.flash("paused · open it to continue" if code == 0 else f"not paused: {out[:100]}")
+        self.flash("paused · open it to continue" if code == 0 else f"not paused: {out[:100]}",
+                   "info" if code == 0 else "bad")
         if self.attached == s["id"]:
             self.attached = None
         self.store.poke()
 
     def discard_handoff(self, h):
-        if self.confirm(f"Discard handoff '{h.get('title', '')[:20]}'?"):
+        if self.confirm(f"Discard '{h.get('title', '')[:26]}'?", "discard"):
             src = Path(h["path"])
             DISCARDED.mkdir(parents=True, exist_ok=True)
             try:
                 os.replace(src, DISCARDED / src.name)
                 os.utime(DISCARDED / src.name)  # the 14 days count from now
+                self.last_discard = DISCARDED / src.name
+                self.flash("discarded · u brings it back")
             except FileNotFoundError:
                 pass
             self.store.poke()
+
+    def undo_discard(self):
+        f, self.last_discard = self.last_discard, None
+        if not f or not f.exists():
+            self.flash("nothing to bring back", "warn")
+            return
+        os.replace(f, HANDOFFS / f.name)
+        self.flash("handoff back in the queue")
+        self.store.poke()
 
     def actions_for(self, kind, obj):
         """The right-click menu: (label, action) for the clicked row."""
@@ -1164,18 +1354,25 @@ class Sidebar:
             acts = [("Start", lambda: self.launch_handoff(obj)),
                     ("Read prompt", lambda: self.view_handoff(obj)),
                     ("Discard", lambda: self.discard_handoff(obj))]
+        elif kind == "more":
+            acts = [("Show all handoffs" if obj["hidden"] else "Show fewer", self.toggle_handoffs)]
         else:
             acts = []
-        return acts + [("New session…", self.new_session)]
+        return acts + ([(None, None)] if acts else []) + [("New session…", self.new_session)]
 
     def menu(self, y, options):
         """Popup under row y. Click or ⏎ picks; Esc, right-click or a click outside cancels."""
         h, w = self.scr.getmaxyx()
-        width = min(w - 2, max(len(label) for label, _ in options) + 4)
+        width = min(w - 2, max(len(label) for label, _ in options if label) + 6)
         height = len(options) + 2
         top, left = max(0, min(y + 1, h - height)), 2
         win = curses.newwin(height, width, top, left)
         idx = 0
+
+        def step(i, d):  # move to the next real item, past separators
+            i = (i + d) % len(options)
+            return i if options[i][0] else (i + d) % len(options)
+
         self.set_timeout(-1)
         try:
             while True:
@@ -1184,18 +1381,20 @@ class Sidebar:
                 win.box()
                 win.attroff(curses.color_pair(C_ACCENT))
                 for i, (label, _) in enumerate(options):
-                    attr = curses.A_REVERSE if i == idx else 0
-                    if label == "Discard":
-                        attr |= curses.color_pair(C_BAD)
-                    win.addnstr(1 + i, 2, label.ljust(width - 4), width - 4, attr)
+                    if not label:  # separator: row actions above, general ones below
+                        win.addnstr(1 + i, 1, "─" * (width - 2), width - 2, curses.color_pair(C_ACCENT) | curses.A_DIM)
+                        continue
+                    color = C_BAD if label == "Discard" else C_TEXT
+                    attr = curses.color_pair(color + SEL) | curses.A_BOLD if i == idx else curses.color_pair(color)
+                    win.addnstr(1 + i, 1, f" {label}".ljust(width - 2), width - 2, attr)
                 win.refresh()
                 ch = self.read()
                 if isinstance(ch, Paste):
                     continue
                 if ch in (curses.KEY_UP, ord("k")):
-                    idx = (idx - 1) % len(options)
+                    idx = step(idx, -1)
                 elif ch in (curses.KEY_DOWN, ord("j")):
-                    idx = (idx + 1) % len(options)
+                    idx = step(idx, 1)
                 elif ch in (10, 13, curses.KEY_ENTER):
                     break
                 elif ch == 27:
@@ -1210,6 +1409,8 @@ class Sidebar:
                             return
                         continue
                     if top < my < top + height - 1 and left <= mx < left + width:
+                        if not options[my - top - 1][0]:
+                            continue  # the separator line
                         idx = my - top - 1
                         break
                     return
@@ -1226,96 +1427,143 @@ class Sidebar:
         self.attached = None
 
     # -- drawing
-    def bar(self, y, label, win):
-        w = self.scr.getmaxyx()[1]
+    def bar(self, y, label, win, width, prefix="resets "):
         if not win:
-            self.put(y, 1, f"{label}  --", curses.A_DIM)
+            self.put(y, 1, label, curses.A_BOLD)
+            self.put(y, 5, "no data yet", curses.A_DIM)
             return
         pct = win["pct"]
         color = C_OK if pct < 50 else C_WARN if pct < 80 else C_BAD
-        width = max(6, min(14, w - 24))
         fill = round(width * min(pct, 100) / 100)
-        self.put(y, 1, f"{label} ", curses.A_BOLD)
-        self.put(y, 4, "█" * fill, curses.color_pair(color))
-        self.put(y, 4 + fill, "░" * (width - fill), curses.A_DIM)
-        self.put(y, 5 + width, f"{pct:>3.0f}%", curses.color_pair(color) | curses.A_BOLD)
+        self.put(y, 1, label, curses.A_BOLD)
+        self.put(y, 5, "█" * fill, curses.color_pair(color))
+        self.put(y, 5 + fill, "░" * (width - fill), curses.A_DIM)
+        self.put(y, 6 + width, f"{pct:>3.0f}%", curses.color_pair(color) | curses.A_BOLD)
         reset = fmt_reset(win.get("resetsAt"))
         if reset:
-            self.put(y, 11 + width, f"↻ {reset}", curses.A_DIM)
+            self.put(y, 12 + width, f"{prefix}{reset}", curses.A_DIM)
 
-    def session_line(self, s):
-        state = session_state(s)
-        return {"working": ("●", C_OK), "needs you": ("!", C_WARN),
-                "your turn": ("○", C_ACCENT)}.get(state, ("○", C_DIM)) + (state,)
+    def usage_header(self, usage, w):
+        """Two usage bars. They share one width, sized to leave room for the reset times;
+        a narrow sidebar drops the word "resets" before it shrinks the bars to nothing."""
+        wins = (usage.get("five_hour"), usage.get("seven_day"))
+        resets = max((len(fmt_reset(x.get("resetsAt"))) for x in wins if x), default=0)
+        prefix = "resets " if w - 13 - 7 - resets >= 6 else ""
+        width = max(3, min(14, w - 13 - len(prefix) - resets))
+        self.bar(1, "5h", wins[0], width, prefix)
+        self.bar(2, "wk", wins[1], width, prefix)
+        if usage.get("updatedAt") and time.time() - usage["updatedAt"] > 900:
+            self.put(3, 1, f"usage as of {ago(usage['updatedAt'])}", curses.A_DIM)
+
+    def item_key(self, item):
+        kind, obj = item
+        return kind, obj.get("id") or obj.get("sessionId") or obj.get("path")
+
+    def row_look(self, kind, obj):
+        """(icon, icon color, name, state word, state color, emphasis) for one row."""
+        if kind == "session":
+            state = session_state(obj)
+            icon, color = {"working": ("●", C_OK), "needs you": ("!", C_WARN),
+                           "your turn": ("○", C_ACCENT), "paused": ("‖", C_DIM),
+                           "failed": ("✕", C_BAD)}.get(state, ("○", C_DIM))
+            name = obj.get("name") or obj.get("id") or "?"
+            emph = "dim" if obj.get("stopped") else "bold" if state == "needs you" else ""
+            return icon, color, name, state, color, emph
+        if kind == "lost" and obj["cause"] == "standby":
+            if obj.get("jobState") == "blocked":
+                return "!", C_WARN, lost_label(obj), "needs you", C_WARN, "bold"
+            return "○", C_ACCENT, lost_label(obj), "your turn", C_ACCENT, ""
+        if kind == "lost":
+            return "↯", C_WARN, lost_label(obj), {"crashed": "crash"}.get(obj["cause"], obj["cause"]), C_WARN, ""
+        if kind == "more":
+            if obj["hidden"]:
+                return "+", C_DIM, f"{obj['hidden']} more handoffs", "", C_DIM, "dim"
+            return "−", C_DIM, "show fewer", "", C_DIM, "dim"
+        if obj["ready"]:  # handoffs: ready is the normal case, so only "not ready" gets a word
+            return "→", C_ACCENT, obj.get("title", "?"), "", C_ACCENT, ""
+        return "…", C_WARN, obj.get("title", "?"), "not ready", C_WARN, "dim"
 
     def draw_item(self, y, w, idx):
         kind, obj = self.items[idx]
-        attr = curses.A_REVERSE if idx == self.sel else 0
-        self.put(y, 0, " " * (w - 1), attr)
-        if kind == "session":
-            icon, color, state = self.session_line(obj)
-            dim = curses.A_DIM if obj.get("stopped") else 0
-            if obj.get("id") and obj.get("id") == self.attached:
-                self.put(y, 1, "▶", curses.color_pair(C_ACCENT) | attr)
-            self.put(y, 2, icon, curses.color_pair(color) | attr | curses.A_BOLD)
-            name = obj.get("name") or obj.get("id") or "?"
-        elif kind == "lost" and obj["cause"] == "standby":
-            blocked = obj.get("jobState") == "blocked"
-            icon, color, state = ("!", C_WARN, "needs you") if blocked else ("○", C_ACCENT, "your turn")
-            dim = 0
-            self.put(y, 2, icon, curses.color_pair(color) | attr | curses.A_BOLD)
-            name = lost_label(obj)
-        elif kind == "lost":
-            color, state, dim = C_WARN, {"crashed": "crash"}.get(obj["cause"], obj["cause"]), 0
-            self.put(y, 2, "↯", curses.color_pair(C_WARN) | attr | curses.A_BOLD)
-            name = lost_label(obj)
-        else:
-            ok = obj["ready"]
-            color, state, dim = (C_OK if ok else C_WARN), ("ready" if ok else "pending"), 0
-            self.put(y, 2, "✓" if ok else "…", curses.color_pair(color) | attr | curses.A_BOLD)
-            name = obj.get("title", "?")
-        room = w - 4 - len(state) - 3
-        self.put(y, 4, name if len(name) <= room else name[:max(3, room - 1)] + "…", attr | dim)
-        self.put(y, w - len(state) - 2, state, curses.color_pair(color) | attr | dim)
+        sel = idx == self.sel
+        band = SEL if sel else 0
+        icon, icolor, name, state, scolor, emph = self.row_look(kind, obj)
+        attached = kind == "session" and obj.get("id") and obj.get("id") == self.attached
+        self.put(y, 0, " " * (w - 1), curses.color_pair(C_TEXT + band))
+        if sel:
+            self.put(y, 0, "▌", curses.color_pair(C_ACCENT + band))
+        if attached:  # the session showing on the right
+            self.put(y, 1, "▶", curses.color_pair(C_ACCENT + band))
+        self.put(y, 2, icon, curses.color_pair(icolor + band) | curses.A_BOLD)
+        weight = curses.A_BOLD if sel or attached or emph == "bold" else 0
+        dim = curses.A_DIM if emph == "dim" and not sel else 0
+        room = w - 5 - (len(state) + 2 if state else 0)
+        shown = name if len(name) <= room else name[:max(3, room - 1)].rstrip() + "…"
+        self.put(y, 4, shown, curses.color_pair(C_TEXT + band) | weight | dim)
+        if state:
+            self.put(y, w - len(state) - 2, state, curses.color_pair(scolor + band) | dim)
 
     def detail_lines(self, w):
+        """The selected row in full: (text, style) lines, style "name", "warn" or "" (dim)."""
         if not self.items:
             return []
         kind, obj = self.items[self.sel]
-        lines = []
+        width = w - 3
+        out = []
+
+        def add(text, style="", max_lines=2):
+            out.extend((ln, style) for ln in wrap(text, width, max_lines))
+
+        _icon, _c, name, _s, _sc, _e = self.row_look(kind, obj)
+        add(name, "name")
         if kind == "session":
-            lines.append(obj.get("cwd", "").replace(str(HOME), "~"))
-            if obj.get("branch"):
-                lines.append(f"branch {obj['branch']}")
-            if obj.get("startedAt"):
-                lines.append(f"started {ago(obj['startedAt'] / 1000)}")
-            if obj.get("needs") and obj.get("state") == "blocked":
-                lines.append(f"needs: {obj['needs']}")
+            add(obj.get("cwd", "").replace(str(HOME), "~"))
+            bits = list(filter(None, [f"branch {obj['branch']}" if obj.get("branch") else "",
+                                      f"started {ago(obj['startedAt'] / 1000)}" if obj.get("startedAt") else ""]))
+            if len(" · ".join(bits)) <= width:
+                add(" · ".join(bits), max_lines=1)
+            else:  # too long for one line: each gets its own
+                for bit in bits:
+                    add(bit, max_lines=1)
+            if obj.get("needs") and session_state(obj) == "needs you":
+                add(f"needs you: {short_needs(obj['needs'], 300)}", "warn", 4)
             if not obj["bg"]:
-                lines.append("in its own window · /exit there to close")
+                add("in its own window · /exit there to close")
         elif kind == "lost":
             where = obj.get("lastCwd") or obj.get("cwd", "")
-            lines.append(where.replace(str(HOME), "~"))
+            add(where.replace(str(HOME), "~"))
             if git_branch(where):
-                lines.append(f"branch {git_branch(where)}")
+                add(f"branch {git_branch(where)}", max_lines=1)
             when = obj.get("lastActive") or obj.get("seenAt")
             if obj["cause"] == "standby":
-                lines.append(f"last active {ago(when)} · on standby" if when else "on standby")
-                lines.append("picks up where it left off")
+                add(f"on standby since {ago(when)} · opens where it left off" if when
+                    else "on standby · opens where it left off")
                 if obj.get("needs") and obj.get("jobState") == "blocked":
-                    lines.append(f"needs: {obj['needs']}")
-            elif when:
-                lines.append(f"last active {ago(when)} · cut off by a {'reboot' if obj['cause'] == 'reboot' else 'crash'}")
+                    add(f"needs you: {short_needs(obj['needs'], 300)}", "warn", 4)
+            else:
+                cause = "a reboot" if obj["cause"] == "reboot" else "a crash"
+                add(f"cut off by {cause}" + (f" {ago(when)}" if when else ""), "warn")
             if obj.get("lastPrompt"):
-                lines.append(f"last ask: {obj['lastPrompt']}")
+                add(f"last ask: {obj['lastPrompt']}")
+        elif kind == "more":
+            add("open it to list every handoff" if obj["hidden"] else "open it to show only the newest")
         else:
             src = obj.get("source")
-            where = "ended" if not src else ("still working" if src.get("status") == "busy" else "done")
-            lines.append(f"from {obj.get('sourceName') or '?'} ({where})")
-            lines.append(obj.get("cwd", "").replace(str(HOME), "~"))
-            lines.append(f"queued {ago(obj.get('createdAt', time.time()))}")
-            lines += [ln.strip() for ln in obj.get("prompt", "").splitlines() if ln.strip()][:5]
-        return lines
+            state = "has ended" if not src else ("is still writing it" if src.get("status") == "busy" else "is done")
+            add(f"from {obj.get('sourceName') or '?'}, which {state}")
+            add(f"{obj.get('cwd', '').replace(str(HOME), '~')} · queued {ago(obj.get('createdAt', time.time()))}")
+            prompt = " ".join(obj.get("prompt", "").split())
+            if prompt:
+                add(prompt, max_lines=5)
+        return out
+
+    def attention(self, mine, standby):
+        """Header summary: how many sessions are waiting on you."""
+        states = [session_state(s) for s in mine]
+        states += ["needs you" if r.get("jobState") == "blocked" else "your turn" for r in standby]
+        needs, turn = states.count("needs you"), states.count("your turn")
+        return [(f"{needs} need{'s' * (needs == 1)} you", C_WARN) if needs else None,
+                (f"{turn} your turn", C_ACCENT) if turn else None]
 
     def draw(self):
         scr = self.scr
@@ -1331,74 +1579,107 @@ class Sidebar:
         mine = [s for s in sessions if s["bg"] and not s.get("stopped")]
         paused = [s for s in sessions if s["bg"] and s.get("stopped")]
         windows = [s for s in sessions if not s["bg"]]
+        # handoffs: newest first, and only the first few unless you open the rest
+        handoffs.sort(key=lambda x: -(x.get("createdAt") or 0))
+        hand_rows = [("handoff", x) for x in handoffs]
+        if len(handoffs) > HANDOFFS_SHOWN + 1:
+            hidden = 0 if self.handoffs_open else len(handoffs) - HANDOFFS_SHOWN
+            hand_rows = hand_rows[:len(handoffs) - hidden] + [("more", {"id": "handoffs", "hidden": hidden})]
+        # self.sel indexes the list as it was last drawn: carry the selection to the same
+        # item in the fresh list, so a session coming or going doesn't move it
+        old = self.items
+        key = self.item_key(old[self.sel]) if 0 <= self.sel < len(old) else None
+        key, self.pending_key = self.pending_key or key, None
+        # standby sessions are parked by Claude while they wait on you: they're listed with
+        # the running ones, below them
         self.items = ([("lost", r) for r in lost] + [("session", s) for s in mine] + [("lost", r) for r in standby]
-                      + [("session", s) for s in paused + windows] + [("handoff", x) for x in handoffs])
-        self.sel = max(0, min(self.sel, len(self.items) - 1))
+                      + [("session", s) for s in paused + windows] + hand_rows)
+        keys = [self.item_key(it) for it in self.items]
+        self.sel = keys.index(key) if key in keys else max(0, min(self.sel, len(self.items) - 1))
         self.rows = {}
 
         self.put(0, 1, "PLANE", curses.color_pair(C_ACCENT) | curses.A_BOLD)
-        if usage.get("updatedAt"):
-            self.put(0, 8, f"usage {ago(usage['updatedAt'])}", curses.A_DIM)
-        self.bar(1, "5h", usage.get("five_hour"))
-        self.bar(2, "wk", usage.get("seven_day"))
+        parts = [p for p in self.attention(mine, standby) if p]
+        while parts and sum(len(t) for t, _ in parts) + 3 * (len(parts) - 1) > w - 10:
+            parts.pop()  # a narrow sidebar keeps "needs you", the more urgent one
+        x = w - 2 - sum(len(t) for t, _ in parts) - 3 * (len(parts) - 1)
+        for i, (text, color) in enumerate(parts):
+            if i:
+                self.put(0, x, " · ", curses.A_DIM)
+                x += 3
+            self.put(0, x, text, curses.color_pair(color) | curses.A_BOLD)
+            x += len(text)
+        self.usage_header(usage, w)
 
         # body: section headings and item rows, scrolled to keep the selection visible
         body, idx = [], 0
-        for title, group, empty in (("CUT OFF BY CRASH/REBOOT", lost, None),
-                                    ("SESSIONS", mine, "none running · n starts one"),
-                                    ("STANDBY", standby, None),
-                                    ("PAUSED", paused, None),
-                                    ("IN OTHER WINDOWS", windows, None),
-                                    ("HANDOFFS", handoffs, "none queued")):
+        for title, group, count, empty in (("CUT OFF BY CRASH/REBOOT", lost, len(lost), None),
+                                           ("SESSIONS", mine + standby, len(mine) + len(standby),
+                                            "none running · n starts one"),
+                                           ("PAUSED", paused, len(paused), None),
+                                           ("IN OTHER WINDOWS", windows, len(windows), None),
+                                           ("HANDOFFS", hand_rows, len(handoffs), "none queued")):
             if not group and empty is None:
                 continue
             if body:
                 body.append(("gap", None))
-            body.append(("head", title))
+            body.append(("head", (title, count)))
             if not group:
                 body.append(("note", empty))
             for _ in group:
                 body.append(("item", idx))
                 idx += 1
 
+        # the details of the selected row keep a fixed place at the bottom, above the
+        # message and key lines; the list scrolls in the space above them
         details = self.detail_lines(w)
-        top, bottom = 4, h - 3
-        avail = bottom - top
-        if len(body) + len(details) + 2 <= avail:
-            offset, show_details = 0, True
+        top = 4
+        room = h - 2 - top
+        detail_h = min(len(details), max(0, room - 6), max(4, min(9, room // 3)))
+        list_bottom = h - 2 - (detail_h + 1 if detail_h else 0)
+        avail = max(1, list_bottom - top)
+        if len(body) <= avail:
+            offset = 0
         else:
             sel_row = next((i for i, (k, v) in enumerate(body) if k == "item" and v == self.sel), 0)
-            off = min(max(getattr(self, "offset", 0), sel_row - avail + 1), sel_row)
+            off = min(max(getattr(self, "offset", 0), sel_row - avail + 1), sel_row, len(body) - avail)
             if off == sel_row and off > 0 and body[off - 1][0] == "head":
                 off -= 1  # keep the section heading in view
-            self.offset = offset = off
-            show_details = False
+            self.offset = offset = max(0, off)
         y = top
         for kind, val in body[offset:offset + avail]:
             if kind == "head":
-                self.put(y, 1, val, curses.A_BOLD | (curses.color_pair(C_WARN) if val.startswith("CUT OFF") else 0))
+                title, count = val
+                self.put(y, 1, title, curses.A_BOLD | (curses.color_pair(C_WARN) if title.startswith("CUT OFF") else 0))
+                if count:
+                    self.put(y, 2 + len(title), str(count), curses.A_DIM)
             elif kind == "note":
-                self.put(y, 3, val, curses.A_DIM)
+                self.put(y, 4, val, curses.A_DIM)
             elif kind == "item":
                 self.draw_item(y, w, val)
                 self.rows[y] = val
             y += 1
-        if offset > 0:
-            self.put(top - 1, w - 7, "▲ more", curses.A_DIM)
-        if offset + avail < len(body):
-            self.put(bottom, w - 7, "▼ more", curses.A_DIM)
+        hidden_above = sum(1 for k, _ in body[:offset] if k == "item")
+        hidden_below = sum(1 for k, _ in body[offset + avail:] if k == "item")
+        if hidden_above:
+            more = f"▲ {hidden_above} more"
+            self.put(top - 1, w - len(more) - 2, more, curses.A_DIM)
 
-        if show_details and details:
-            y += 1
-            self.put(y, 0, "─" * (w - 1), curses.A_DIM)
-            for ln in details:
-                y += 1
-                if y >= bottom:
-                    break
-                self.put(y, 1, ln[:w - 2], curses.A_DIM)
+        if detail_h:
+            rule = "─" * (w - 1)
+            if hidden_below:  # the hidden count sits on the rule, where the list stops
+                more = f" ▼ {hidden_below} more "
+                rule = rule[:2] + more + rule[2 + len(more):]
+            self.put(list_bottom, 0, rule, curses.A_DIM)
+            for i, (text, style) in enumerate(details[:detail_h]):
+                attr = (curses.A_BOLD if style == "name" else
+                        curses.color_pair(C_WARN) if style == "warn" else curses.A_DIM)
+                self.put(list_bottom + 1 + i, 1, text, attr)
+        elif hidden_below:
+            self.put(list_bottom - 1, w - 12, f"▼ {hidden_below} more", curses.A_DIM)
 
         if self.msg and time.time() - self.msg_at < 6:
-            self.put(h - 2, 1, self.msg[:w - 2], curses.color_pair(C_WARN))
+            self.put(h - 2, 1, self.msg[:w - 2], curses.color_pair(TONES.get(self.msg_tone, C_ACCENT)))
         elif err:
             self.put(h - 2, 1, err[:w - 2], curses.color_pair(C_BAD))
         kind, obj = self.items[self.sel] if self.items else (None, None)
@@ -1410,35 +1691,53 @@ class Sidebar:
             hint = "x close  p pause  n new  ? keys"
         else:
             hint = "n new session  ? keys"
-        self.put(h - 1, 1, hint, curses.A_DIM)
+        x = 1
+        pairs = hint.split("  ")
+        while len(pairs) > 1 and len("  ".join(pairs)) > w - 2:
+            pairs.pop(-2)  # a narrow sidebar drops hints from the middle; "? keys" stays
+        for pair in pairs:  # the key stands out, its word stays quiet
+            key, _, word = pair.partition(" ")
+            self.put(h - 1, x, key, curses.A_BOLD)
+            self.put(h - 1, x + len(key) + 1, word, curses.A_DIM)
+            x += len(pair) + 2
         scr.refresh()
 
     def help(self):
         self.scr.erase()
-        rows = [  # the sidebar is ~38 columns: keys in 9, words in 26
-            ("x", "close: done, off the list"),
-            ("", "conversation is kept"),
-            ("p", "pause: stays listed"),
-            ("n", "new session"),
-            ("v", "read a handoff"),
-            ("x", "on a handoff: discard it"),
-            ("⏎ click", "open the selected row"),
-            ("", "handoff: ⏎ or double-click"),
-            ("r-click", "all actions for a row"),
+        rows = [  # the sidebar is ~38 columns: keys in 9, words in 26; "#" rows are headings
+            ("#", "ANY ROW"),
+            ("⏎ click", "open it"),
+            ("r-click", "all its actions"),
             ("↑↓ jk", "move the selection"),
+            ("#", "SESSIONS"),
+            ("x", "close: off the list,"),
+            ("", "conversation kept"),
+            ("p", "pause: stays listed"),
+            ("#", "HANDOFFS"),
+            ("⏎ 2×click", "start it"),
+            ("v", "read the prompt"),
+            ("x", "discard (u undoes)"),
+            ("#", "PLANE"),
+            ("n", "new session"),
             ("super ←→", "sidebar ⇄ session"),
             ("r / R", "refresh / reload code"),
             ("q", "quit (sessions go on)"),
-            ("", ""),
+            ("#", "TIP"),
             (None, "In a session, ← on an empty"),
             (None, "prompt opens Claude's own"),
             (None, "list; ⏎ there comes back."),
         ]
-        self.put(1, 1, "KEYS", curses.color_pair(C_ACCENT) | curses.A_BOLD)
-        for i, (k, d) in enumerate(rows):
-            self.put(3 + i, 1, k or "", curses.A_BOLD)
-            self.put(3 + i, 1 if k is None else 11, d, curses.A_DIM)
-        self.put(4 + len(rows), 1, "any key to go back", curses.A_DIM)
+        self.put(0, 1, "KEYS", curses.color_pair(C_ACCENT) | curses.A_BOLD)
+        y = 1
+        for k, d in rows:
+            if k == "#":
+                y += 1
+                self.put(y, 1, d, curses.A_BOLD | curses.color_pair(C_ACCENT))
+            else:
+                self.put(y, 2, k or "", curses.A_BOLD)
+                self.put(y, 2 if k is None else 13, d, curses.A_DIM)
+            y += 1
+        self.put(y + 1, 1, "any key to go back", curses.A_DIM)
         self.set_timeout(-1)
         self.read()
         self.set_timeout(400)
@@ -1454,6 +1753,18 @@ class Sidebar:
             self.launch_handoff(obj)
         elif kind == "lost":
             self.resume_lost(obj)
+        elif kind == "more":
+            self.toggle_handoffs()
+
+    def toggle_handoffs(self):
+        """Open the rest of the handoff list (selecting the first one it shows), or fold it."""
+        self.handoffs_open = not self.handoffs_open
+        if self.handoffs_open:
+            shown = [o for k, o in self.items if k == "handoff"]
+            with self.store.lock:
+                rest = sorted(self.store.handoffs, key=lambda x: -(x.get("createdAt") or 0))[len(shown):]
+            if rest:
+                self.pending_key = ("handoff", rest[0].get("id"))
 
     def click(self, row):
         # A handoff starts a whole session, so it needs a double-click (or ⏎) to start.
@@ -1487,6 +1798,9 @@ class Sidebar:
                     s = next((s for s in self.store.sessions if s.get("id") == sid and not s.get("stopped")), None)
                 if s:
                     self.attach(s)
+                    keys = [self.item_key(it) for it in self.items]
+                    if ("session", sid) in keys:  # select it too, so its details show
+                        self.sel = keys.index(("session", sid))
             self.draw()
             if self.resized_at and time.time() - self.resized_at > 0.3:
                 self.resized_at = 0
@@ -1535,6 +1849,8 @@ class Sidebar:
                     self.discard_handoff(obj)
             elif ch == ord("p") and kind == "session":
                 self.pause(obj)
+            elif ch == ord("u"):
+                self.undo_discard()
             elif ch == ord("v") and kind == "handoff":
                 self.view_handoff(obj)
             elif ch == ord("r"):
