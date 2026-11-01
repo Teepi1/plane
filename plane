@@ -1419,7 +1419,7 @@ class Sidebar:
         self.attached = None
 
     # -- drawing
-    def bar(self, y, label, win, width):
+    def bar(self, y, label, win, width, prefix="resets "):
         if not win:
             self.put(y, 1, label, curses.A_BOLD)
             self.put(y, 5, "no data yet", curses.A_DIM)
@@ -1433,15 +1433,17 @@ class Sidebar:
         self.put(y, 6 + width, f"{pct:>3.0f}%", curses.color_pair(color) | curses.A_BOLD)
         reset = fmt_reset(win.get("resetsAt"))
         if reset:
-            self.put(y, 12 + width, f"resets {reset}", curses.A_DIM)
+            self.put(y, 12 + width, f"{prefix}{reset}", curses.A_DIM)
 
     def usage_header(self, usage, w):
-        """Two usage bars. They share one width, sized to leave room for the reset times."""
+        """Two usage bars. They share one width, sized to leave room for the reset times;
+        a narrow sidebar drops the word "resets" before it shrinks the bars to nothing."""
         wins = (usage.get("five_hour"), usage.get("seven_day"))
         resets = max((len(fmt_reset(x.get("resetsAt"))) for x in wins if x), default=0)
-        width = max(4, min(14, w - 20 - resets))
-        self.bar(1, "5h", wins[0], width)
-        self.bar(2, "wk", wins[1], width)
+        prefix = "resets " if w - 13 - 7 - resets >= 6 else ""
+        width = max(3, min(14, w - 13 - len(prefix) - resets))
+        self.bar(1, "5h", wins[0], width, prefix)
+        self.bar(2, "wk", wins[1], width, prefix)
         if usage.get("updatedAt") and time.time() - usage["updatedAt"] > 900:
             self.put(3, 1, f"usage as of {ago(usage['updatedAt'])}", curses.A_DIM)
 
@@ -1682,7 +1684,10 @@ class Sidebar:
         else:
             hint = "n new session  ? keys"
         x = 1
-        for pair in hint.split("  "):  # the key stands out, its word stays quiet
+        pairs = hint.split("  ")
+        while len(pairs) > 1 and len("  ".join(pairs)) > w - 2:
+            pairs.pop(-2)  # a narrow sidebar drops hints from the middle; "? keys" stays
+        for pair in pairs:  # the key stands out, its word stays quiet
             key, _, word = pair.partition(" ")
             self.put(h - 1, x, key, curses.A_BOLD)
             self.put(h - 1, x + len(key) + 1, word, curses.A_DIM)
