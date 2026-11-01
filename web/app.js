@@ -165,8 +165,12 @@ function stream(url, handlers) {
 function fitViewport() {
   const vv = window.visualViewport;
   if (!vv) return;
-  app.style.height = `${vv.height}px`;
-  app.style.top = `${vv.offsetTop}px`;
+  // Only while the keyboard is up: otherwise the CSS fills the whole screen (sizing from the
+  // viewport left the app short by the status bar's height, a blank band at the bottom).
+  const keyboard = window.innerHeight - vv.height > 80;
+  app.classList.toggle("kb", keyboard);
+  app.style.height = keyboard ? `${vv.height}px` : "";
+  app.style.top = keyboard ? `${vv.offsetTop}px` : "";
 }
 window.visualViewport && visualViewport.addEventListener("resize", fitViewport);
 window.visualViewport && visualViewport.addEventListener("scroll", fitViewport);
@@ -309,8 +313,8 @@ function homeView() {
       + (nothing ? `<div class="empty"><b>No sessions running</b><span>Start one here and it runs on your laptop. It shows up in Plane on the laptop too.</span></div>` : "")
       + `<div class="${off ? "dim" : ""}">`
       + sec("Cut off by crash or reboot", cutoff, "lost") + sec("Waiting on you", waiting, "session") + sec("Working", working, "session")
-      + sec("Handoffs", snap.handoffs || [], "handoff")
       + (parked.length || standby.length ? `<div class="sec">Paused &amp; standby</div>${parked.map(o => rowHtml("session", o)).join("")}${standby.map(o => rowHtml("lost", o)).join("")}` : "")
+      + sec("Handoffs", snap.handoffs || [], "handoff")  // after paused, as in the sidebar
       + sec("In laptop windows", windows, "session")
       + `<div class="updated" id="updated"></div></div>`;
     list.scrollTop = scroll;

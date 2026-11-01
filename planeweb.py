@@ -236,6 +236,28 @@ def parse_prompt(lines):
 ANSI = re.compile(r"\x1b\[[0-9;?<>=]*[A-Za-z~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Z0-9]|\x1b[=>78]")
 
 
+if pyte is not None:
+    class DimScreen(pyte.Screen):
+        """pyte drops "dim" (SGR 2), but Claude draws its suggested next message dim, which is
+        how a suggestion is told apart from text you typed. Kept in the blink flag (unused)."""
+
+        def select_graphic_rendition(self, *attrs, **kw):
+            super().select_graphic_rendition(*attrs, **kw)
+            dim, i, seq = getattr(self, "_dim", False), 0, list(attrs) or [0]
+            while i < len(seq):
+                a = seq[i]
+                if a in (38, 48):  # extended color: skip its arguments
+                    i += 2 if i + 1 < len(seq) and seq[i + 1] == 5 else 4
+                    continue
+                if a == 2:
+                    dim = True
+                elif a in (0, 22):
+                    dim = False
+                i += 1
+            self._dim = dim
+            self.cursor.attrs = self.cursor.attrs._replace(blink=dim)
+
+
 class PtyScreen:
     """A Claude TUI running in a pty, mirrored onto a pyte screen."""
 
@@ -247,7 +269,7 @@ class PtyScreen:
         self.raw = bytearray()  # everything printed (Starter reads its result from it)
         self.dead = False
         self.last_output = time.time()
-        self.screen = pyte.Screen(cols, rows)
+        self.screen = DimScreen(cols, rows)
         self.stream = pyte.ByteStream(self.screen)
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
@@ -432,6 +454,19 @@ class Attach(PtyScreen):
             if m:
                 return m.group(1).strip()
         return None
+
+    def draft(self):
+        """Text someone typed into Claude's message box and hasn't sent (on the laptop: the
+        box is shared by every view of the session). A dim suggestion doesn't count."""
+        with self.lock:
+            buf, cols = self.screen.buffer, self.screen.columns
+            for y in range(self.screen.lines - 1, max(-1, self.screen.lines - 15), -1):
+                row = [buf[y][x] for x in range(cols)]
+                text = "".join(c.data for c in row)
+                if text.lstrip().startswith("❯"):
+                    start = text.index("❯") + 1
+                    return "".join(c.data for c in row[start:] if not c.blink).strip()
+        return ""
 
     def wait_ready(self, limit=30):
         """A new attach (or a paused session coming back) needs a moment before it takes
@@ -1572,6 +1607,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self.fail(400, "Type a message first.")
             a = hub.attach(job)
             a.wait_ready()
+            typed = a.draft() if not a.prompt else ""
+            if typed:  # the message box is shared: don't mix your laptop text into this one
+                short = typed if len(typed) <= 40 else typed[:40] + "…"
+                raise LookupError(f"Not sent: the laptop has unsent text in this session's message box "
+                                  f"(“{short}”). Send or clear it there, then try again.")
             a.send_text(text)
             hub.store.poke()
         elif action == "choose":
