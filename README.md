@@ -204,6 +204,13 @@ timeout = 120.0
 `~/.local/share/plane/uploads/` (kept 30 days), and the message gives Claude their paths.
 iPhone photos are turned into JPEG on the phone, since Claude can't read HEIC.
 
+**Terminal** on the home screen opens your own login shell on the computer, for running
+something without Claude. Tap the screen to type. The keys above the keyboard add Esc,
+Tab, Ctrl (tap it, then a letter), ^C, arrows and Paste. Leaving the screen doesn't close
+the shell: a command you started keeps running, and its output is there when you come
+back. **End** closes it. To turn the terminal off, put `"terminal": false` in
+`~/.config/plane/web.json`.
+
 It needs [Tailscale](https://tailscale.com) on both, with **HTTPS Certificates** turned on
 (admin console › DNS), plus `python-pyte` and `python-cryptography`. Then:
 

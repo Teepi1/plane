@@ -4,6 +4,8 @@
 A small web server for Plane's Home Screen app. It listens on 127.0.0.1 only;
 `tailscale serve` puts it on your tailnet with HTTPS and tells it who is asking.
 Sessions keep running on this computer: the phone only watches and types.
+The phone can also open a plain login shell here (the Terminal), unless web.json
+says "terminal": false.
 
   plane web [--port 8377]
 
@@ -552,6 +554,146 @@ class Starter(PtyScreen):
         self.broadcast("screen", self.screen_state())
 
 
+class Shell:
+    """Your login shell on this computer, for the phone's Terminal. It keeps running while
+    no phone is looking (a command you started finishes), until you end it or it exits.
+    The phone draws it with xterm.js, so the raw bytes go straight through; the last
+    SHELL_KEEP bytes are kept to redraw the screen when a phone comes back."""
+
+    SHELL_KEEP = 400_000
+
+    def __init__(self, hub, cols=80, rows=24):
+        self.hub = hub
+        self.lock = threading.Lock()
+        self.listeners = set()
+        self.buf = bytearray()
+        self.total = 0  # bytes printed since the start
+        self.seen = 0  # bytes some phone has been sent live (older ones were answered already)
+        self.dead, self.code = False, None
+        self.started = time.time()
+        self.cols, self.rows = self._clamp(cols, rows)
+        shell = os.environ.get("SHELL") or ""
+        try:
+            import pwd
+            shell = pwd.getpwuid(os.getuid()).pw_shell or shell
+        except (KeyError, ImportError):
+            pass
+        shell = shell if shell and os.access(shell, os.X_OK) else "/bin/sh"
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:
+            try:
+                os.chdir(str(P.HOME))
+                env = {k: v for k, v in os.environ.items()
+                       if not k.startswith(("KITTY_", "INVOCATION_ID", "JOURNAL_STREAM", "PLANE_"))}
+                env.update(TERM="xterm-256color", COLORTERM="truecolor", PLANE_PHONE_TERMINAL="1")
+                os.execvpe(shell, [shell, "-l"], env)
+            finally:
+                os._exit(127)
+        self.resize(self.cols, self.rows)
+        threading.Thread(target=self._read, daemon=True).start()
+        log(f"terminal: started {shell} (pid {self.pid})")
+
+    @staticmethod
+    def _clamp(cols, rows):
+        return max(20, min(int(cols), 300)), max(5, min(int(rows), 150))
+
+    def resize(self, cols, rows):
+        self.cols, self.rows = self._clamp(cols, rows)
+        try:
+            fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", self.rows, self.cols, 0, 0))
+        except OSError:
+            pass
+
+    def _read(self):
+        while True:
+            try:
+                r, _, _ = select.select([self.fd], [], [], 1.0)
+                if not r:
+                    continue
+                data = os.read(self.fd, 65536)
+            except (OSError, ValueError):
+                break
+            if not data:
+                break
+            b64 = base64.b64encode(data).decode()
+            with self.lock:
+                self.buf += data
+                if len(self.buf) > self.SHELL_KEEP:
+                    del self.buf[:len(self.buf) - self.SHELL_KEEP]
+                self.total += len(data)
+                if self.listeners:
+                    self.seen = self.total
+                listeners = list(self.listeners)
+            for q in listeners:
+                q.put(("out", {"b64": b64}))
+        try:
+            _, status = os.waitpid(self.pid, 0)
+            self.code = os.waitstatus_to_exitcode(status)
+        except ChildProcessError:
+            pass
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+        with self.lock:
+            self.dead = True
+            listeners = list(self.listeners)
+        log(f"terminal: ended (code {self.code})")
+        for q in listeners:
+            q.put(("ended", {"code": self.code}))
+        self.hub.shell_gone(self)
+
+    def join(self, q):
+        """Add a phone. Returns what to redraw: bytes it has seen before (replayed quietly,
+        so old questions to the terminal aren't answered twice) and bytes nobody has seen."""
+        with self.lock:
+            self.listeners.add(q)
+            start = self.total - len(self.buf)
+            data = bytes(self.buf)
+            cut = max(0, self.seen - start)
+            old, new = data[:cut], data[cut:]
+            if start > 0 and old:  # the kept bytes begin mid-stream: start on a fresh line
+                nl = old.find(b"\n")
+                old = old[nl + 1:] if nl >= 0 else b""
+            self.seen = self.total
+            return old, new
+
+    def leave(self, q):
+        with self.lock:
+            self.listeners.discard(q)
+
+    def write(self, data):
+        if self.dead:
+            raise LookupError("The terminal has ended.")
+        if isinstance(data, str):
+            data = data.encode()
+        while data:
+            n = os.write(self.fd, data)
+            data = data[n:]
+
+    def end(self):
+        for sig in (signal.SIGHUP, signal.SIGKILL):
+            try:
+                os.killpg(os.getpgid(self.pid), sig)
+            except (ProcessLookupError, PermissionError):
+                try:
+                    os.kill(self.pid, sig)
+                except ProcessLookupError:
+                    return
+            for _ in range(20):
+                if self.dead:
+                    return
+                time.sleep(0.1)
+
+    def info(self):
+        return {"open": not self.dead, "startedAt": self.started, "pid": self.pid}
+
+
+def terminal_allowed():
+    """On unless ~/.config/plane/web.json says "terminal": false."""
+    return (P.read_json(config_path(), {}) or {}).get("terminal", True) is not False
+
+
 # ---------------------------------------------------------------- chat from the transcript
 
 def transcript_path(session_id):
@@ -894,6 +1036,7 @@ class Hub:
         self.viewers = {}  # job id -> set of queues
         self.transcripts = {}  # session id -> Transcript
         self.starters = {}  # starter id -> Starter
+        self.shell = None  # the phone's Terminal (a Shell), while it runs
         self.snap_json = ""
         self.snap = {}
         self.launched = {}  # handoff files in done/, by session id, cached by dir mtime
@@ -1018,6 +1161,7 @@ class Hub:
         launched = self.launched_handoffs()
         out = {"sessions": [], "handoffs": [], "lost": [], "error": error, "updatedAt": time.time(),
                "uploadsDir": str(uploads_dir()),
+               "terminal": {"allowed": terminal_allowed(), "open": bool(self.shell and not self.shell.dead)},
                "push": {"ok": self.push.ok, "why": self.push.why}}
         for s in sessions:
             cwd = s.get("cwd", "")
@@ -1143,6 +1287,23 @@ class Hub:
                         del self.starters[k]
             for a in idle:
                 a.close()
+
+    # -- the Terminal
+    def open_shell(self, cols, rows):
+        if not terminal_allowed():
+            raise PermissionError("The terminal is turned off in ~/.config/plane/web.json.")
+        with self.lock:
+            if self.shell is None or self.shell.dead:
+                self.shell = Shell(self, cols, rows)
+            sh = self.shell
+        self.changed()
+        return sh
+
+    def shell_gone(self, sh):
+        with self.lock:
+            if self.shell is sh:
+                self.shell = None
+        self.changed()
 
     def start(self, cwd, name="", prompt="", resume=None, handoff=None):
         if pyte is None:
@@ -1386,6 +1547,8 @@ class Handler(BaseHTTPRequestHandler):
             m = re.fullmatch(r"/api/start/([0-9a-f]+)/stream", path)
             if m:
                 return self.starter_stream(m.group(1))
+            if path == "/api/shell/stream":
+                return self.shell_stream()
             if path.startswith("/api/"):
                 return self.fail(404, "Not found")
             return self.static(path)
@@ -1502,6 +1665,76 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             hub.unwatch(job, tq)
 
+    def shell_stream(self):
+        """The Terminal's screen: what it printed lately (to redraw), then everything live."""
+        sh = self.hub.shell
+        q = queue.Queue()
+        self.sse_start()
+        try:
+            if not sh or sh.dead:
+                self.sse("ended", {"code": None, "none": True})
+                return
+            old, new = sh.join(q)
+            self.sse("hello", {"old": base64.b64encode(old).decode(), "new": base64.b64encode(new).decode(),
+                               "startedAt": sh.started})
+            while True:
+                try:
+                    kind, data = q.get(timeout=15)
+                    if kind == "out":  # send what's queued in one go: fewer, bigger writes
+                        chunks = [base64.b64decode(data["b64"])]
+                        ended = None
+                        while len(chunks) < 256:
+                            try:
+                                k2, d2 = q.get_nowait()
+                            except queue.Empty:
+                                break
+                            if k2 == "out":
+                                chunks.append(base64.b64decode(d2["b64"]))
+                            else:
+                                ended = (k2, d2)
+                                break
+                        self.sse("out", {"b64": base64.b64encode(b"".join(chunks)).decode()})
+                        if ended:
+                            self.sse(*ended)
+                            return
+                    else:
+                        self.sse(kind, data)
+                        if kind == "ended":
+                            return
+                except queue.Empty:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            if sh:
+                sh.leave(q)
+
+    def shell_action(self, action, b):
+        hub = self.hub
+        if not terminal_allowed():
+            return self.fail(403, "The terminal is turned off in ~/.config/plane/web.json.")
+        if action == "open":
+            sh = hub.open_shell(b.get("cols", 80), b.get("rows", 24))
+            return self.send_json(sh.info())
+        sh = hub.shell
+        if action == "end":
+            if sh:
+                sh.end()
+            return self.send_json({"ok": True})
+        if not sh or sh.dead:
+            raise LookupError("The terminal has ended.")
+        if action == "input":
+            data = b.get("data")
+            if not isinstance(data, str) or len(data) > 200_000:
+                return self.fail(400, "Bad input.")
+            sh.write(data)
+        elif action == "resize":
+            sh.resize(b.get("cols", 80), b.get("rows", 24))
+        else:
+            return self.fail(404, "Not found")
+        return self.send_json({"ok": True})
+
     def starter_stream(self, sid):
         s = self.hub.starters.get(sid)
         if not s:
@@ -1537,6 +1770,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.upload()
         try:
             b = self.body()
+            m = re.fullmatch(r"/api/shell/(\w+)", path)
+            if m:
+                return self.shell_action(m.group(1), b)
             m = re.fullmatch(r"/api/session/([\w-]+)/(\w+)", path)
             if m:
                 return self.session_action(m.group(1), m.group(2), b)
@@ -1577,6 +1813,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.fail(404, "Not found")
         except LookupError as e:
             return self.fail(409, str(e).strip("'\""))
+        except PermissionError as e:
+            return self.fail(403, str(e))
         except (ValueError, KeyError, TypeError, IndexError) as e:
             return self.fail(400, f"Bad request: {e}")
         except Exception as e:
@@ -1693,6 +1931,8 @@ def serve(plane_module=None, port=PORT):
             attaches = list(hub.attaches.values())
         for a in attaches:
             a.close()
+        if hub.shell:
+            hub.shell.end()
         try:
             P.PHONE_FLAG.unlink(missing_ok=True)
         except (OSError, AttributeError):
