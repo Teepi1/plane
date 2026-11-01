@@ -286,7 +286,8 @@ function tipHtml() {
 function homeView() {
   app.innerHTML = `<div class="top"><div class="top-row"><h1>Plane</h1><span class="live" id="live"></span></div><div class="usage" id="usage"></div></div>
     <div class="scroll" id="list"></div>
-    <div class="dock"><button class="btn primary" data-href="#new" id="newBtn">+ New session</button></div>`;
+    <div class="dock" id="dock"><button class="btn primary" data-href="#new" id="newBtn">+ New session</button>
+      <button class="btn" data-href="#sh" id="shBtn" hidden>Terminal</button></div>`;
   const list = $("#list");
   let tick;
   function update() {
@@ -298,6 +299,11 @@ function homeView() {
       ? `<span>${label}</span><span class="meter"><i class="${x.pct >= 85 ? "hot" : ""}" style="width:${Math.min(100, x.pct)}%"></i></span><span>${Math.round(x.pct)}%${x.resetsAt ? " · " + resetLabel(x.resetsAt) : ""}</span>` : "";
     $("#usage").innerHTML = bar("5-hour", u.five_hour) + bar("Week", u.seven_day);
     $("#newBtn").disabled = off;
+    const tm = snap?.terminal || {};
+    $("#shBtn").hidden = !tm.allowed;
+    $("#shBtn").textContent = tm.open ? "Back to terminal" : "Terminal";
+    $("#shBtn").disabled = off;
+    $("#dock").classList.toggle("two", !!tm.allowed);
     if (!snap) {
       list.innerHTML = off ? offlineHtml() : `<div class="center"><span class="big spin" aria-hidden="true">◌</span><span>Loading your sessions…</span></div>`;
       return;
@@ -717,6 +723,166 @@ function termView(id) {
   return { cleanup() { st && st.close(); ro && ro.disconnect(); term && term.dispose(); app.onclick = null; } };
 }
 
+// ---- the laptop's own terminal (your shell, not a Claude session)
+
+const TERM_THEME = { background: "#0A0E16", foreground: "#F2F5F9", cursor: "#5CCFF0", selectionBackground: "#1F4A73",
+  black: "#151C28", red: "#FF5C6C", green: "#4ED6A0", yellow: "#F5C86A", blue: "#3A9BE8", magenta: "#E58AB8", cyan: "#5CCFF0", white: "#C9D2DE",
+  brightBlack: "#5A6880", brightRed: "#FF7F8B", brightGreen: "#72E3B5", brightYellow: "#FFD88A", brightBlue: "#62B2F0",
+  brightMagenta: "#F0A6CB", brightCyan: "#86DDF5", brightWhite: "#F2F5F9" };
+
+const b64bytes = b64 => { const bin = atob(b64); const out = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i); return out; };
+
+function shellView() {
+  app.innerHTML = `<div class="nav"><button data-href="#">‹ Sessions</button><span class="t">Laptop terminal</span><button class="endbtn gone" id="shEnd">End</button></div>
+    <div class="termwrap" id="term"></div>
+    <div class="termnote" id="shNote" role="status" hidden></div>
+    <div class="composer dim" id="shKeys"><div class="keys">
+      <button data-sk="esc">Esc</button><button data-sk="tab">Tab</button>
+      <button data-sk="ctrl" aria-pressed="false">Ctrl</button><button data-sk="ctrlc" aria-label="Control C">^C</button>
+      <button class="wide" data-sk="kbd" id="shKbd">Keyboard</button>
+      <button data-sk="left" aria-label="Left">←</button><button data-sk="up" aria-label="Up">↑</button>
+      <button data-sk="down" aria-label="Down">↓</button><button data-sk="right" aria-label="Right">→</button>
+      <button class="wide" data-sk="paste">Paste</button></div></div>`;
+  const note = $("#shNote"), kbdBtn = $("#shKbd"), ctrlBtn = $('[data-sk="ctrl"]');
+  let term, fit, st, ro, quiet = false, ended = false, ctrl = false, typing = false, alive = true;
+
+  // End and the keys only while a shell is there to take them
+  function live(on) { $("#shEnd").classList.toggle("gone", !on); $("#shKeys").classList.toggle("dim", !on); }
+
+  // what the bar under the screen says; nothing while all is well
+  function say(text, action) {
+    note.hidden = !text;
+    note.innerHTML = text ? `<span>${esc(text)}</span>${action ? `<button data-sk="${action[0]}">${esc(action[1])}</button>` : ""}` : "";
+  }
+
+  // -- typing: keys go to the laptop in order, bunched while one is on its way
+  let outq = "", sending = false;
+  async function flush() {
+    sending = true;
+    while (outq && alive) {
+      const data = outq; outq = "";
+      try { await api("/api/shell/input", { data }); }
+      catch (e) { outq = ""; say(e.message); break; }
+    }
+    sending = false;
+  }
+  function send(data) { if (ended || !data) return; outq += data; if (!sending) flush(); }
+
+  function setCtrl(on) { ctrl = on; ctrlBtn.setAttribute("aria-pressed", String(on)); }
+  function withCtrl(d) {
+    if (!ctrl || d.length !== 1) return d;
+    setCtrl(false);
+    const c = d.toLowerCase();
+    if (c >= "a" && c <= "z") return String.fromCharCode(c.charCodeAt(0) - 96);
+    return { "@": "\x00", " ": "\x00", "[": "\x1b", "\\": "\x1c", "]": "\x1d", "^": "\x1e", "_": "\x1f", "?": "\x7f" }[d] || d;
+  }
+
+  function arrow(k) {
+    const letter = { up: "A", down: "B", right: "C", left: "D" }[k];
+    if (ctrl) { setCtrl(false); return `\x1b[1;5${letter}`; }
+    return (term && term.modes.applicationCursorKeysMode ? "\x1bO" : "\x1b[") + letter;
+  }
+
+  function setTyping(on) { typing = on; kbdBtn.textContent = on ? "Hide keyboard" : "Keyboard"; }
+
+  // -- the screen
+  let lastSize = "";
+  function sendSize() {
+    if (!term || ended) return;
+    const now = `${term.cols}x${term.rows}`;
+    if (now === lastSize) return;
+    lastSize = now;
+    api("/api/shell/resize", { cols: term.cols, rows: term.rows }).catch(() => { lastSize = ""; });
+  }
+
+  function connect() {
+    st && st.close();
+    st = stream("/api/shell/stream", {
+      hello(v) {
+        ended = false; live(true); say("");
+        term.reset();
+        // what a phone saw before is redrawn quietly: questions in it (from the shell to the
+        // terminal) were answered then, and answering again would type junk into the shell
+        quiet = true;
+        term.write(b64bytes(v.old), () => { quiet = false; term.write(b64bytes(v.new)); });
+        lastSize = ""; sendSize();
+      },
+      out(v) { term.write(b64bytes(v.b64)); },
+      ended(v) {
+        ended = true; st && st.close(); live(false);
+        if (term) term.blur();
+        say(v.none ? "The terminal isn't running." : "The terminal ended.", ["new", "Start a new one"]);
+      },
+      error() { if (!ended) say(S.online === false ? "Can't reach your laptop. Trying again…" : "Reconnecting…"); },
+    });
+  }
+
+  async function open() {
+    say("Starting your terminal…");
+    try {
+      await api("/api/shell/open", { cols: term.cols, rows: term.rows });
+      connect();
+    } catch (e) { say(e.message, ["new", "Try again"]); }
+  }
+
+  const failed = () => { $("#term").innerHTML = `<div class="center"><span>Couldn't load the terminal.</span></div>`; };
+  loadXterm().then(() => {
+    if (!alive) return;
+    term = new window.Terminal({ fontSize: 12, fontFamily: getComputedStyle(document.body).getPropertyValue("--mono"),
+      scrollback: 5000, cursorBlink: true, macOptionIsMeta: true, theme: TERM_THEME });
+    fit = new window.FitAddon.FitAddon();
+    term.loadAddon(fit);
+    term.open($("#term"));
+    fit.fit();
+    term.onData(d => { if (!quiet) send(withCtrl(d)); });
+    let rt;
+    term.onResize(() => { clearTimeout(rt); rt = setTimeout(sendSize, 150); });
+    if (term.textarea) {
+      term.textarea.setAttribute("autocapitalize", "off");
+      term.textarea.setAttribute("autocorrect", "off");
+      term.textarea.setAttribute("spellcheck", "false");
+      term.textarea.addEventListener("focus", () => setTyping(true));
+      term.textarea.addEventListener("blur", () => setTyping(false));
+    }
+    ro = new ResizeObserver(() => { try { fit.fit(); } catch { /* not laid out yet */ } });
+    ro.observe($("#term"));
+    open();
+  }).catch(failed);
+
+  // the extra keys: they never take focus, so the keyboard stays up while you use them
+  const keepFocus = e => { if (e.target.closest(".keys [data-sk]")) e.preventDefault(); };
+  app.addEventListener("pointerdown", keepFocus);
+  app.addEventListener("mousedown", keepFocus);
+  app.onclick = async e => {
+    const b = e.target.closest("[data-sk]");
+    if (!b) return;
+    const k = b.dataset.sk;
+    if (k === "new") { term && term.reset(); return open(); }
+    if (!term) return;
+    if (k === "kbd") { typing ? term.blur() : term.focus(); return; }
+    if (k === "ctrl") { setCtrl(!ctrl); return; }
+    if (k === "esc") send("\x1b");
+    else if (k === "tab") send("\t");
+    else if (k === "ctrlc") { setCtrl(false); send("\x03"); }
+    else if (k === "paste") {
+      try {
+        const text = await navigator.clipboard.readText();
+        if (text) term.paste(text); else toast("Nothing to paste: the clipboard is empty.");
+      } catch { toast("Plane can't read the clipboard. Allow pasting when your phone asks."); }
+    } else send(arrow(k));
+  };
+  $("#shEnd").onclick = () => confirmSheet("End the terminal?", "Your laptop shell closes. Anything still running in it stops.", "End terminal",
+    async () => { await api("/api/shell/end", {}); });
+
+  return {
+    update() { if (!ended && S.online === false) say("Can't reach your laptop. Trying again…"); },
+    cleanup() {
+      alive = false; st && st.close(); ro && ro.disconnect(); term && term.dispose(); app.onclick = null;
+      app.removeEventListener("pointerdown", keepFocus); app.removeEventListener("mousedown", keepFocus);
+    },
+  };
+}
+
 // ---- new session
 
 function newView() {
@@ -898,6 +1064,7 @@ function route() {
   app.className = kind === "s" || kind === "starting" ? "withbottom" : "";
   if (kind === "s" && id) S.view = chatView(id, extra === "wake");
   else if (kind === "t" && id) S.view = termView(id);
+  else if (kind === "sh") S.view = shellView();
   else if (kind === "new") S.view = newView();
   else if (kind === "starting" && id) S.view = startingView(id);
   else if (kind === "h" && id) S.view = handoffView(decodeURIComponent(id));
