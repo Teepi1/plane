@@ -152,7 +152,12 @@ function stream(url, handlers) {
       if (es.readyState === EventSource.CLOSED) { clearTimeout(timer); timer = setTimeout(open, retry); retry = Math.min(retry * 2, 15000); }
     };
   };
-  const wake = () => { if (!document.hidden && es && es.readyState === EventSource.CLOSED) { clearTimeout(timer); open(); } };
+  // Leaving the app closes the connection at once: iOS can keep a backgrounded app's
+  // connection open, and the laptop would think you're still looking (no notifications).
+  const wake = () => {
+    if (document.hidden) { clearTimeout(timer); es && es.close(); return; }
+    if (es && es.readyState === EventSource.CLOSED) { clearTimeout(timer); open(); }
+  };
   document.addEventListener("visibilitychange", wake);
   open();
   return {
