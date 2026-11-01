@@ -1,6 +1,6 @@
 // Plane's service worker: shows push notifications, and keeps the app's own files so it
 // still opens (and says so) when the laptop can't be reached.
-const CACHE = "plane-v1";
+const CACHE = "plane-v2";
 const SHELL = ["./", "index.html", "app.css", "app.js", "manifest.webmanifest", "icons/icon-192.png", "icons/apple-touch-icon.png"];
 
 self.addEventListener("install", e => {

@@ -187,6 +187,10 @@ whether to trust a folder), the options turn into buttons. **Terminal** shows th
 needs you or it's your turn, unless Plane is the active window on the computer or the app
 is open on the phone.
 
+**Add** sends photos and files with a message. They're saved on the computer in
+`~/.local/share/plane/uploads/` (kept 30 days), and the message gives Claude their paths.
+iPhone photos are turned into JPEG on the phone, since Claude can't read HEIC.
+
 It needs [Tailscale](https://tailscale.com) on both, with **HTTPS Certificates** turned on
 (admin console › DNS), plus `python-pyte` and `python-cryptography`. Then:
 

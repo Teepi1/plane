@@ -47,6 +47,52 @@ function ago(ms) {
 
 const cap = s => s ? s[0].toUpperCase() + s.slice(1) : s;
 
+function size(n) {
+  if (!n && n !== 0) return "";
+  return n < 1e3 ? `${n} B` : n < 1e6 ? `${Math.round(n / 1e3)} KB` : `${(n / 1e6).toFixed(1)} MB`;
+}
+
+// Photos: iPhone HEIC becomes JPEG (Claude can't read HEIC), and big photos shrink to 2400 px
+// on the long side so they upload fast. Everything else goes up as it is.
+async function prepareFile(file) {
+  const heic = /image\/hei[cf]/i.test(file.type) || /\.hei[cf]$/i.test(file.name || "");
+  if (!heic && !/^image\/(jpeg|png|webp)$/i.test(file.type)) return file;
+  const url = URL.createObjectURL(file);
+  try {
+    const img = await new Promise((ok, bad) => { const im = new Image(); im.onload = () => ok(im); im.onerror = bad; im.src = url; });
+    const scale = Math.min(1, 2400 / Math.max(img.naturalWidth, img.naturalHeight));
+    if (scale === 1 && !heic) return file;
+    const c = document.createElement("canvas");
+    c.width = Math.round(img.naturalWidth * scale); c.height = Math.round(img.naturalHeight * scale);
+    c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+    const png = file.type === "image/png";
+    const blob = await new Promise(ok => c.toBlob(ok, png ? "image/png" : "image/jpeg", 0.88));
+    if (!blob) return file;
+    const base = (file.name || "photo").replace(/\.[^.]+$/, "");
+    return new File([blob], `${base}.${png ? "png" : "jpg"}`, { type: blob.type });
+  } catch { return file; }
+  finally { URL.revokeObjectURL(url); }
+}
+
+// "Attached file: /path" lines in your messages show as a preview or a file chip
+function youBody(text) {
+  const files = [], rest = [];
+  for (const l of String(text).split("\n")) {
+    const m = /^Attached file: (\/.+)$/.exec(l.trim());
+    m ? files.push(m[1]) : rest.push(l);
+  }
+  const words = rest.join("\n").trim();
+  return esc(words) + (files.length ? `<span class="files">${files.map(fileChip).join("")}</span>` : "");
+}
+
+function fileChip(p) {
+  const name = p.split("/").pop().replace(/^\d{6}-[0-9a-f]{4}-/, "");
+  const dir = S.snap && S.snap.uploadsDir;
+  const url = dir && p.startsWith(dir + "/") ? "/api/file/" + p.slice(dir.length + 1).split("/").map(encodeURIComponent).join("/") : "";
+  if (url && /\.(jpe?g|png|gif|webp)$/i.test(p)) return `<a class="fchip img" href="${url}" target="_blank" rel="noopener"><img src="${url}" alt="${esc(name)}" loading="lazy"></a>`;
+  return `<span class="fchip">File · ${esc(name)}</span>`;
+}
+
 // A small, safe markdown: escape first, then code, emphasis, links, lists, headings.
 function md(src) {
   const blocks = [];
@@ -344,7 +390,7 @@ async function choose(card, url, i, sig) {
 // ---- one session: chat
 
 function itemHtml(it, idx, open) {
-  if (it.k === "you") return `<div class="msg you"><span class="who">You${it.ts ? " · " + clock(it.ts) : ""}</span><div class="body">${esc(it.text)}</div></div>`;
+  if (it.k === "you") return `<div class="msg you"><span class="who">You${it.ts ? " · " + clock(it.ts) : ""}</span><div class="body">${youBody(it.text)}</div></div>`;
   if (it.k === "claude") return `<div class="msg"><span class="who">Claude</span><div class="md">${md(it.text)}</div></div>`;
   if (it.k === "note") return `<div class="note">${esc(it.text)}</div>`;
   if (it.k === "plan") {
@@ -362,7 +408,7 @@ function itemHtml(it, idx, open) {
 }
 
 function chatView(id, wake) {
-  let items = [], base = 0, pending = [], prompt = null, info = "", planOpen = false;
+  let items = [], base = 0, pending = [], prompt = null, info = "", planOpen = false, atts = [];
   const open = new Set();
   const openedAt = Date.now();
   const late = setTimeout(() => header(), 4500);
@@ -393,7 +439,7 @@ function chatView(id, wake) {
     pending = pending.filter(p => !seen.has(p.text.trim()) && Date.now() - p.at < 60000);
     chat.innerHTML = `<div class="msgs">${items.length ? "" : `<div class="note">Nothing said yet.</div>`}
       ${items.map((it, i) => itemHtml(it, i, open)).join("")}
-      ${pending.map(p => `<div class="msg you pending"><span class="who">You · ${p.failed ? "not sent" : "sending…"}</span><div class="body">${esc(p.text)}</div></div>`).join("")}</div>`;
+      ${pending.map(p => `<div class="msg you pending"><span class="who">You · ${p.failed ? "not sent" : "sending…"}</span><div class="body">${youBody(p.text)}</div></div>`).join("")}</div>`;
     if (nearBottom) chat.scrollTop = chat.scrollHeight;
   }
 
@@ -419,18 +465,60 @@ function chatView(id, wake) {
       if (sb) sb.innerHTML = subbar(s);
       return;
     }
-    bottom.innerHTML = `<div class="composer">${info ? `<span class="inline-err">${esc(info)}</span>` : ""}
-      <div class="inrow"><textarea class="field" id="draft" rows="1" placeholder="Message" aria-label="Message">${esc(draft)}</textarea>
+    bottom.innerHTML = `<div class="composer" id="composer">${info ? `<span class="inline-err">${esc(info)}</span>` : ""}
+      <div class="atts" id="atts">${attsHtml()}</div>
+      <div class="inrow three"><button class="add" id="addBtn" aria-label="Add a photo or file">Add</button>
+      <textarea class="field" id="draft" rows="1" placeholder="Message" aria-label="Message">${esc(draft)}</textarea>
       <button class="send" id="sendBtn">Send</button></div>
+      <input type="file" id="fileIn" multiple hidden>
       <div class="subbar" id="subbar">${subbar(s)}</div></div>`;
-    grow();
+    grow(); renderAtts();
   }
 
   function subbar(s) {
     const working = s && s.state === "working" && !s.stopped;
     const parked = (s && s.stopped) || !s;
     return `<button data-act="terminal">Terminal</button>${working ? `<button class="stop" data-act="stop">Stop</button>` : ""}
-      ${parked ? `<span>Sending a message continues it on the laptop.</span>` : ""}`;
+      ${parked ? `<span>Sending a message continues it on the laptop.</span>` : ""}
+      <button class="kbd" data-kbd>Hide keyboard</button>`;
+  }
+
+  // -- photos and files: uploaded to the laptop as soon as they're picked, sent as paths
+  function attsHtml() {
+    return atts.map(a => `<div class="att ${a.status}">
+      <span class="thumb">${a.thumb ? `<img src="${a.thumb}" alt="">` : "File"}</span>
+      <span class="an"><span>${esc(a.name)}</span><small>${a.status === "uploading" ? "Uploading…" : a.status === "error" ? esc(a.error) : esc(size(a.size))}</small></span>
+      <button class="rm" data-rm="${a.id}" aria-label="Remove ${esc(a.name)}">×</button></div>`).join("");
+  }
+
+  function renderAtts() {
+    const box = $("#atts"), b = $("#sendBtn");
+    if (box) { box.innerHTML = attsHtml(); box.hidden = !atts.length; }
+    const busy = atts.some(a => a.status === "uploading");
+    if (b) { b.disabled = busy; b.textContent = busy ? "Uploading…" : "Send"; }
+  }
+
+  async function addFiles(files) {
+    for (const file of files) {
+      const a = { id: Math.random().toString(36).slice(2), name: file.name || "photo", status: "uploading", size: file.size };
+      atts.push(a);
+      renderAtts();
+      try {
+        const f = await prepareFile(file);
+        a.name = f.name; a.size = f.size;
+        if (/^image\//.test(f.type)) a.thumb = URL.createObjectURL(f);
+        renderAtts();
+        const r = await fetch(`/api/upload?name=${encodeURIComponent(f.name)}`, {
+          method: "POST", headers: { "X-Plane": "1", "Content-Type": f.type || "application/octet-stream" }, body: f });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j.error || `Upload failed (${r.status})`);
+        a.path = j.path; a.status = "done";
+      } catch (e) {
+        a.status = "error";
+        a.error = /fetch|network|load/i.test(e.message) ? "Upload failed: can't reach your laptop" : e.message;
+      }
+      renderAtts();
+    }
   }
 
   function grow() {
@@ -442,16 +530,25 @@ function chatView(id, wake) {
 
   async function send() {
     const d = $("#draft");
-    const text = (d ? d.value : "").trim();
-    if (!text) { d && d.focus(); return; }
+    const words = (d ? d.value : "").trim();
+    if (atts.some(a => a.status === "uploading")) return;
+    const sent = atts.filter(a => a.status === "done");
+    if (!words && !sent.length) { d && d.focus(); return; }
+    const text = [words, sent.map(a => `Attached file: ${a.path}`).join("\n")].filter(Boolean).join("\n\n");
     const p = { text, at: Date.now() };
     pending.push(p);
     draft = ""; store(`plane:draft:${id}`, "");
     d.value = ""; grow();
+    const kept = atts;
+    atts = atts.filter(a => a.status === "error");
+    renderAtts();
     renderChat();
     chat.scrollTop = chat.scrollHeight;
     try { await api(`/api/session/${id}/send`, { text }); info = ""; }
-    catch (e) { p.failed = true; info = e.message; draft = text; store(`plane:draft:${id}`, text); renderChat(); d.value = text; renderBottom(); }
+    catch (e) {
+      p.failed = true; info = e.message; draft = words; store(`plane:draft:${id}`, words); atts = kept;
+      renderChat(); d.value = words; renderBottom();
+    }
   }
 
   const st = stream(`/api/session/${id}/stream${wake ? "?wake=1" : ""}`, {
@@ -471,8 +568,27 @@ function chatView(id, wake) {
 
   app.addEventListener("input", onInput);
   function onInput(e) { if (e.target.id === "draft") { draft = e.target.value; store(`plane:draft:${id}`, draft); grow(); } }
+  // the keyboard: "Hide keyboard" while typing; tapping the conversation hides it too; Send keeps it up
+  const onFocus = e => { if (e.target.id === "draft") { const c = $("#composer"); c && c.classList.toggle("typing", e.type === "focusin"); } };
+  const onPress = e => {
+    if (e.target.closest("[data-kbd]")) { e.preventDefault(); $("#draft") && $("#draft").blur(); }
+    else if (e.target.closest("#sendBtn") && document.activeElement && document.activeElement.id === "draft") e.preventDefault();
+  };
+  const onPick = e => { if (e.target.id === "fileIn" && e.target.files.length) { addFiles([...e.target.files]); e.target.value = ""; } };
+  app.addEventListener("focusin", onFocus);
+  app.addEventListener("focusout", onFocus);
+  app.addEventListener("pointerdown", onPress);
+  app.addEventListener("change", onPick);
+  chat.addEventListener("click", () => { const d = $("#draft"); if (d && document.activeElement === d) d.blur(); });
   app.onclick = async e => {
     if (e.target.closest("#sendBtn")) return send();
+    if (e.target.closest("#addBtn")) { $("#fileIn").click(); return; }
+    const rm = e.target.closest("[data-rm]");
+    if (rm) {
+      const a = atts.find(x => x.id === rm.dataset.rm);
+      if (a && a.thumb) URL.revokeObjectURL(a.thumb);
+      atts = atts.filter(x => x !== a); renderAtts(); return;
+    }
     const tg = e.target.closest("[data-toggle]");
     if (tg) { const i = +tg.dataset.toggle; open.has(i) ? open.delete(i) : open.add(i); renderChat(); return; }
     const ch = e.target.closest("[data-choose]");
@@ -491,7 +607,12 @@ function chatView(id, wake) {
   header(); renderBottom();
   return {
     update() { header(); if (!prompt) renderBottom(); },
-    cleanup() { st.close(); clearTimeout(late); app.removeEventListener("input", onInput); app.onclick = null; },
+    cleanup() {
+      st.close(); clearTimeout(late); app.onclick = null;
+      app.removeEventListener("input", onInput); app.removeEventListener("focusin", onFocus);
+      app.removeEventListener("focusout", onFocus); app.removeEventListener("pointerdown", onPress);
+      app.removeEventListener("change", onPick);
+    },
   };
 }
 
@@ -583,6 +704,7 @@ function termView(id) {
     if (e.target.closest("#tsend")) { const t = $("#tin"); if (t.value) { key("text", { text: t.value, enter: true }); t.value = ""; } else key("enter"); }
   };
   $("#tin").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); $("#tsend").click(); } });
+  $("#term").addEventListener("pointerdown", () => $("#tin").blur());  // tap the screen to put the keyboard away
   return { cleanup() { st && st.close(); ro && ro.disconnect(); term && term.dispose(); app.onclick = null; } };
 }
 
