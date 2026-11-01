@@ -864,8 +864,10 @@ class Hub:
                 while True:
                     now = time.time()
                     hub.mark_phone()
-                    if now - purged > 3600 and hasattr(P, "purge_discarded"):
-                        P.purge_discarded()
+                    if now - purged > 3600:
+                        if hasattr(P, "purge_discarded"):
+                            P.purge_discarded()
+                        purge_uploads()
                         purged = now
                     try:
                         s = cheap_signature()
@@ -948,6 +950,7 @@ class Hub:
             usage, error = dict(st.usage or {}), st.error
         launched = self.launched_handoffs()
         out = {"sessions": [], "handoffs": [], "lost": [], "error": error, "updatedAt": time.time(),
+               "uploadsDir": str(uploads_dir()),
                "push": {"ok": self.push.ok, "why": self.push.why}}
         for s in sessions:
             cwd = s.get("cwd", "")
@@ -1199,6 +1202,32 @@ def op_close_lost(hub, session_id):
     hub.store.poke()
 
 
+UPLOAD_MAX = 60_000_000
+UPLOAD_KEEP_DAYS = 30
+FILE_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif",
+              ".webp": "image/webp", ".pdf": "application/pdf", ".txt": "text/plain; charset=utf-8"}
+
+
+def uploads_dir():
+    return P.DATA / "uploads"
+
+
+def purge_uploads():
+    """Uploads are for the conversation they were sent in: drop them after a month."""
+    cutoff = time.time() - UPLOAD_KEEP_DAYS * 86400
+    for day in uploads_dir().glob("*"):
+        for f in day.glob("*"):
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+            except OSError:
+                pass
+        try:
+            day.rmdir()  # only when empty
+        except OSError:
+            pass
+
+
 def folders(q):
     if not q:
         hidden = str(P.CLAUDE_DIR) + "/"  # job scratch folders aren't projects
@@ -1277,6 +1306,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(self.hub.snap or self.hub.snapshot())
             if path == "/api/events":
                 return self.events()
+            if path.startswith("/api/file/"):
+                return self.uploaded_file(path[len("/api/file/"):])
             if path == "/api/folders":
                 return self.send_json({"folders": folders(q.get("q", ""))})
             if path == "/api/push/key":
@@ -1435,6 +1466,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.fail(403, "Bad origin.")
         path = unquote(urlparse(self.path).path)
         hub = self.hub
+        if path == "/api/upload":
+            return self.upload()
         try:
             b = self.body()
             m = re.fullmatch(r"/api/session/([\w-]+)/(\w+)", path)
@@ -1481,6 +1514,49 @@ class Handler(BaseHTTPRequestHandler):
             return self.fail(400, f"Bad request: {e}")
         except Exception as e:
             return self.fail(500, str(e))
+
+    def upload(self):
+        """A photo or file from the phone, saved under ~/.local/share/plane/uploads/<day>/.
+        The phone then sends its path in the message, for Claude to read."""
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        if n <= 0:
+            return self.fail(400, "That file is empty.")
+        if n > UPLOAD_MAX:
+            return self.fail(413, f"That file is too big ({UPLOAD_MAX // 1_000_000} MB at most).")
+        name = parse_qs(urlparse(self.path).query).get("name", ["file"])[-1]
+        safe = re.sub(r"[^\w.-]+", "_", Path(name).name).strip("._")[:80] or "file"
+        day = uploads_dir() / time.strftime("%Y-%m-%d")
+        day.mkdir(parents=True, exist_ok=True)
+        f = day / f"{time.strftime('%H%M%S')}-{secrets.token_hex(2)}-{safe}"
+        left = n
+        try:
+            with open(f, "wb") as out:
+                while left > 0:
+                    chunk = self.rfile.read(min(left, 1 << 20))
+                    if not chunk:
+                        raise OSError("the upload stopped part way")
+                    out.write(chunk)
+                    left -= len(chunk)
+        except OSError as e:
+            f.unlink(missing_ok=True)
+            return self.fail(400, f"Upload failed: {e}")
+        rel = f.relative_to(uploads_dir()).as_posix()
+        return self.send_json({"path": str(f), "name": safe, "size": n, "url": f"/api/file/{rel}"})
+
+    def uploaded_file(self, rel):
+        f = (uploads_dir() / rel).resolve()
+        if uploads_dir().resolve() not in f.parents or not f.is_file():
+            return self.fail(404, "Not found")
+        data = f.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", FILE_TYPES.get(f.suffix.lower(), "application/octet-stream"))
+        self.send_header("Cache-Control", "private, max-age=86400")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def session_action(self, job, action, b):
         hub = self.hub
