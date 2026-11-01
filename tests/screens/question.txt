@@ -1,0 +1,40 @@
+
+ ▐▛███▛█   Claude Code v2.1.316
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   ~/code/demo/ws · /rc
+
+
+❯ Use the Bash tool to run exactly this command: curl -sI https://example.com | head -1
+  Then reply with just the word hello.
+
+  Ran 1 shell command
+
+● hello
+
+✻ Cooked for 9s · done 11:02 PM
+
+❯ Use the AskUserQuestion tool to ask me one question: tea or coffee? Offer those two options.
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Drink
+
+Tea or coffee?
+
+❯ 1. Tea
+     Go with tea.
+  2. Coffee
+     Go with coffee.
+  3. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────── plane-web spike ─

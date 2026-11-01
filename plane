@@ -9,6 +9,7 @@
   plane statusline                Claude Code statusLine command; records usage
   plane track start|prompt|end    Claude Code hook: keep the ledger of running sessions
   plane recover                   at login: notify about interrupted sessions + handoffs
+  plane web [--port 8377]         the phone app's server (see planeweb.py)
 """
 import argparse
 import curses
@@ -402,6 +403,13 @@ def interrupted_sessions():
 
 def lost_label(r):
     return r.get("name") or r.get("firstPrompt") or Path(r.get("cwd", "")).name or r["sessionId"][:8]
+
+
+def cmd_web(args):
+    """The phone app: planeweb.py, next to this file, reusing this module."""
+    sys.path.insert(0, str(Path(SELF).parent))
+    import planeweb
+    planeweb.serve(sys.modules[__name__], args.port)
 
 
 def cmd_recover(args):
@@ -1591,6 +1599,9 @@ def main():
     tr = sub.add_parser("track", help="Claude Code hook: record running sessions")
     tr.add_argument("event", choices=["start", "prompt", "end"])
     tr.set_defaults(fn=cmd_track)
+    wb = sub.add_parser("web", help="serve the phone app on 127.0.0.1 (put it on Tailscale with tailscale serve)")
+    wb.add_argument("--port", type=int, default=8377)
+    wb.set_defaults(fn=cmd_web)
     rc = sub.add_parser("recover", help="notify about interrupted sessions and waiting handoffs")
     rc.add_argument("--delay", type=float, default=8)
     rc.set_defaults(fn=cmd_recover)
