@@ -8,7 +8,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
-sys.modules.setdefault("pyte", types.ModuleType("pyte"))  # parse_prompt doesn't need it
+sys.modules.setdefault("pyte", None)  # parse_prompt doesn't need it
 import planeweb  # noqa: E402
 
 
@@ -51,6 +51,37 @@ def test_trust():
 
 def test_idle():
     assert planeweb.parse_prompt(screen("idle")) is None
+
+
+def test_question_narrow_with_name_footer():
+    # a phone-width attach: the hint wraps onto two lines, and the session's name rule sits
+    # at the very bottom with empty rows above it
+    p = planeweb.parse_prompt(screen("question-narrow"))
+    assert p, "no menu found"
+    assert labels(p) == ["Summer", "Winter", "Type something.", "Chat about this"], labels(p)
+    assert p["selected"] == 0
+    texts = [c["s"] for c in p["context"]]
+    assert texts == ["Season · Pet · Submit", "Pick a season."], texts
+
+
+def test_question_review_has_no_hint():
+    p = planeweb.parse_prompt(screen("question-review"))
+    assert p, "no menu found"
+    assert labels(p) == ["Submit answers", "Cancel"], labels(p)
+    texts = [c["s"] for c in p["context"]]
+    assert texts[0] == "Colour ✓ · Fruit ✓ · Submit" and texts[-1] == "Ready to submit your answers?", texts
+    assert "→ Pear" in texts
+
+
+def test_idle_with_name_footer():
+    assert planeweb.parse_prompt(screen("idle-footer")) is None
+
+
+def test_typed_numbered_draft_is_not_a_menu():
+    lines = screen("idle-footer")
+    i = next(k for k, ln in enumerate(lines) if ln.startswith("❯"))
+    lines[i] = "❯ 1. buy milk"
+    assert planeweb.parse_prompt(lines) is None
 
 
 def test_sig_changes_with_options():

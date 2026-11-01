@@ -223,6 +223,15 @@ That installs `plane-web.service` (a user service on `127.0.0.1:8377`) and runs
 tailnet only. On the phone, open that address in Safari, tap Share › Add to Home Screen,
 open Plane from there and tap **Turn on** for notifications (iOS 16.4 or later).
 
+To check them, tap **Send test** under the session list, then leave the app. The phone
+reports back each push it gets, so the row then says whether the test arrived and was
+shown, arrived but couldn't be shown, or never reached the phone. In that last case,
+**Set up again** signs the phone up fresh. Each device keeps one sign-up, so an icon you
+removed from the Home Screen stops collecting notifications. The service log
+(`journalctl --user -u plane-web`) lists each push, and whether the phone showed it.
+
+Code blocks in the chat have a **Copy** button.
+
 Who gets in: `tailscale serve` tells the app which Tailscale login is asking, and only
 the login that owns this computer is let in. `--web` also writes
 `~/.config/plane/web.json` listing your phones and tablets by tailnet name, and only those

@@ -81,6 +81,15 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
 .tip .small { min-height: 44px; padding: 0 16px; border-radius: 10px; border: 0; background: var(--accent); color: var(--on-accent); font-weight: 600; cursor: pointer; }
 .tip .x { grid-column: 1 / 3; justify-self: start; background: none; border: 0; color: var(--muted); font-size: 14px; padding: 0; min-height: 36px; cursor: pointer; }
 .tip .err { grid-column: 1 / 3; color: var(--red); font-size: 13.5px; }
+/* notifications row, under the session list */
+.notif { margin: 22px 16px 0; padding: 12px 14px; border-radius: 14px; border: 1px solid var(--line); display: grid;
+  grid-template-columns: 1fr auto; gap: 8px 12px; align-items: center; font-size: 14px; line-height: 1.4; color: var(--muted); }
+.notif .small { min-height: 44px; padding: 0 16px; border-radius: 10px; border: 1px solid var(--line); background: var(--surface);
+  color: var(--fg); font-weight: 600; cursor: pointer; white-space: nowrap; }
+.notif .small[disabled] { opacity: .6; }
+.notif .x { grid-column: 1 / 3; justify-self: start; min-height: 44px; padding: 0 16px; border-radius: 10px; border: 0;
+  background: var(--accent); color: var(--on-accent); font-weight: 600; cursor: pointer; }
+.notif .err { grid-column: 1 / 3; color: var(--red); font-size: 13.5px; }
 .offline { margin: 12px 16px 0; padding: 14px; border-radius: 14px; border: 1px solid color-mix(in srgb, var(--red) 50%, var(--line));
   display: grid; gap: 10px; font-size: 14.5px; line-height: 1.45; }
 .offline b { font-size: 16px; }
@@ -108,6 +117,16 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
 .md code { font-family: var(--mono); font-size: 13.5px; background: var(--surface); padding: 1px 5px; border-radius: 5px; }
 .md pre { background: var(--term); color: var(--term-fg); padding: 10px 12px; border-radius: 10px; overflow-x: auto; }
 .md pre code { background: none; padding: 0; font-size: 12.5px; line-height: 1.5; }
+/* a code block with its Copy button beside the code (the code scrolls, the button stays put);
+   the button's tap area is 44px tall, its pill smaller */
+.md .codeblock { display: flex; align-items: flex-start; margin: 0 0 8px; background: var(--term); border-radius: 10px; }
+.md .codeblock pre { flex: 1; min-width: 0; margin: 0; padding-right: 4px; background: none; }
+.md .copy { flex: none; min-width: 68px; min-height: 44px; padding: 0 8px 0 4px; border: 0; background: none;
+  display: flex; align-items: center; justify-content: center; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.md .copy span { font: 600 12.5px/1 var(--ui); padding: 7px 10px; border-radius: 8px;
+  background: color-mix(in srgb, var(--term-fg) 14%, var(--term)); color: var(--term-fg); }
+.md .copy:active span { background: color-mix(in srgb, var(--term-fg) 26%, var(--term)); }
+.md .copy.done span { color: var(--term); background: var(--cyan); }
 .md a { color: var(--accent); }
 .tools { border: 0; background: none; text-align: left; padding: 4px 0; color: var(--muted); font-size: 14.5px; cursor: pointer; min-height: 40px; }
 .toollist { font-family: var(--mono); font-size: 12px; color: var(--muted); display: grid; gap: 6px; padding: 2px 0 4px 12px;

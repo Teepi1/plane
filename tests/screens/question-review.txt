@@ -1,0 +1,60 @@
+
+ ▐▛███▛█   Claude Code v2.1.316
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   ~/…/9e38a013/tmp/spike/ws
+
+
+❯ Use the AskUserQuestion tool right away
+  to ask me two questions in one call: 1)
+  favourite colour (options Red, Blue) 2)
+  favourite fruit (options Apple, Pear). Do
+  nothing else.
+
+────────────────────────────────────────────
+←  ☒ Colour  ☒ Fruit  ✔ Submit  →
+
+Review your answers
+
+ ● What is your favourite colour?
+   → Red
+ ● What is your favourite fruit?
+   → Pear
+
+Ready to submit your answers?
+
+❯ 1. Submit answers
+  2. Cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+──────────────────────── plane-prompt-test ─
