@@ -28,6 +28,7 @@ import sys
 import termios
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1122,28 +1123,36 @@ class Hub:
 
         class WebStore(P.Store):
             def _loop(self):
-                purged, last, sig = 0.0, 0.0, None
+                purged, last, sig, failed = 0.0, 0.0, None, None
                 while True:
-                    now = time.time()
-                    hub.mark_phone()
-                    if now - purged > 3600:
-                        if hasattr(P, "purge_discarded"):
-                            P.purge_discarded()
-                        purge_uploads()
-                        purged = now
+                    # the phone's lists and pushes all come from this thread, and the server
+                    # keeps answering without it, so no one failed pass may end it
                     try:
-                        s = cheap_signature()
-                    except Exception:
-                        s = None
-                    watching = bool(hub.event_queues or hub.viewers)
-                    if s != sig or (watching and now - last >= 2.5) or now - last >= 60:
-                        sig = s
+                        now = time.time()
+                        hub.mark_phone()
+                        if now - purged > 3600:
+                            if hasattr(P, "purge_discarded"):
+                                P.purge_discarded()
+                            purge_uploads()
+                            purged = now
                         try:
-                            self._refresh()
-                        except Exception as exc:
-                            self.error = f"refresh: {exc}"
-                        last = time.time()
-                        hub.changed()
+                            s = cheap_signature()
+                        except Exception:
+                            s = None
+                        watching = bool(hub.event_queues or hub.viewers)
+                        if s != sig or (watching and now - last >= 2.5) or now - last >= 60:
+                            sig = s
+                            try:
+                                self._refresh()
+                            except Exception as exc:
+                                self.error = f"refresh: {exc}"
+                            last = time.time()
+                            hub.changed()
+                        failed = None
+                    except Exception as exc:
+                        if repr(exc) != failed:  # once per failure, not once a second
+                            failed = repr(exc)
+                            log(f"poller: {traceback.format_exc()}")
                     if self._wake.wait(1.0):
                         sig = None
                     self._wake.clear()
@@ -1234,6 +1243,8 @@ class Hub:
                "terminal": {"allowed": terminal_allowed(), "open": bool(self.shell and not self.shell.dead)},
                "push": {"ok": self.push.ok, "why": self.push.why}}
         for s in sessions:
+            if not s.get("id"):  # `claude agents` can list one with no id; the phone couldn't open it
+                continue
             cwd = s.get("cwd", "")
             job = job_state(s["id"]) if s.get("bg") else {}
             out["sessions"].append({
