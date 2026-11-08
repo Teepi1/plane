@@ -36,10 +36,16 @@ fn claude_bin() -> String {
     if local.exists() { local.to_string_lossy().into_owned() } else { "claude".into() }
 }
 
-/// Your shell first (to compare plain terminal behaviour), then every live background session.
-fn choices() -> Vec<Choice> {
+/// Your shell, to compare plain terminal behaviour with kitty.
+fn shell_choice() -> Choice {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let mut out = vec![Choice { label: "Your shell (to compare)".into(), argv: vec![shell], cwd: Some(home().to_string_lossy().into_owned()) }];
+    Choice { label: "Your shell (to compare)".into(), argv: vec![shell], cwd: Some(home().to_string_lossy().into_owned()) }
+}
+
+/// Your shell first, then every live background session. Slow (`claude agents` takes about
+/// half a second), so it runs off the main thread.
+fn choices() -> Vec<Choice> {
+    let mut out = vec![shell_choice()];
     let Ok(res) = std::process::Command::new(claude_bin()).args(["agents", "--json", "--all"]).output() else { return out };
     let Ok(serde_json::Value::Array(list)) = serde_json::from_slice::<serde_json::Value>(&res.stdout) else { return out };
     let mut sessions: Vec<Choice> = list
@@ -281,7 +287,7 @@ fn build(app: &gtk::Application) {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     bar.add_css_class("plane-bar");
-    let list = Rc::new(RefCell::new(choices()));
+    let list = Rc::new(RefCell::new(vec![shell_choice()]));
     let labels: Vec<String> = list.borrow().iter().map(|c| c.label.clone()).collect();
     let model = gtk::StringList::new(&labels.iter().map(String::as_str).collect::<Vec<_>>());
     let picker = gtk::DropDown::new(Some(model.clone()), None::<gtk::Expression>);
@@ -310,15 +316,11 @@ fn build(app: &gtk::Application) {
 
     let ui = Rc::new(Ui { holder, status, term: RefCell::new(None), current: RefCell::new(None), scale: Cell::new(1.0) });
 
-    // `plane-gui <job id>` opens that session straight away
-    let wanted = std::env::args().nth(1);
-    let start = wanted
-        .and_then(|id| list.borrow().iter().position(|c| c.argv.last() == Some(&id)))
-        .unwrap_or(0);
-    picker.set_selected(start as u32);
-    show(&ui, &list.borrow()[start]);
+    // open on your shell at once; the session list fills in when `claude agents` answers
+    picker.set_selected(0);
+    show(&ui, &list.borrow()[0]);
 
-    // a refresh swaps the list under the picker; that must not reopen the session being shown
+    // a reload swaps the list under the picker; that must not reopen the session being shown
     let refreshing = Rc::new(Cell::new(false));
     let (u, l, busy) = (ui.clone(), list.clone(), refreshing.clone());
     picker.connect_selected_notify(move |p| {
@@ -331,21 +333,36 @@ fn build(app: &gtk::Application) {
             show(&u, &choice);
         }
     });
-    let (u, l, m, p, busy) = (ui.clone(), list.clone(), model, picker.clone(), refreshing);
-    refresh.connect_clicked(move |_| {
-        let current = u.current.borrow().as_ref().map(|c| c.argv.clone());
-        let fresh = choices();
-        let keep = current.and_then(|argv| fresh.iter().position(|c| c.argv == argv));
-        *l.borrow_mut() = fresh;
-        let labels: Vec<String> = l.borrow().iter().map(|c| c.label.clone()).collect();
-        // swap the list without reopening the session being shown
-        busy.set(true);
-        let n = m.n_items();
-        m.splice(0, n, &labels.iter().map(String::as_str).collect::<Vec<_>>());
-        p.set_selected(keep.map(|i| i as u32).unwrap_or(gtk::INVALID_LIST_POSITION));
-        busy.set(false);
-        u.status.set_text(if keep.is_some() { "List refreshed." } else { "List refreshed. The session shown here has ended or been paused." });
-    });
+    let reload: Rc<dyn Fn(Option<String>, bool)> = {
+        let (u, l, m, p, busy) = (ui.clone(), list.clone(), model, picker.clone(), refreshing);
+        Rc::new(move |open_id: Option<String>, say: bool| {
+            let (u, l, m, p, busy) = (u.clone(), l.clone(), m.clone(), p.clone(), busy.clone());
+            glib::spawn_future_local(async move {
+                let fresh = gio::spawn_blocking(choices).await.unwrap_or_else(|_| vec![shell_choice()]);
+                let current = u.current.borrow().as_ref().map(|c| c.argv.clone());
+                let keep = current.and_then(|argv| fresh.iter().position(|c| c.argv == argv));
+                let target = open_id.as_ref().and_then(|id| fresh.iter().position(|c| c.argv.last() == Some(id)));
+                let labels: Vec<String> = fresh.iter().map(|c| c.label.clone()).collect();
+                *l.borrow_mut() = fresh;
+                busy.set(true);
+                let n = m.n_items();
+                m.splice(0, n, &labels.iter().map(String::as_str).collect::<Vec<_>>());
+                p.set_selected(keep.map(|i| i as u32).unwrap_or(gtk::INVALID_LIST_POSITION));
+                busy.set(false);
+                if let Some(i) = target {
+                    p.set_selected(i as u32); // opens it
+                } else if let Some(id) = open_id {
+                    u.status.set_text(&format!("No running session with id {id}. Pick one from the list."));
+                } else if say {
+                    u.status.set_text(if keep.is_some() { "List refreshed." } else { "List refreshed. The session shown here has ended or been paused." });
+                }
+            });
+        })
+    };
+    // `plane-gui <job id>` opens that session once the list is in
+    reload(std::env::args().nth(1), false);
+    let r = reload.clone();
+    refresh.connect_clicked(move |_| r(None, true));
 
     window.present();
 }
