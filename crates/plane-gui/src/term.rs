@@ -17,6 +17,11 @@ const PCRE2_MULTILINE: u32 = 0x0000_0400;
 /// A file path with an extension, optionally followed by :line or :line:column.
 const PATH_RE: &str = r"(?:~|\.{1,2})?/?[\w.\-]+(?:/[\w.\-]+)*\.[A-Za-z0-9]{1,8}(?::\d+(?::\d+)?)?";
 
+/// Lines per mouse-wheel notch. kitty's default is 5; this is a touch slower.
+const WHEEL_LINES: f64 = 4.0;
+/// Touchpad: pixels scrolled per pixel your fingers move.
+const TOUCHPAD_SPEED: f64 = 0.8;
+
 fn home() -> PathBuf {
     plane_core::Env::from_env().home
 }
@@ -76,8 +81,28 @@ pub fn new_terminal(theme: &HashMap<String, gdk::RGBA>, scale: Rc<Cell<f64>>, cw
     term.set_font(Some(&pango::FontDescription::from_string("monospace 11")));
     term.set_font_scale(scale.get());
     term.set_scrollback_lines(10_000);
-    // a touchpad scrolls by the distance your fingers move, not that many whole lines
+    // Scrolling is done here, not by VTE, which glides on after a touchpad flick and felt
+    // too fast. Like kitty: a wheel notch is a few lines, a touchpad follows your fingers
+    // (a little slower), and nothing keeps moving after you stop.
     term.set_scroll_unit_is_pixels(true);
+    let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+    scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let t = term.clone();
+    scroll.connect_scroll(move |c, _, dy| {
+        let Some(adj) = t.vadjustment() else { return glib::Propagation::Proceed };
+        let top = adj.upper() - adj.page_size();
+        if top <= adj.lower() {
+            // no scrollback (a full-screen program): VTE turns the wheel into arrow keys
+            return glib::Propagation::Proceed;
+        }
+        let step = match c.unit() {
+            gdk::ScrollUnit::Wheel => dy * WHEEL_LINES * t.char_height() as f64,
+            _ => dy * TOUCHPAD_SPEED,
+        };
+        adj.set_value((adj.value() + step).clamp(adj.lower(), top));
+        glib::Propagation::Stop
+    });
+    term.add_controller(scroll);
     term.set_mouse_autohide(true);
     term.set_allow_hyperlink(true);
     term.set_audible_bell(false);
