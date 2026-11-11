@@ -5,6 +5,13 @@
 //!       none). --agents reads `claude agents --json --all` output from a file instead of
 //!       running it, so the Python and Rust versions can be compared on the same input.
 //!
+//!   plane-next open
+//!       Bring the app forward, or start it.
+//!
+//!   plane-next focus left|right|up|down
+//!       Super+arrows: move between the app's sidebar and session; past its edge, or with
+//!       no app running, plain Hyprland focus.
+//!
 //!   plane-next action [--home DIR] [--now SECONDS] NAME ARGS...
 //!       One user action, for `tools/actions_check.py` (these do change files):
 //!         close JOB · pause JOB · requeue JOB
@@ -17,11 +24,12 @@ use std::process::ExitCode;
 
 use plane_core::actions::{self, ClaimError};
 use plane_core::ledger::interrupted_sessions;
-use plane_core::{pget, snapshot::snapshot, Env, Fs, Mode};
+use plane_core::{control, hypr, pget, snapshot::snapshot, Env, Fs, Mode};
 use serde_json::{json, Value};
 
 fn usage() -> ExitCode {
     eprintln!("usage: plane-next snapshot [--agents FILE] [--now SECONDS] [--home DIR]");
+    eprintln!("       plane-next open | focus left|right|up|down");
     eprintln!("       plane-next action [--home DIR] [--now SECONDS] NAME ARGS...");
     ExitCode::from(2)
 }
@@ -121,6 +129,25 @@ fn main() -> ExitCode {
             }
             None => usage(),
         },
+        "open" => {
+            if control::send("raise").is_none() {
+                let gui = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("plane-gui")));
+                let Some(gui) = gui.filter(|g| g.exists()) else {
+                    eprintln!("plane-next: plane-gui isn't built next to plane-next");
+                    return ExitCode::FAILURE;
+                };
+                let null = std::process::Stdio::null;
+                let _ = std::process::Command::new("setsid").arg("-f").arg(gui).stdin(null()).stdout(null()).stderr(null()).status();
+            }
+            ExitCode::SUCCESS
+        }
+        "focus" if matches!(positional.first().map(String::as_str), Some("left" | "right" | "up" | "down")) => {
+            let dir = positional[0].as_str();
+            if control::send(&format!("focus {dir}")).as_deref() != Some("ok") {
+                hypr::move_focus(dir);
+            }
+            ExitCode::SUCCESS
+        }
         _ => usage(),
     }
 }

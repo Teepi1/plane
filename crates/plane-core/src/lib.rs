@@ -6,6 +6,8 @@
 //! which can record writes instead of making them.
 
 pub mod actions;
+pub mod control;
+pub mod hypr;
 pub mod ledger;
 pub mod snapshot;
 pub mod state;

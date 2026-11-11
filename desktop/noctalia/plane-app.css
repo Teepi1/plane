@@ -1,0 +1,38 @@
+/* Plane's colors, rendered by Noctalia on every theme change.
+   Template: ~/.config/noctalia/templates/plane-app.css (from the plane repo, desktop/noctalia/)
+   Output:   ~/.config/plane/theme.css, which the Plane app watches and reloads.
+   plane_* are the app's own colors; term_* are the terminal palette, the same values
+   Noctalia writes for kitty. */
+@define-color plane_bg {{colors.surface.default.hex}};
+@define-color plane_bg_alt {{colors.surface_variant.default.hex}};
+@define-color plane_fg {{colors.on_surface.default.hex}};
+@define-color plane_dim {{colors.on_surface_variant.default.hex}};
+@define-color plane_outline {{colors.outline.default.hex}};
+@define-color plane_primary {{colors.primary.default.hex}};
+@define-color plane_on_primary {{colors.on_primary.default.hex}};
+@define-color plane_accent {{colors.terminal_normal_cyan.default.hex}};
+@define-color plane_ok {{colors.terminal_normal_green.default.hex}};
+@define-color plane_warn {{colors.terminal_normal_yellow.default.hex}};
+@define-color plane_bad {{colors.terminal_normal_red.default.hex}};
+@define-color term_bg {{colors.terminal_background.default.hex}};
+@define-color term_fg {{colors.terminal_foreground.default.hex}};
+@define-color term_cursor {{colors.terminal_cursor.default.hex}};
+@define-color term_cursor_text {{colors.terminal_cursor_text.default.hex}};
+@define-color term_sel_bg {{colors.terminal_selection_bg.default.hex}};
+@define-color term_sel_fg {{colors.terminal_selection_fg.default.hex}};
+@define-color term_0 {{colors.terminal_normal_black.default.hex}};
+@define-color term_1 {{colors.terminal_normal_red.default.hex}};
+@define-color term_2 {{colors.terminal_normal_green.default.hex}};
+@define-color term_3 {{colors.terminal_normal_yellow.default.hex}};
+@define-color term_4 {{colors.terminal_normal_blue.default.hex}};
+@define-color term_5 {{colors.terminal_normal_magenta.default.hex}};
+@define-color term_6 {{colors.terminal_normal_cyan.default.hex}};
+@define-color term_7 {{colors.terminal_normal_white.default.hex}};
+@define-color term_8 {{colors.terminal_bright_black.default.hex}};
+@define-color term_9 {{colors.terminal_bright_red.default.hex}};
+@define-color term_10 {{colors.terminal_bright_green.default.hex}};
+@define-color term_11 {{colors.terminal_bright_yellow.default.hex}};
+@define-color term_12 {{colors.terminal_bright_blue.default.hex}};
+@define-color term_13 {{colors.terminal_bright_magenta.default.hex}};
+@define-color term_14 {{colors.terminal_bright_cyan.default.hex}};
+@define-color term_15 {{colors.terminal_bright_white.default.hex}};
