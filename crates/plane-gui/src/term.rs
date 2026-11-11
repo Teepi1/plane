@@ -1,7 +1,6 @@
 //! The built-in terminal, as tested in step 1: kitty's look (the Noctalia palette, 0.8
 //! opacity, 25 px padding, monospace 11), kitty's copy, paste and zoom keys, Shift+Enter
-//! as a new line, and file paths that can be clicked (reported for now; opening them is
-//! step 6).
+//! as a new line, and file paths and links that open when clicked.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -43,21 +42,6 @@ pub fn child_env() -> Vec<String> {
     env
 }
 
-/// Turns `src/app.ts:12:4` into (absolute path, line) against the session's folder.
-fn resolve(text: &str, cwd: &str) -> (PathBuf, Option<u32>) {
-    let mut parts = text.splitn(3, ':');
-    let file = parts.next().unwrap_or(text);
-    let line = parts.next().and_then(|l| l.parse().ok());
-    let path = if let Some(rest) = file.strip_prefix("~/") {
-        home().join(rest)
-    } else if Path::new(file).is_absolute() {
-        PathBuf::from(file)
-    } else {
-        Path::new(cwd).join(file)
-    };
-    (path, line)
-}
-
 fn color(theme: &HashMap<String, gdk::RGBA>, key: &str) -> gdk::RGBA {
     theme.get(key).copied().unwrap_or(gdk::RGBA::WHITE)
 }
@@ -74,9 +58,9 @@ pub fn apply_colors(term: &vte::Terminal, theme: &HashMap<String, gdk::RGBA>) {
     term.set_color_highlight_foreground(Some(&color(theme, "term_sel_fg")));
 }
 
-/// A terminal for one tab. `say` reports what a clicked file path would open.
+/// A terminal for one tab. `open` gets the text of a clicked file path or hyperlink.
 /// `wheel_to_app` is set once the terminal runs `claude attach`, which takes mouse events.
-pub fn new_terminal(theme: &HashMap<String, gdk::RGBA>, scale: Rc<Cell<f64>>, cwd: String, say: Rc<dyn Fn(String)>, wheel_to_app: Rc<Cell<bool>>) -> vte::Terminal {
+pub fn new_terminal(theme: &HashMap<String, gdk::RGBA>, scale: Rc<Cell<f64>>, open: Rc<dyn Fn(String)>, wheel_to_app: Rc<Cell<bool>>) -> vte::Terminal {
     let term = vte::Terminal::new();
     term.set_hexpand(true);
     term.set_vexpand(true);
@@ -171,8 +155,8 @@ pub fn new_terminal(theme: &HashMap<String, gdk::RGBA>, scale: Rc<Cell<f64>>, cw
     });
     term.add_controller(keys);
 
-    // a click (not a drag) on a file path reports what Plane would open; the click still
-    // reaches the terminal, so selecting text and the session's own mouse use are untouched
+    // a click (not a drag) on a file path or a link opens it; the click still reaches the
+    // terminal, so selecting text and the session's own mouse use are untouched
     let click = gtk::GestureClick::new();
     click.set_button(1);
     click.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -186,18 +170,12 @@ pub fn new_terminal(theme: &HashMap<String, gdk::RGBA>, scale: Rc<Cell<f64>>, cw
             return;
         }
         if let Some(uri) = t.check_hyperlink_at(x, y) {
-            say(format!("link: {uri}"));
+            open(uri.to_string());
             return;
         }
-        let (found, _) = t.check_match_at(x, y);
-        let Some(text) = found else { return };
-        let (path, line) = resolve(&text, &cwd);
-        let at = line.map(|l| format!(" at line {l}")).unwrap_or_default();
-        say(if path.is_file() {
-            format!("opening files comes later: {}{at}", path.display())
-        } else {
-            format!("no file called {text} in this session's folder")
-        });
+        if let (Some(text), _) = t.check_match_at(x, y) {
+            open(text.to_string());
+        }
     });
     term.add_controller(click);
     term

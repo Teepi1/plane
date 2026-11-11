@@ -104,6 +104,42 @@ vte-terminal { padding: 25px; }
 textview.prompt, textview.prompt text { background: alpha(@term_bg, 0.8); color: @plane_fg; }
 textview.prompt { padding: 25px; font-family: monospace; }
 popover.menu contents { background: @plane_bg_alt; color: @plane_fg; }
+.file { background: alpha(@term_bg, 0.8); color: @plane_fg; }
+.file .bar { padding: 3px 8px 3px 14px; border-bottom: 1px solid @plane_outline; min-height: 28px; }
+.file .bar button { padding: 2px 10px; min-height: 22px; }
+.file .bar .path { color: @plane_dim; }
+.file .banner { padding: 6px 14px; background: alpha(@plane_warn, 0.14); border-bottom: 1px solid alpha(@plane_warn, 0.5); }
+.file .banner.bad { background: alpha(@plane_bad, 0.14); border-bottom-color: alpha(@plane_bad, 0.5); }
+.file .banner label.text { color: @plane_fg; font-weight: bold; }
+.file .banner button { padding: 2px 10px; min-height: 22px; }
+.file .findbar { padding: 4px 14px; border-bottom: 1px solid @plane_outline; }
+.file .findbar entry { min-width: 260px; background: @term_0; color: @plane_fg; }
+.file .side-head { padding: 4px 14px; color: @plane_dim; font-weight: bold; font-size: 0.9em; border-bottom: 1px solid @plane_outline; }
+.file .changes-head { padding: 6px 14px; border-bottom: 1px solid @plane_outline; }
+textview.editor, textview.editor text { background: transparent; font-family: monospace; font-size: 11pt; }
+textview.editor { padding: 0; }
+textview.editor gutter, textview.editor border { background: transparent; background-color: transparent; }
+.file button, .file-message button, notebook > header button.files {
+  background: @term_0; color: @plane_fg; border: 1px solid @plane_outline; box-shadow: none; background-image: none; text-shadow: none;
+}
+.file button:hover, .file-message button:hover, notebook > header button.files:hover { background: mix(@term_0, @plane_fg, 0.08); }
+.file button:checked { background: alpha(@plane_accent, 0.25); border-color: @plane_accent; }
+.file button.suggested-action { background: @plane_primary; color: @plane_on_primary; border-color: @plane_primary; font-weight: bold; }
+.file button:disabled { background: transparent; color: @plane_dim; border-color: transparent; }
+.file button.flat { background: transparent; border-color: transparent; color: @plane_accent; }
+notebook > header button.files { margin: 3px 8px; padding: 1px 12px; min-height: 20px; }
+.file .findbar button { padding: 2px 6px; }
+.files-page .strike { text-decoration: line-through; color: @plane_dim; }
+textview.editor border.left gutter { padding-right: 6px; }
+.file-message { background: alpha(@term_bg, 0.8); color: @plane_dim; }
+.file-message .big { font-size: 1.15em; color: @plane_fg; }
+.files-page .where { color: @plane_dim; }
+.files-page listview, .files-page row { background: transparent; color: @plane_fg; }
+.files-page row { padding: 2px 6px; min-height: 22px; }
+.files-page row:selected { background: @term_0; }
+.files-page .head { color: @plane_fg; font-size: 0.85em; font-weight: bold; letter-spacing: 1px; padding: 10px 0 3px 0; }
+.files-page .note { color: @plane_dim; font-size: 0.9em; }
+.files-page .ignored { color: @plane_dim; }
 ";
 
 pub fn theme_path() -> PathBuf {
@@ -138,4 +174,71 @@ pub fn colors(defines: &str) -> HashMap<String, gdk::RGBA> {
         }
     }
     out
+}
+
+/// `a` moved toward `b` by `t` (0..1), as #rrggbb: source-view styles want solid colors.
+fn mix(a: &gdk::RGBA, b: &gdk::RGBA, t: f32) -> String {
+    let m = |x: f32, y: f32| ((x + (y - x) * t).clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!("#{:02x}{:02x}{:02x}", m(a.red(), b.red()), m(a.green(), b.green()), m(a.blue(), b.blue()))
+}
+
+fn hex(c: &gdk::RGBA) -> String {
+    mix(c, c, 0.0)
+}
+
+/// A GtkSourceView style scheme ("plane") in the theme's colors. It sets no text background,
+/// so the editor keeps the app's translucent one from CSS.
+pub fn source_scheme(colors: &HashMap<String, gdk::RGBA>) -> String {
+    let c = |k: &str| colors.get(k).copied().unwrap_or(gdk::RGBA::WHITE);
+    let (bg, fg, dim) = (c("term_bg"), c("term_fg"), c("plane_dim"));
+    let styles = [
+        ("text", format!("foreground=\"{}\"", hex(&fg))),
+        ("selection", format!("foreground=\"{}\" background=\"{}\"", hex(&c("term_sel_fg")), hex(&c("term_sel_bg")))),
+        ("selection-unfocused", format!("background=\"{}\"", mix(&bg, &c("term_sel_bg"), 0.6))),
+        ("cursor", format!("foreground=\"{}\"", hex(&c("term_cursor")))),
+        ("current-line", format!("background=\"{}\"", mix(&bg, &c("term_0"), 0.9))),
+        ("current-line-number", format!("foreground=\"{}\" bold=\"true\"", hex(&fg))),
+        ("line-numbers", format!("foreground=\"{}\"", mix(&bg, &dim, 0.75))),
+        ("bracket-match", format!("background=\"{}\" bold=\"true\"", mix(&bg, &c("plane_accent"), 0.3))),
+        ("search-match", format!("foreground=\"{}\" background=\"{}\"", hex(&fg), mix(&bg, &c("plane_warn"), 0.35))),
+        ("def:comment", format!("foreground=\"{}\" italic=\"true\"", hex(&dim))),
+        ("def:doc-comment-element", format!("foreground=\"{}\" italic=\"true\" bold=\"true\"", hex(&dim))),
+        ("def:string", format!("foreground=\"{}\"", hex(&c("term_2")))),
+        ("def:special-char", format!("foreground=\"{}\"", hex(&c("term_10")))),
+        ("def:keyword", format!("foreground=\"{}\"", hex(&c("term_5")))),
+        ("def:statement", format!("foreground=\"{}\"", hex(&c("term_5")))),
+        ("def:type", format!("foreground=\"{}\"", hex(&c("term_6")))),
+        ("def:function", format!("foreground=\"{}\"", hex(&c("term_4")))),
+        ("def:constant", format!("foreground=\"{}\"", hex(&c("term_3")))),
+        ("def:number", format!("foreground=\"{}\"", hex(&c("term_3")))),
+        ("def:boolean", format!("foreground=\"{}\"", hex(&c("term_3")))),
+        ("def:preprocessor", format!("foreground=\"{}\"", hex(&c("term_1")))),
+        ("def:builtin", format!("foreground=\"{}\"", hex(&c("term_6")))),
+        ("def:identifier", format!("foreground=\"{}\"", hex(&fg))),
+        ("def:heading", format!("foreground=\"{}\" bold=\"true\"", hex(&c("plane_accent")))),
+        ("def:emphasis", "italic=\"true\"".to_owned()),
+        ("def:strong-emphasis", "bold=\"true\"".to_owned()),
+        ("def:link-text", format!("foreground=\"{}\" underline=\"single\"", hex(&c("term_4")))),
+        ("def:error", format!("foreground=\"{}\" underline=\"error\"", hex(&c("plane_bad")))),
+        ("diff:added-line", format!("foreground=\"{}\"", hex(&c("plane_ok")))),
+        ("diff:removed-line", format!("foreground=\"{}\"", hex(&c("plane_bad")))),
+        ("diff:changed-line", format!("foreground=\"{}\"", hex(&c("plane_warn")))),
+        ("diff:location", format!("foreground=\"{}\" bold=\"true\"", hex(&c("plane_accent")))),
+        ("diff:diff-file", format!("foreground=\"{}\" bold=\"true\"", hex(&dim))),
+        ("diff:special-case", format!("foreground=\"{}\"", hex(&dim))),
+    ];
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<style-scheme id=\"plane\" name=\"Plane\" version=\"1.0\">\n");
+    for (name, attrs) in styles {
+        xml.push_str(&format!("  <style name=\"{name}\" {attrs}/>\n"));
+    }
+    xml.push_str("</style-scheme>\n");
+    xml
+}
+
+/// A theme color moved toward the terminal background, solid: tints for marked lines.
+pub fn tint(colors: &HashMap<String, gdk::RGBA>, key: &str, t: f32) -> gdk::RGBA {
+    let bg = colors.get("term_bg").copied().unwrap_or(gdk::RGBA::BLACK);
+    let c = colors.get(key).copied().unwrap_or(gdk::RGBA::WHITE);
+    let m = |x: f32, y: f32| x + (y - x) * t;
+    gdk::RGBA::new(m(bg.red(), c.red()), m(bg.green(), c.green()), m(bg.blue(), c.blue()), 1.0)
 }

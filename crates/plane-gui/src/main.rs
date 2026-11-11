@@ -8,6 +8,7 @@
 //! control socket that `plane-next open` and `plane-next focus` (Super+arrows) also use.
 
 mod app;
+mod editor;
 mod shot;
 mod store;
 mod term;
@@ -51,6 +52,7 @@ fn main() -> glib::ExitCode {
     let keep: std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<app::App>>>> = Default::default();
     let k = keep.clone();
     app.connect_activate(move |a| {
+        sourceview5::init();
         *k.borrow_mut() = Some(app::App::build(a, commands.clone()));
     });
     let code = app.run_with_args(&["plane-gui"]);

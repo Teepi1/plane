@@ -7,3 +7,4 @@ license = "MIT"
 
 [dependencies]
 serde_json = { version = "1", features = ["preserve_order"] }
+similar = "3"

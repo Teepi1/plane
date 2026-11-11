@@ -21,9 +21,11 @@ use plane_core::{hypr, lost_label, num, pget, py_str, truthy, Env, Fs, Mode};
 use serde_json::Value;
 use vte::prelude::*;
 
+use crate::editor::{self, Editor};
 use crate::store::{Snap, Store};
 use crate::text::{ago, esc, fmt_reset, now, short_needs, tilde};
 use crate::{term, theme};
+use plane_core::files;
 
 /// Newest handoffs listed before "N more handoffs" (the list folds above 5).
 const HANDOFFS_SHOWN: usize = 4;
@@ -93,11 +95,26 @@ enum TabKind {
     Starting(Option<PathBuf>),
     /// A handoff's prompt, read-only (the handoff's id).
     Prompt(String),
+    /// A file, in an editor or as a "can't show this" page (its full path).
+    File(PathBuf),
+}
+
+/// Where a file was opened from: the folder its Files button shows, and the session.
+#[derive(Clone, Debug)]
+struct Origin {
+    root: PathBuf,
+    /// The session's job id, when it came from one.
+    session: Option<String>,
+    name: String,
 }
 
 struct Tab {
     kind: RefCell<TabKind>,
     page: gtk::Widget,
+    title: gtk::Label,
+    name: String,
+    editor: RefCell<Option<Rc<Editor>>>,
+    origin: RefCell<Option<Origin>>,
     term: Option<vte::Terminal>,
     shown_at: Cell<f64>,
     /// The tab is being taken away: its terminal's exit isn't news.
@@ -154,6 +171,23 @@ pub struct App {
     ns_error: gtk::Label,
     ns_hint: gtk::Label,
     ns_state: RefCell<Step>,
+    // the files page
+    fp_title: gtk::Label,
+    fp_where: gtk::Label,
+    fp_store: gio::ListStore,
+    fp_tree: gtk::TreeListModel,
+    fp_view: gtk::ListView,
+    fp_origin: RefCell<Option<Origin>>,
+    /// Items in the store before the folder tree (the changed lists).
+    fp_split: Cell<u32>,
+    fp_shown: RefCell<Vec<String>>,
+    fp_ignored: Rc<RefCell<HashSet<PathBuf>>>,
+    fp_timer: RefCell<Option<glib::SourceId>>,
+    files_btn: gtk::Button,
+    /// What each session's transcripts say about edits, read a little more each time.
+    scans: Arc<Mutex<HashMap<PathBuf, files::TranscriptScan>>>,
+    /// Unsaved files were dealt with: the window may close.
+    allow_close: Cell<bool>,
     // state
     snap: RefCell<Snap>,
     items: RefCell<Vec<Item>>,
@@ -234,6 +268,7 @@ impl App {
         let defines = theme::defines();
         provider.load_from_string(&theme::css(&defines));
         gtk::style_context_add_provider_for_display(&gdk::Display::default().expect("no display"), &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        editor::install_scheme(&theme::colors(&defines));
 
         let window = gtk::ApplicationWindow::builder().application(app).title("Plane").default_width(1346).default_height(713).build();
         window.add_css_class("plane");
@@ -325,6 +360,35 @@ impl App {
         page.append(&ns_hint);
         stack.add_named(&page, Some("new"));
         stack.add_named(&help_page(), Some("help"));
+
+        // files: a session's changed files, then its folder as a tree
+        let fpage = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        fpage.add_css_class("page");
+        fpage.add_css_class("files-page");
+        let fp_title = label("", &["step"]);
+        let fp_where = label("", &["where"]);
+        fp_where.set_ellipsize(pango::EllipsizeMode::Start);
+        let fp_store = gio::ListStore::new::<gtk::StringObject>();
+        let fp_ignored: Rc<RefCell<HashSet<PathBuf>>> = Rc::default();
+        let ig = fp_ignored.clone();
+        let fp_tree = gtk::TreeListModel::new(fp_store.clone(), false, false, move |item| {
+            let s = item.downcast_ref::<gtk::StringObject>()?.string();
+            let (kind, path, _) = fp_parse(&s);
+            (kind == "dir").then(|| folder_model(Path::new(path), &ig.borrow()).upcast())
+        });
+        let fp_sel = gtk::SingleSelection::new(Some(fp_tree.clone()));
+        fp_sel.set_autoselect(false);
+        let fp_view = gtk::ListView::new(Some(fp_sel), None::<gtk::ListItemFactory>);
+        let fscroll = gtk::ScrolledWindow::new();
+        fscroll.set_hscrollbar_policy(gtk::PolicyType::Never);
+        fscroll.set_kinetic_scrolling(false);
+        fscroll.set_child(Some(&fp_view));
+        fscroll.set_vexpand(true);
+        fpage.append(&fp_title);
+        fpage.append(&fp_where);
+        fpage.append(&fscroll);
+        fpage.append(&label("esc back", &["dim"]));
+        stack.add_named(&fpage, Some("files"));
         sidebar.append(&stack);
 
         let details = gtk::Box::new(gtk::Orientation::Vertical, 1);
@@ -363,7 +427,12 @@ impl App {
         notebook.set_show_border(false);
         notebook.set_hexpand(true);
         notebook.set_vexpand(true);
-        let empty = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let files_btn = gtk::Button::with_label("Files");
+        files_btn.add_css_class("files");
+        files_btn.set_focusable(false);
+        files_btn.set_tooltip_text(Some("The changed files and folder of what this tab shows"));
+        notebook.set_action_widget(&files_btn, gtk::PackType::End);
+        let empty =gtk::Box::new(gtk::Orientation::Vertical, 8);
         empty.add_css_class("empty");
         empty.set_valign(gtk::Align::Fill);
         let inner = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -418,6 +487,19 @@ impl App {
             ns_error,
             ns_hint,
             ns_state: RefCell::new(Step::Folder),
+            fp_title,
+            fp_where,
+            fp_store,
+            fp_tree,
+            fp_view,
+            fp_origin: RefCell::new(None),
+            fp_split: Cell::new(0),
+            fp_shown: RefCell::new(vec![]),
+            fp_ignored,
+            fp_timer: RefCell::new(None),
+            files_btn,
+            scans: Arc::default(),
+            allow_close: Cell::new(false),
             snap: RefCell::new(Snap::default()),
             items: RefCell::new(vec![]),
             rows: RefCell::new(HashMap::new()),
@@ -457,6 +539,26 @@ impl App {
                     let y = r.compute_point(&app.list, &gtk::graphene::Point::new(10.0, 10.0)).map(|p| p.y()).unwrap_or(0.0);
                     app.context_menu(40.0, y as f64);
                 }
+            } else if let Some(text) = name.strip_prefix("open:") {
+                // a file, as a click on its path in a terminal would open it
+                let bases = vec![PathBuf::from(&app.home)];
+                if let Some(l) = files::parse_link(text) {
+                    if let Some(p) = files::resolve(&l.file, &bases, &app.env.home) {
+                        app.open_file(&p, l.line, l.col, None);
+                    }
+                }
+            } else if let Some(text) = name.strip_prefix("type:") {
+                // typing into the focused editor
+                if let Some(ed) = app.current_tab().and_then(|t| t.editor.borrow().clone()) {
+                    let b = ed.view.buffer();
+                    b.insert_at_cursor(&text.replace('_', " "));
+                }
+            } else if let Some(cmd) = name.strip_prefix("ed:") {
+                if let Some(ed) = app.current_tab().and_then(|t| t.editor.borrow().clone()) {
+                    ed.shot_command(cmd);
+                }
+            } else if name == "files" {
+                app.files_for_current_tab();
             } else if let Some(key) = gdk::Key::from_name(name) {
                 app.on_key(key, gdk::ModifierType::empty());
             }
@@ -603,6 +705,29 @@ impl App {
             }
         });
 
+        // files
+        let weak = Rc::downgrade(self);
+        self.files_btn.connect_clicked(move |_| {
+            if let Some(app) = weak.upgrade() {
+                app.files_for_current_tab();
+            }
+        });
+        self.wire_files_page();
+        // unsaved files are asked about before the window goes
+        let weak = Rc::downgrade(self);
+        self.window.connect_close_request(move |_| {
+            let Some(app) = weak.upgrade() else { return glib::Propagation::Proceed };
+            if app.allow_close.get() || std::env::var_os("PLANE_SHOT").is_some() {
+                return glib::Propagation::Proceed; // (an off-screen picture quits without asking)
+            }
+            let dirty = app.dirty_editors();
+            if dirty.is_empty() {
+                return glib::Propagation::Proceed;
+            }
+            app.ask_quit(dirty);
+            glib::Propagation::Stop
+        });
+
         // new-session page
         let weak = Rc::downgrade(self);
         self.ns_folders.connect_row_activated(move |_, row| {
@@ -653,6 +778,7 @@ impl App {
             let Some(app) = weak.upgrade() else { return glib::ControlFlow::Break };
             app.show_usage(); // "resets in", "started 5m ago" move on
             app.show_details();
+            app.refresh_who(None); // "edited this 5m ago" too
             glib::ControlFlow::Continue
         });
 
@@ -676,9 +802,13 @@ impl App {
         self.provider.load_from_string(&theme::css(&defines));
         *self.colors.borrow_mut() = theme::colors(&defines);
         let colors = self.colors.borrow();
+        editor::install_scheme(&colors);
         for tab in self.tabs.borrow().iter() {
             if let Some(t) = &tab.term {
                 term::apply_colors(t, &colors);
+            }
+            if let Some(ed) = tab.editor.borrow().as_ref() {
+                ed.set_scheme(&colors);
             }
         }
     }
@@ -1187,8 +1317,9 @@ impl App {
         let hint = match item.map(|i| (i.kind, &i.obj)) {
             Some((Kind::Handoff, _)) => "v read  x discard  n new  ? keys",
             Some((Kind::Lost, _)) => "x close  n new  ? keys",
-            Some((Kind::Session, o)) if truthy(pget(o, "bg")) && truthy(pget(o, "stopped")) => "x close  n new  ? keys",
-            Some((Kind::Session, o)) if truthy(pget(o, "bg")) => "x close  p pause  n new  ? keys",
+            Some((Kind::Session, o)) if truthy(pget(o, "bg")) && truthy(pget(o, "stopped")) => "x close  f files  n new  ? keys",
+            Some((Kind::Session, o)) if truthy(pget(o, "bg")) => "x close  p pause  f files  ? keys",
+            Some((Kind::Session, _)) => "f files  n new  ? keys",
             _ => "n new session  ? keys",
         };
         let markup: Vec<String> = hint
@@ -1289,7 +1420,7 @@ impl App {
             self.back_to_list();
             return glib::Propagation::Stop;
         }
-        if page == "new" {
+        if page == "new" || page == "files" {
             if key == K::Escape {
                 self.back_to_list();
                 return glib::Propagation::Stop;
@@ -1326,6 +1457,11 @@ impl App {
             K::p => {
                 if let (Some(Kind::Session), Some(i)) = (kind, item) {
                     self.pause(&i.obj);
+                }
+            }
+            K::f => {
+                if let (Some(Kind::Session), Some(i)) = (kind, item) {
+                    self.files_for_session(&i.obj);
                 }
             }
             K::u => self.undo_discard(),
@@ -1422,9 +1558,13 @@ impl App {
         if let Some(i) = &item {
             let o = &i.obj;
             match i.kind {
-                Kind::Session if !truthy(pget(o, "bg")) => acts.append(Some("Go to its window"), Some("row.open")),
+                Kind::Session if !truthy(pget(o, "bg")) => {
+                    acts.append(Some("Go to its window"), Some("row.open"));
+                    acts.append(Some("Files"), Some("row.files"));
+                }
                 Kind::Session => {
                     acts.append(Some(if truthy(pget(o, "stopped")) { "Continue" } else { "Open" }), Some("row.open"));
+                    acts.append(Some("Files"), Some("row.files"));
                     if !truthy(pget(o, "stopped")) {
                         acts.append(Some("Pause"), Some("row.pause"));
                     }
@@ -1493,6 +1633,7 @@ impl App {
         add("close-all", |app, i| app.close_lost(&i.obj, true));
         add("requeue", |app, i| app.requeue(&i.obj));
         add("read", |app, i| app.view_handoff(&i.obj));
+        add("files", |app, i| app.files_for_session(&i.obj));
         let a = gio::SimpleAction::new("new", None);
         let weak = Rc::downgrade(self);
         a.connect_activate(move |_, _| {
@@ -1573,14 +1714,18 @@ impl App {
 
     fn add_term_tab(self: &Rc<Self>, kind: TabKind, title: &str, cwd: &str) -> Rc<Tab> {
         let weak = Rc::downgrade(self);
-        let say: Rc<dyn Fn(String)> = Rc::new(move |text| {
-            if let Some(app) = weak.upgrade() {
-                app.say(&text, "info");
+        let slot: Rc<RefCell<std::rc::Weak<Tab>>> = Rc::default();
+        let s = slot.clone();
+        let open: Rc<dyn Fn(String)> = Rc::new(move |text| {
+            if let (Some(app), Some(tab)) = (weak.upgrade(), s.borrow().upgrade()) {
+                app.open_link(&tab, &text);
             }
         });
         let wheel = Rc::new(Cell::new(matches!(kind, TabKind::Session(_))));
-        let t = term::new_terminal(&self.colors.borrow(), self.scale.clone(), cwd.to_owned(), say, wheel.clone());
+        let t = term::new_terminal(&self.colors.borrow(), self.scale.clone(), open, wheel.clone());
         let tab = self.add_tab(kind, title, t.clone().upcast(), Some(t.clone()), wheel);
+        *slot.borrow_mut() = Rc::downgrade(&tab);
+        *tab.origin.borrow_mut() = Some(Origin { root: PathBuf::from(cwd), session: None, name: title.to_owned() });
         let weak = Rc::downgrade(self);
         let w_tab = Rc::downgrade(&tab);
         t.connect_child_exited(move |term, _| {
@@ -1611,11 +1756,26 @@ impl App {
         close.set_focusable(false);
         close.set_tooltip_text(Some(match kind {
             TabKind::Prompt(_) => "Hide this tab",
+            TabKind::File(_) => "Close this file (Ctrl+W)",
             _ => "Hide this view · the session keeps running",
         }));
+        if let TabKind::File(p) = &kind {
+            head.set_tooltip_text(Some(&tilde(&p.to_string_lossy(), &self.home)));
+        }
         head.append(&title_label);
         head.append(&close);
-        let tab = Rc::new(Tab { kind: RefCell::new(kind), page: page.clone(), term, shown_at: Cell::new(now()), closing: Cell::new(false), wheel_to_app });
+        let tab = Rc::new(Tab {
+            kind: RefCell::new(kind),
+            page: page.clone(),
+            title: title_label,
+            name: title.to_owned(),
+            editor: RefCell::new(None),
+            origin: RefCell::new(None),
+            term,
+            shown_at: Cell::new(now()),
+            closing: Cell::new(false),
+            wheel_to_app,
+        });
         let weak = Rc::downgrade(self);
         let w_tab = Rc::downgrade(&tab);
         close.connect_clicked(move |_| {
@@ -1654,13 +1814,47 @@ impl App {
     fn focus_tab(&self, tab: &Tab) {
         tab.shown_at.set(now());
         let page = tab.page.clone();
+        let ed = tab.editor.borrow().clone();
         // after GTK has shown the page, or the focus lands nowhere
-        glib::idle_add_local_once(move || {
-            page.grab_focus();
+        glib::idle_add_local_once(move || match ed {
+            Some(ed) => ed.focus(),
+            None => {
+                page.grab_focus();
+            }
         });
     }
 
+    /// Takes a tab away; a file with unsaved changes asks first.
     fn close_tab(self: &Rc<Self>, tab: &Rc<Tab>) {
+        let ed = tab.editor.borrow().clone();
+        match ed {
+            Some(ed) if ed.is_dirty() => {
+                self.show_tab(tab);
+                let dialog = gtk::AlertDialog::builder()
+                    .modal(true)
+                    .message(format!("Save your changes to {}?", ed.file_name()))
+                    .detail("If you close it without saving, your changes are lost.")
+                    .buttons(["Cancel", "Close without saving", "Save"])
+                    .cancel_button(0)
+                    .default_button(2)
+                    .build();
+                let app = self.clone();
+                let tab = tab.clone();
+                dialog.choose(Some(&self.window), None::<&gio::Cancellable>, move |r| match r {
+                    Ok(2) => {
+                        if ed.save(false) {
+                            app.remove_tab(&tab);
+                        }
+                    }
+                    Ok(1) => app.remove_tab(&tab),
+                    _ => ed.focus(),
+                });
+            }
+            _ => self.remove_tab(tab),
+        }
+    }
+
+    fn remove_tab(self: &Rc<Self>, tab: &Rc<Tab>) {
         tab.closing.set(true);
         // a handoff still starting (at a trust prompt, say) stops with its tab: back in the queue
         if let TabKind::Starting(Some(done)) = tab.kind.borrow().clone() {
@@ -2001,6 +2195,523 @@ impl App {
         self.add_tab(TabKind::Prompt(id), &title, scroll.upcast(), None, Rc::new(Cell::new(false)));
     }
 
+    // ------------------------------------------------------------------ files
+
+    /// Runs `work` off the main thread, then `done` on it (no refresh afterwards).
+    fn off_thread<T: Send + 'static>(self: &Rc<Self>, work: impl FnOnce() -> T + Send + 'static, done: impl FnOnce(&Rc<App>, T) + 'static) {
+        let handle = gio::spawn_blocking(work);
+        let app = self.clone();
+        glib::spawn_future_local(async move {
+            if let Ok(v) = handle.await {
+                done(&app, v);
+            }
+        });
+    }
+
+    fn session_obj(&self, id: &str) -> Option<Value> {
+        self.snap.borrow().sessions.iter().find(|s| py_str(pget(s, "id")) == id).cloned()
+    }
+
+    /// Where a session's relative paths start: the folder it works in now (a worktree it
+    /// entered, from the end of its transcript), the one in its process file, where it began.
+    fn session_bases(&self, s: &Value) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = vec![];
+        let sid = sval(s, "sessionId");
+        if !sid.is_empty() {
+            let main = format!("{sid}.jsonl");
+            if let Some(t) = files::transcripts(&self.env.claude, sid).into_iter().find(|p| p.file_name().is_some_and(|n| n.to_string_lossy() == main)) {
+                if let Some(c) = files::last_cwd(&t) {
+                    out.push(c.into());
+                }
+            }
+        }
+        if truthy(pget(s, "pid")) {
+            let f = plane_core::read_obj(&self.env.sessions().join(format!("{}.json", py_str(pget(s, "pid")))));
+            if !sval(&f, "cwd").is_empty() {
+                out.push(sval(&f, "cwd").into());
+            }
+        }
+        if !sval(s, "cwd").is_empty() {
+            out.push(sval(s, "cwd").into());
+        }
+        let mut seen = HashSet::new();
+        out.retain(|p| p.is_dir() && seen.insert(p.clone()));
+        if out.is_empty() {
+            out.push(self.env.home.clone());
+        }
+        out
+    }
+
+    fn session_origin(&self, s: &Value) -> (Vec<PathBuf>, Origin) {
+        let bases = self.session_bases(s);
+        let name = py_str(plane_core::or(&[pget(s, "name"), pget(s, "id")]));
+        let origin = Origin { root: bases[0].clone(), session: Some(py_str(pget(s, "id"))), name };
+        (bases, origin)
+    }
+
+    /// A click on a path or a link in a terminal.
+    fn open_link(self: &Rc<Self>, tab: &Rc<Tab>, text: &str) {
+        let Some(link) = files::parse_link(text) else {
+            if text.starts_with("http://") || text.starts_with("https://") {
+                gtk::UriLauncher::new(text).launch(Some(&self.window), None::<&gio::Cancellable>, |_| {}); // as kitty does
+            }
+            return;
+        };
+        let kind = tab.kind.borrow().clone();
+        let session = match &kind {
+            TabKind::Session(id) => self.session_obj(id),
+            _ => None,
+        };
+        let (bases, origin) = match session {
+            Some(s) => self.session_origin(&s),
+            None => {
+                let o = tab.origin.borrow().clone().unwrap_or(Origin { root: self.env.home.clone(), session: None, name: tab.name.clone() });
+                (vec![o.root.clone()], o)
+            }
+        };
+        match files::resolve(&link.file, &bases, &self.env.home) {
+            Some(p) => self.open_file(&p, link.line, link.col, Some(origin)),
+            None => self.say(&format!("no file called {} in this session's folder", link.file), "warn"),
+        }
+    }
+
+    fn file_tab(&self, path: &Path) -> Option<Rc<Tab>> {
+        self.tabs.borrow().iter().find(|t| matches!(&*t.kind.borrow(), TabKind::File(p) if p == path)).cloned()
+    }
+
+    /// Opens a file in a tab (or shows its tab), at `line` if given.
+    fn open_file(self: &Rc<Self>, path: &Path, line: Option<u32>, col: Option<u32>, origin: Option<Origin>) {
+        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if let Some(tab) = self.file_tab(&path) {
+            self.show_tab(&tab);
+            if let (Some(ed), Some(l)) = (tab.editor.borrow().clone(), line) {
+                ed.goto(l, col);
+            }
+            return;
+        }
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+        let origin = origin.unwrap_or_else(|| {
+            let root = path.parent().map(Path::to_path_buf).unwrap_or_else(|| self.env.home.clone());
+            let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "~".into());
+            Origin { root, session: None, name }
+        });
+        let shown = editor::display_path(&path, &origin.root, &self.env.home);
+        match files::load(&path) {
+            Ok((files::Content::Text(text), stamp)) => {
+                let base = files::head_text(&path).map(files::Base::Head).unwrap_or_else(|| files::Base::Opened(text.clone()));
+                let hooks = {
+                    let (w1, w2, w3) = (Rc::downgrade(self), Rc::downgrade(self), Rc::downgrade(self));
+                    let (p1, p2, p3) = (path.clone(), path.clone(), path.clone());
+                    editor::Hooks {
+                        dirty: Box::new(move |d| {
+                            if let Some(app) = w1.upgrade() {
+                                app.file_dirty(&p1, d);
+                            }
+                        }),
+                        close: Box::new(move || {
+                            if let Some(app) = w2.upgrade() {
+                                if let Some(t) = app.file_tab(&p2) {
+                                    app.close_tab(&t);
+                                }
+                            }
+                        }),
+                        changed_on_disk: Box::new(move || {
+                            if let Some(app) = w3.upgrade() {
+                                app.refresh_who(Some(&p3));
+                            }
+                        }),
+                    }
+                };
+                let ed = Editor::new(path.clone(), &shown, text, stamp, base, &self.colors.borrow(), hooks);
+                let tab = self.add_tab(TabKind::File(path.clone()), &name, ed.page.clone().upcast(), None, Rc::new(Cell::new(false)));
+                *tab.editor.borrow_mut() = Some(ed.clone());
+                *tab.origin.borrow_mut() = Some(origin);
+                self.focus_tab(&tab);
+                if let Some(l) = line {
+                    ed.goto(l, col);
+                }
+                self.refresh_who(Some(&path));
+            }
+            Ok((c, _)) => {
+                let page = editor::message_page(&path, &shown, &editor::why_not_text(&c));
+                let tab = self.add_tab(TabKind::File(path.clone()), &name, page, None, Rc::new(Cell::new(false)));
+                *tab.origin.borrow_mut() = Some(origin);
+            }
+            Err(files::ReadError::Missing) => self.say(&format!("no such file: {}", tilde(&path.to_string_lossy(), &self.home)), "warn"),
+            Err(files::ReadError::Other(e)) => self.say(&format!("couldn't open {name}: {e}"), "bad"),
+        }
+    }
+
+    /// The ● in a file tab's title while it has unsaved changes.
+    fn file_dirty(&self, path: &Path, dirty: bool) {
+        if let Some(t) = self.file_tab(path) {
+            let text = if dirty { format!("● {}", t.name) } else { t.name.clone() };
+            t.title.set_width_chars(text.chars().count().min(26) as i32);
+            t.title.set_max_width_chars(26);
+            t.title.set_text(&text);
+        }
+    }
+
+    fn dirty_editors(&self) -> Vec<(Rc<Tab>, Rc<Editor>)> {
+        self.tabs.borrow().iter().filter_map(|t| t.editor.borrow().clone().filter(|e| e.is_dirty()).map(|e| (t.clone(), e))).collect()
+    }
+
+    /// The window is closing with unsaved files: save them, leave them, or stay.
+    fn ask_quit(self: &Rc<Self>, dirty: Vec<(Rc<Tab>, Rc<Editor>)>) {
+        let names: Vec<String> = dirty.iter().map(|(_, e)| e.file_name()).collect();
+        let (message, save) = if names.len() == 1 {
+            (format!("Save your changes to {} before quitting?", names[0]), "Save and quit")
+        } else {
+            (format!("{} files have unsaved changes: {}", names.len(), names.join(", ")), "Save all and quit")
+        };
+        let dialog = gtk::AlertDialog::builder()
+            .modal(true)
+            .message(message)
+            .detail("If you quit without saving, the changes are lost. Sessions keep running either way.")
+            .buttons(["Cancel", "Quit without saving", save])
+            .cancel_button(0)
+            .default_button(2)
+            .build();
+        let app = self.clone();
+        dialog.choose(Some(&self.window), None::<&gio::Cancellable>, move |r| match r {
+            Ok(2) => {
+                for (tab, ed) in &dirty {
+                    if !ed.save(false) {
+                        app.show_tab(tab); // it says why, and nothing is lost
+                        return;
+                    }
+                }
+                app.allow_close.set(true);
+                app.window.close();
+            }
+            Ok(1) => {
+                app.allow_close.set(true);
+                app.window.close();
+            }
+            _ => {}
+        });
+    }
+
+    /// Who last edited each open file, from the transcripts of the sessions listed: "node is
+    /// working on this" for an edit in the last two minutes by a working session.
+    fn refresh_who(self: &Rc<Self>, only: Option<&Path>) {
+        let paths: Vec<PathBuf> = self
+            .tabs
+            .borrow()
+            .iter()
+            .filter(|t| t.editor.borrow().is_some())
+            .filter_map(|t| match &*t.kind.borrow() {
+                TabKind::File(p) if only.is_none_or(|o| o == p) => Some(p.clone()),
+                _ => None,
+            })
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        let sessions: Vec<(String, String, bool)> = self
+            .snap
+            .borrow()
+            .sessions
+            .iter()
+            .filter(|s| !sval(s, "sessionId").is_empty())
+            .map(|s| (sval(s, "sessionId").to_owned(), py_str(plane_core::or(&[pget(s, "name"), pget(s, "id")])), session_state(s) == "working"))
+            .collect();
+        let (scans, claude) = (self.scans.clone(), self.env.claude.clone());
+        self.off_thread(
+            move || {
+                let mut best: HashMap<PathBuf, (String, f64, bool)> = HashMap::new();
+                let mut scans = scans.lock().unwrap();
+                for (sid, name, working) in &sessions {
+                    for t in files::transcripts(&claude, sid) {
+                        let scan = scans.entry(t.clone()).or_default();
+                        scan.update(&t);
+                        for p in &paths {
+                            if let Some(&ts) = scan.edits.get(p) {
+                                if best.get(p).is_none_or(|b| ts > b.1) {
+                                    best.insert(p.clone(), (name.clone(), ts, *working));
+                                }
+                            }
+                        }
+                    }
+                }
+                (paths, best)
+            },
+            |app, (paths, best)| {
+                for p in paths {
+                    let text = match best.get(&p) {
+                        Some((name, ts, true)) if now() - ts < 120.0 => format!("{name} is working on this"),
+                        Some((name, ts, _)) => format!("{name} edited this {}", ago(*ts)),
+                        None => String::new(),
+                    };
+                    if let Some(ed) = app.file_tab(&p).and_then(|t| t.editor.borrow().clone()) {
+                        ed.set_who(&text);
+                    }
+                }
+            },
+        );
+    }
+
+    fn files_for_session(self: &Rc<Self>, s: &Value) {
+        let (_, origin) = self.session_origin(s);
+        self.show_files(origin);
+    }
+
+    /// The Files button: the files of the session (or folder) the current tab belongs to.
+    fn files_for_current_tab(self: &Rc<Self>) {
+        let Some(tab) = self.current_tab() else { return };
+        let kind = tab.kind.borrow().clone();
+        if let TabKind::Session(id) = &kind {
+            if let Some(s) = self.session_obj(id) {
+                return self.files_for_session(&s);
+            }
+        }
+        let origin = tab.origin.borrow().clone();
+        match origin {
+            Some(o) => match o.session.as_ref().and_then(|id| self.session_obj(id)) {
+                Some(s) => self.files_for_session(&s),
+                None => self.show_files(o),
+            },
+            None => self.say("this tab has no folder to show", "info"),
+        }
+    }
+
+    fn show_files(self: &Rc<Self>, origin: Origin) {
+        self.cancel_confirm();
+        let same = self.fp_origin.borrow().as_ref().is_some_and(|o| o.root == origin.root);
+        self.fp_title.set_text(&format!("FILES · {}", origin.name));
+        self.fp_where.set_text(&tilde(&origin.root.to_string_lossy(), &self.home));
+        self.fp_where.set_tooltip_text(Some(&origin.root.to_string_lossy()));
+        *self.fp_origin.borrow_mut() = Some(origin);
+        if !same {
+            self.fp_store.remove_all();
+            self.fp_store.append(&fp_item("note", "", "reading the folder…"));
+            self.fp_split.set(0);
+            self.fp_shown.borrow_mut().clear();
+        }
+        self.show_page("files");
+        self.refresh_files_page(!same);
+        if self.fp_timer.borrow().is_none() {
+            let weak = Rc::downgrade(self);
+            let id = glib::timeout_add_seconds_local(4, move || {
+                let Some(app) = weak.upgrade() else { return glib::ControlFlow::Break };
+                if app.stack.visible_child_name().as_deref() != Some("files") {
+                    *app.fp_timer.borrow_mut() = None;
+                    return glib::ControlFlow::Break;
+                }
+                app.refresh_files_page(false);
+                glib::ControlFlow::Continue
+            });
+            *self.fp_timer.borrow_mut() = Some(id);
+        }
+        self.fp_view.grab_focus();
+    }
+
+    /// The changed lists at the top (git status, and what the session's transcripts say it
+    /// edited), and with `full` the folder tree under them.
+    fn refresh_files_page(self: &Rc<Self>, full: bool) {
+        let Some(origin) = self.fp_origin.borrow().clone() else { return };
+        let session = origin.session.as_ref().and_then(|id| self.session_obj(id)).map(|s| sval(&s, "sessionId").to_owned()).filter(|s| !s.is_empty());
+        let (scans, claude, root) = (self.scans.clone(), self.env.claude.clone(), origin.root.clone());
+        self.off_thread(
+            move || {
+                let changes = files::git_changes(&root);
+                let mut edits: Vec<(PathBuf, f64)> = vec![];
+                if let Some(sid) = &session {
+                    let mut scans = scans.lock().unwrap();
+                    let mut all: HashMap<PathBuf, f64> = HashMap::new();
+                    for t in files::transcripts(&claude, sid) {
+                        let scan = scans.entry(t.clone()).or_default();
+                        scan.update(&t);
+                        for (p, ts) in &scan.edits {
+                            let e = all.entry(p.clone()).or_insert(0.0);
+                            *e = e.max(*ts);
+                        }
+                    }
+                    let listed: HashSet<&PathBuf> = changes.iter().flatten().map(|c| &c.path).collect();
+                    edits = all.into_iter().filter(|(p, _)| !listed.contains(p) && p.is_file()).collect();
+                    edits.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    edits.truncate(12);
+                }
+                let ignored = if full { files::git_ignored(&files::repo_root(&root).unwrap_or_else(|| root.clone())) } else { vec![] };
+                (root, changes, edits, ignored)
+            },
+            move |app, (root, changes, edits, ignored)| {
+                if app.fp_origin.borrow().as_ref().is_none_or(|o| o.root != root) {
+                    return; // the page moved on to another folder meanwhile
+                }
+                let mut top: Vec<String> = vec![];
+                if let Some(mut ch) = changes {
+                    ch.sort_by(|a, b| a.path.cmp(&b.path));
+                    top.push(format!("head\t\tNOT COMMITTED · {}", ch.len()));
+                    if ch.is_empty() {
+                        top.push("note\t\tnothing uncommitted".into());
+                    }
+                    for c in ch {
+                        top.push(format!("chg\t{}\t{}", c.path.display(), c.word));
+                    }
+                }
+                if !edits.is_empty() {
+                    top.push("head\t\tEDITED BY THIS SESSION".into());
+                    for (p, ts) in edits {
+                        top.push(format!("edit\t{}\t{}", p.display(), ago(ts)));
+                    }
+                }
+                top.push("head\t\tALL FILES".into());
+                if full {
+                    *app.fp_ignored.borrow_mut() = ignored.into_iter().collect();
+                    let tree = folder_model(&root, &app.fp_ignored.borrow());
+                    let mut all: Vec<glib::Object> = top.iter().map(|s| gtk::StringObject::new(s).upcast()).collect();
+                    for i in 0..tree.n_items() {
+                        if let Some(o) = tree.item(i) {
+                            all.push(o);
+                        }
+                    }
+                    let n = app.fp_store.n_items();
+                    app.fp_store.splice(0, n, &all);
+                } else if *app.fp_shown.borrow() != top {
+                    let objs: Vec<gtk::StringObject> = top.iter().map(|s| gtk::StringObject::new(s)).collect();
+                    app.fp_store.splice(0, app.fp_split.get(), &objs);
+                } else {
+                    return;
+                }
+                app.fp_split.set(top.len() as u32);
+                *app.fp_shown.borrow_mut() = top;
+            },
+        );
+    }
+
+    fn wire_files_page(self: &Rc<Self>) {
+        let factory = gtk::SignalListItemFactory::new();
+        let weak = Rc::downgrade(self);
+        factory.connect_setup(move |_, obj| {
+            let Some(li) = obj.downcast_ref::<gtk::ListItem>() else { return };
+            let exp = gtk::TreeExpander::new();
+            let b = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            let name = label("", &["name"]);
+            name.set_ellipsize(pango::EllipsizeMode::Middle);
+            let dir = label("", &["note"]);
+            dir.set_hexpand(true);
+            dir.set_ellipsize(pango::EllipsizeMode::Start);
+            dir.set_max_width_chars(4); // the name gets the room first; the folder takes what's left
+            let note = label("", &["note"]);
+            b.append(&name);
+            b.append(&dir);
+            b.append(&note);
+            exp.set_child(Some(&b));
+            // one click opens a file or opens and folds a folder, as in other file lists
+            let click = gtk::GestureClick::new();
+            click.set_button(1);
+            let (w, l) = (weak.clone(), li.downgrade());
+            click.connect_released(move |g, n, _, _| {
+                let (Some(app), Some(li)) = (w.upgrade(), l.upgrade()) else { return };
+                if n == 1 && g.current_event_state().is_empty() {
+                    app.files_activate(li.position());
+                }
+            });
+            exp.add_controller(click);
+            li.set_child(Some(&exp));
+        });
+        let home = self.home.clone();
+        let weak = Rc::downgrade(self);
+        factory.connect_bind(move |_, obj| {
+            let Some(li) = obj.downcast_ref::<gtk::ListItem>() else { return };
+            let Some(row) = li.item().and_downcast::<gtk::TreeListRow>() else { return };
+            let Some(exp) = li.child().and_downcast::<gtk::TreeExpander>() else { return };
+            exp.set_list_row(Some(&row));
+            let Some(s) = row.item().and_downcast::<gtk::StringObject>().map(|o| o.string()) else { return };
+            let (kind, path, note) = fp_parse(&s);
+            let Some(b) = exp.child().and_downcast::<gtk::Box>() else { return };
+            let name = b.first_child().and_downcast::<gtk::Label>().unwrap();
+            let dir = name.next_sibling().and_downcast::<gtk::Label>().unwrap();
+            let note_l = b.last_child().and_downcast::<gtk::Label>().unwrap();
+            let p = Path::new(path);
+            let file_name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let root = weak.upgrade().and_then(|a| a.fp_origin.borrow().as_ref().map(|o| o.root.clone())).unwrap_or_default();
+            let rel_dir = p.parent().and_then(|d| d.strip_prefix(&root).ok()).map(|d| d.display().to_string()).unwrap_or_else(|| p.parent().map(|d| tilde(&d.to_string_lossy(), &home)).unwrap_or_default());
+            let heading = kind == "head" || kind == "note";
+            li.set_selectable(!heading);
+            li.set_activatable(!heading);
+            exp.set_hide_expander(kind != "dir");
+            exp.set_indent_for_icon(kind == "dir" || kind == "file");
+            for (w, c, on) in [(&name, "head", kind == "head"), (&name, "dim", kind == "note"), (&name, "ignored", note == "ignored"), (&name, "strike", note == "deleted")] {
+                if on { w.add_css_class(c) } else { w.remove_css_class(c) }
+            }
+            dir.set_visible(!heading);
+            note_l.set_visible(!heading);
+            name.set_hexpand(heading);
+            match kind {
+                "head" | "note" => {
+                    name.set_text(note);
+                    dir.set_text("");
+                    note_l.set_text("");
+                }
+                "chg" | "edit" => {
+                    name.set_text(&file_name);
+                    dir.set_text(&rel_dir);
+                    note_l.set_text(note);
+                    exp.set_tooltip_text(Some(&tilde(path, &home)));
+                }
+                _ => {
+                    name.set_text(&file_name);
+                    dir.set_text("");
+                    note_l.set_text(if note == "ignored" { "" } else { note });
+                    exp.set_tooltip_text(None);
+                }
+            }
+        });
+        self.fp_view.set_factory(Some(&factory));
+        let weak = Rc::downgrade(self);
+        self.fp_view.connect_activate(move |_, pos| {
+            if let Some(app) = weak.upgrade() {
+                app.files_activate(pos);
+            }
+        });
+        // → opens a folder, ← folds it (or goes up to the folder it's in)
+        let keys = gtk::EventControllerKey::new();
+        let weak = Rc::downgrade(self);
+        keys.connect_key_pressed(move |_, key, _, mods| {
+            let Some(app) = weak.upgrade() else { return glib::Propagation::Proceed };
+            if !mods.is_empty() || !matches!(key, gdk::Key::Left | gdk::Key::Right) {
+                return glib::Propagation::Proceed;
+            }
+            let Some(sel) = app.fp_view.model().and_downcast::<gtk::SingleSelection>() else { return glib::Propagation::Proceed };
+            let Some(row) = sel.selected_item().and_downcast::<gtk::TreeListRow>() else { return glib::Propagation::Proceed };
+            if key == gdk::Key::Right {
+                if row.is_expandable() {
+                    row.set_expanded(true);
+                }
+            } else if row.is_expanded() {
+                row.set_expanded(false);
+            } else if let Some(parent) = row.parent() {
+                let pos = parent.position();
+                sel.set_selected(pos);
+                app.fp_view.scroll_to(pos, gtk::ListScrollFlags::FOCUS, None);
+            }
+            glib::Propagation::Stop
+        });
+        self.fp_view.add_controller(keys);
+    }
+
+    fn files_activate(self: &Rc<Self>, pos: u32) {
+        let Some(row) = self.fp_tree.item(pos).and_downcast::<gtk::TreeListRow>() else { return };
+        let Some(s) = row.item().and_downcast::<gtk::StringObject>().map(|o| o.string()) else { return };
+        let (kind, path, note) = fp_parse(&s);
+        if let Some(sel) = self.fp_view.model().and_downcast::<gtk::SingleSelection>() {
+            if kind != "head" && kind != "note" {
+                sel.set_selected(pos);
+            }
+        }
+        match kind {
+            "dir" => row.set_expanded(!row.is_expanded()),
+            "file" | "chg" | "edit" if note == "deleted" => self.say("deleted: it's only in the last commit now", "info"),
+            "file" | "chg" | "edit" => {
+                let origin = self.fp_origin.borrow().clone();
+                self.open_file(Path::new(path), None, None, origin);
+            }
+            _ => {}
+        }
+    }
+
     // ------------------------------------------------------------------ pages
 
     /// The help and new-session pages take the sidebar; the details and key hints are for
@@ -2131,6 +2842,40 @@ impl App {
     }
 }
 
+/// Files-page rows are strings: "kind\tpath\tnote". Kinds: head, note, chg (git status),
+/// edit (the session's transcript), dir and file (the folder tree).
+fn fp_parse(s: &str) -> (&str, &str, &str) {
+    let mut it = s.splitn(3, '\t');
+    (it.next().unwrap_or(""), it.next().unwrap_or(""), it.next().unwrap_or(""))
+}
+
+fn fp_item(kind: &str, path: &str, note: &str) -> gtk::StringObject {
+    gtk::StringObject::new(&format!("{kind}\t{path}\t{note}"))
+}
+
+/// One folder's entries for the tree, folders first; `.git` left out, ignored ones marked.
+fn folder_model(dir: &Path, ignored: &HashSet<PathBuf>) -> gio::ListStore {
+    let store = gio::ListStore::new::<gtk::StringObject>();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        store.append(&fp_item("note", "", "can't read this folder"));
+        return store;
+    };
+    let mut entries: Vec<(bool, String, PathBuf)> = rd
+        .filter_map(Result::ok)
+        .map(|e| (e.path().is_dir(), e.file_name().to_string_lossy().into_owned(), e.path()))
+        .filter(|(_, n, _)| n != ".git")
+        .collect();
+    entries.sort_by(|a, b| (!a.0, a.1.to_lowercase()).cmp(&(!b.0, b.1.to_lowercase())));
+    if entries.is_empty() {
+        store.append(&fp_item("note", "", "empty folder"));
+    }
+    for (is_dir, _, p) in entries {
+        let ign = p.ancestors().any(|a| ignored.contains(a));
+        store.append(&fp_item(if is_dir { "dir" } else { "file" }, &p.to_string_lossy(), if ign { "ignored" } else { "" }));
+    }
+    store
+}
+
 /// The session the kitty Plane window has in its pane, if it's running (read-only).
 fn kitty_plane_shows() -> Option<String> {
     let runtime = plane_core::control::socket_path().parent()?.to_path_buf();
@@ -2176,6 +2921,11 @@ fn help_page() -> gtk::Widget {
         ("q", "quit (sessions go on)"),
         ("#", "TABS"),
         ("× on a tab", "hide it; the session keeps running"),
+        ("#", "FILES"),
+        ("click a path", "open it in a tab"),
+        ("f / Files", "a session's changed files and folder"),
+        ("Ctrl+S  Ctrl+F", "save · find"),
+        ("Ctrl+W", "close the file"),
         ("#", "TIP"),
         ("", "In a session, ← on an empty prompt opens Claude's own list; Enter there comes back."),
     ];
