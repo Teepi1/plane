@@ -38,8 +38,22 @@ fn claude_bin() -> String {
 
 /// Your shell, to compare plain terminal behaviour with kitty.
 fn shell_choice() -> Choice {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    Choice { label: "Your shell (to compare)".into(), argv: vec![shell], cwd: Some(home().to_string_lossy().into_owned()) }
+    Choice { label: "Your shell (to compare)".into(), argv: vec![login_shell()], cwd: Some(home().to_string_lossy().into_owned()) }
+}
+
+/// Your login shell from your account (what kitty runs by default), not $SHELL: $SHELL can be
+/// left over from whatever launched Plane, and here it named zsh while the account uses fish.
+fn login_shell() -> String {
+    let uid = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("Uid:").and_then(|r| r.split_whitespace().next().map(str::to_owned))));
+    let from_getent = uid.and_then(|uid| std::process::Command::new("getent").args(["passwd", &uid]).output().ok())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|line| line.trim_end().rsplit(':').next().map(str::to_owned))
+        .filter(|s| !s.is_empty() && Path::new(s).exists());
+    from_getent
+        .or_else(|| std::env::var("SHELL").ok())
+        .unwrap_or_else(|| "/bin/sh".into())
 }
 
 /// Your shell first, then every live background session. Slow (`claude agents` takes about
