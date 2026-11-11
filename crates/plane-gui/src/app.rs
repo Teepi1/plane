@@ -90,7 +90,7 @@ enum TabKind {
     /// Attached to a background session (its job id).
     Session(String),
     /// Running `claude --bg`, waiting to learn the job id.
-    Starting,
+    Starting(Option<PathBuf>),
     /// A handoff's prompt, read-only (the handoff's id).
     Prompt(String),
 }
@@ -171,6 +171,10 @@ pub struct App {
     pending_key: RefCell<Option<String>>,
     press: RefCell<(String, f64)>,
     menu_item: RefCell<Option<Item>>,
+    /// What the list and the details panel last showed: a refresh that changes neither
+    /// (most of them) costs no layout.
+    shown_print: RefCell<String>,
+    shown_details: RefCell<String>,
     scale: Rc<Cell<f64>>,
     colors: RefCell<HashMap<String, gdk::RGBA>>,
     provider: gtk::CssProvider,
@@ -287,6 +291,7 @@ impl App {
         let scroller = gtk::ScrolledWindow::new();
         scroller.add_css_class("list");
         scroller.set_hscrollbar_policy(gtk::PolicyType::Never);
+        scroller.set_kinetic_scrolling(false); // a flick doesn't keep the list gliding
         scroller.set_child(Some(&list));
         scroller.set_vexpand(true);
         stack.add_named(&scroller, Some("list"));
@@ -302,6 +307,7 @@ impl App {
         ns_folders.set_activate_on_single_click(true);
         let folder_scroll = gtk::ScrolledWindow::new();
         folder_scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
+        folder_scroll.set_kinetic_scrolling(false);
         folder_scroll.set_child(Some(&ns_folders));
         folder_scroll.set_vexpand(true);
         let ns_entry = gtk::Entry::new();
@@ -428,6 +434,8 @@ impl App {
             pending_key: RefCell::new(None),
             press: RefCell::new((String::new(), 0.0)),
             menu_item: RefCell::new(None),
+            shown_print: RefCell::new(String::new()),
+            shown_details: RefCell::new(String::new()),
             scale: Rc::new(Cell::new(1.0)),
             colors: RefCell::new(theme::colors(&defines)),
             provider,
@@ -891,6 +899,21 @@ impl App {
         let selected = self.selected_key();
         let sel_index = self.list.selected_row().map(|r| r.index()).unwrap_or(0);
         let frozen = self.focus_in.get() || self.hover.get();
+        // the rows as they'd look: when that's unchanged, only the small things need updating
+        let shown_id = self.shown_session();
+        let mut print = format!("{frozen}|{shown_id:?}|{}|{}\n", self.snap.borrow().handoffs.len(), self.pending_key.borrow().is_some());
+        for it in &items {
+            print.push_str(&format!("{}|{:?}|{}|{:?}\n", it.key, it.section, it.sub, self.row_look(it)));
+        }
+        if *self.shown_print.borrow() == print {
+            *self.items.borrow_mut() = items; // fresh data behind the same rows, for actions
+            self.show_attention();
+            self.show_usage();
+            self.show_details();
+            self.show_message();
+            return;
+        }
+        *self.shown_print.borrow_mut() = print;
         {
             let placed = self.placed.borrow();
             let mut order = self.order.borrow_mut();
@@ -1137,11 +1160,16 @@ impl App {
     }
 
     fn show_details(&self) {
+        let item = self.current();
+        let lines = item.as_ref().map(|i| self.detail_lines(i)).unwrap_or_default();
+        let print = format!("{:?}|{lines:?}", item.as_ref().map(|i| &i.key));
+        if *self.shown_details.borrow() == print {
+            return;
+        }
+        *self.shown_details.borrow_mut() = print;
         while let Some(c) = self.details.first_child() {
             self.details.remove(&c);
         }
-        let item = self.current();
-        let lines = item.as_ref().map(|i| self.detail_lines(i)).unwrap_or_default();
         for (text, style, max) in lines {
             let l = label(&text, &[if style.is_empty() { "dim" } else { style }]);
             l.set_wrap(true);
@@ -1313,7 +1341,7 @@ impl App {
     }
 
     fn forward_paste(self: &Rc<Self>) {
-        let term = self.current_tab().filter(|t| matches!(*t.kind.borrow(), TabKind::Session(_) | TabKind::Starting)).and_then(|t| t.term.clone());
+        let term = self.current_tab().filter(|t| matches!(*t.kind.borrow(), TabKind::Session(_) | TabKind::Starting(_))).and_then(|t| t.term.clone());
         match term {
             Some(t) => {
                 t.paste_clipboard();
@@ -1559,7 +1587,7 @@ impl App {
             }
             let kind = tab.kind.borrow().clone();
             match kind {
-                TabKind::Starting => {} // handled by the start itself
+                TabKind::Starting(_) => {} // handled by the start itself
                 _ => {
                     term.feed(b"\r\n\x1b[2mThis view ended. The session keeps running unless you closed it; open it again from the list.\x1b[0m\r\n");
                     app.store.poke();
@@ -1574,6 +1602,7 @@ impl App {
         let title_label = gtk::Label::new(Some(title));
         title_label.set_ellipsize(pango::EllipsizeMode::End);
         title_label.set_max_width_chars(24);
+        title_label.set_width_chars(title.chars().count().min(24) as i32);
         let close = gtk::Button::from_icon_name("window-close-symbolic");
         close.add_css_class("flat");
         close.set_focusable(false);
@@ -1630,6 +1659,15 @@ impl App {
 
     fn close_tab(self: &Rc<Self>, tab: &Rc<Tab>) {
         tab.closing.set(true);
+        // a handoff still starting (at a trust prompt, say) stops with its tab: back in the queue
+        if let TabKind::Starting(Some(done)) = tab.kind.borrow().clone() {
+            let started = plane_core::read_json(&done).is_some_and(|h| truthy(pget(&h, "launchedSessionId")));
+            if !started && done.exists() {
+                actions::handoff_not_started(&self.env, &mut Fs::new(Mode::Real), &done);
+                self.say("not started · the handoff is back in the queue", "info");
+                self.store.poke();
+            }
+        }
         if let Some(n) = self.notebook.page_num(&tab.page) {
             self.notebook.remove_page(Some(n));
         }
@@ -1692,14 +1730,14 @@ impl App {
             .map(|d| d.filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
             .unwrap_or_default();
         self.make_room();
-        let tab = self.add_term_tab(TabKind::Starting, title, cwd);
+        let tab = self.add_term_tab(TabKind::Starting(opts.handoff.clone()), title, cwd);
         let Some(t) = tab.term.clone() else { return };
         let weak = Rc::downgrade(self);
         let w_tab = Rc::downgrade(&tab);
         let cwd_s = cwd.to_owned();
         t.connect_child_exited(move |term, _| {
             let (Some(app), Some(tab)) = (weak.upgrade(), w_tab.upgrade()) else { return };
-            if *tab.kind.borrow() != TabKind::Starting || tab.closing.get() {
+            if !matches!(*tab.kind.borrow(), TabKind::Starting(_)) || tab.closing.get() {
                 return;
             }
             let text = term.text_format(vte::Format::Text).map(|s| s.to_string()).unwrap_or_default();

@@ -93,8 +93,9 @@ list.sessions row.urgent .name { font-weight: bold; }
 .keys .heading { color: @plane_accent; font-weight: bold; font-size: 0.85em; letter-spacing: 1px; padding-top: 8px; }
 paned > separator { background: @plane_outline; background-image: none; min-width: 1px; margin: 0; }
 notebook > header { background: alpha(@term_bg, 0.8); border: none; box-shadow: none; }
-notebook > header tabs > tab { color: @plane_dim; padding: 4px 6px 4px 12px; min-height: 22px; border: none; }
-notebook > header tabs > tab:checked { color: @plane_fg; box-shadow: inset 0 -2px @plane_accent; }
+notebook > header tabs > tab { background: transparent; color: @plane_dim; padding: 4px 6px 4px 12px; min-height: 22px; border: none; }
+notebook > header tabs > tab:checked { background: alpha(@term_0, 0.9); color: @plane_fg; box-shadow: inset 0 -2px @plane_accent; }
+notebook > header tabs > tab:hover:not(:checked) { background: alpha(@term_0, 0.5); }
 notebook > header tabs > tab button { padding: 0; min-width: 18px; min-height: 18px; }
 notebook > stack { background: transparent; }
 vte-terminal { padding: 25px; }

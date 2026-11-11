@@ -24,15 +24,26 @@ pub fn arm(window: &gtk::ApplicationWindow, press: std::rc::Rc<dyn Fn(&str)>) {
     let w = window.clone();
     glib::timeout_add_local_once(std::time::Duration::from_secs_f64(after), move || {
         let (width, height) = (w.width(), w.height());
-        let paintable = gtk::WidgetPaintable::new(Some(&w));
+        let content = w.child().unwrap_or_else(|| w.clone().upcast());
+
         let snap = gtk::Snapshot::new();
-        paintable.snapshot(&snap, width as f64, height as f64);
-        if let Some(node) = snap.to_node() {
-            let renderer = gsk::CairoRenderer::new();
-            if renderer.realize_for_display(&gdk::Display::default().unwrap()).is_ok() {
-                let tex = renderer.render_texture(&node, Some(&gtk::graphene::Rect::new(0.0, 0.0, width as f32, height as f32)));
-                let _ = tex.save_to_png(&path);
-                renderer.unrealize();
+        // broadway with no browser watching stops laying out and drawing: do both here
+        content.allocate(width, height, -1, None);
+        w.snapshot_child(&content, &snap);
+        match snap.to_node() {
+            None => eprintln!("plane shot: nothing drawn"),
+            Some(node) => {
+                let renderer = gsk::CairoRenderer::new();
+                match renderer.realize_for_display(&gdk::Display::default().unwrap()) {
+                    Err(e) => eprintln!("plane shot: no renderer: {e}"),
+                    Ok(()) => {
+                        let tex = renderer.render_texture(&node, Some(&gtk::graphene::Rect::new(0.0, 0.0, width as f32, height as f32)));
+                        if let Err(e) = tex.save_to_png(&path) {
+                            eprintln!("plane shot: can't save: {e}");
+                        }
+                        renderer.unrealize();
+                    }
+                }
             }
         }
         w.close();

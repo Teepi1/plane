@@ -76,6 +76,8 @@ pub fn new_terminal(theme: &HashMap<String, gdk::RGBA>, scale: Rc<Cell<f64>>, cw
     term.set_font(Some(&pango::FontDescription::from_string("monospace 11")));
     term.set_font_scale(scale.get());
     term.set_scrollback_lines(10_000);
+    // a touchpad scrolls by the distance your fingers move, not that many whole lines
+    term.set_scroll_unit_is_pixels(true);
     term.set_mouse_autohide(true);
     term.set_allow_hyperlink(true);
     term.set_audible_bell(false);
