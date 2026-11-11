@@ -5,6 +5,7 @@
 //! `str()` rules are spelled out by the helpers here, and every write goes through [`Fs`],
 //! which can record writes instead of making them.
 
+pub mod actions;
 pub mod ledger;
 pub mod snapshot;
 pub mod state;
@@ -154,6 +155,38 @@ impl Fs {
             Mode::Record => self.writes.push(serde_json::json!({ "op": "unlink", "path": env.short(path) })),
             Mode::Real => {
                 let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    /// `os.replace(from, to)`: atomic, and it fails when `from` is already gone, which is how
+    /// a claim tells that someone else got there first.
+    pub fn rename(&mut self, env: &Env, from: &Path, to: &Path) -> std::io::Result<()> {
+        match self.mode {
+            Mode::Record => {
+                if !from.exists() {
+                    return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+                }
+                self.writes.push(serde_json::json!({ "op": "rename", "path": env.short(from), "to": env.short(to) }));
+                Ok(())
+            }
+            Mode::Real => {
+                if let Some(parent) = to.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::rename(from, to)
+            }
+        }
+    }
+
+    /// `os.utime(path)`: set its modification time to now.
+    pub fn touch(&mut self, env: &Env, path: &Path) {
+        match self.mode {
+            Mode::Record => self.writes.push(serde_json::json!({ "op": "touch", "path": env.short(path) })),
+            Mode::Real => {
+                if let Ok(f) = std::fs::File::options().append(true).open(path) {
+                    let _ = f.set_modified(std::time::SystemTime::now());
+                }
             }
         }
     }
