@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/plane-gui"]
+members = ["crates/plane-core", "crates/plane-cli", "crates/plane-gui"]
 
 [profile.release]
 opt-level = 3

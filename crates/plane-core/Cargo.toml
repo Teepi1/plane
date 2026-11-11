@@ -1,0 +1,9 @@
+[package]
+name = "plane-core"
+version = "0.1.0"
+edition = "2021"
+description = "Plane's session logic, with no GUI: shared by the plane command, the app and the phone server"
+license = "MIT"
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }

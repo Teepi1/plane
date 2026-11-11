@@ -1,0 +1,14 @@
+[package]
+name = "plane-cli"
+version = "0.1.0"
+edition = "2021"
+description = "The plane command, built as plane-next while it runs beside the Python version"
+license = "MIT"
+
+[[bin]]
+name = "plane-next"
+path = "src/main.rs"
+
+[dependencies]
+plane-core = { path = "../plane-core" }
+serde_json = { version = "1", features = ["preserve_order"] }
