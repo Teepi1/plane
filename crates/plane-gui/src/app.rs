@@ -102,6 +102,8 @@ struct Tab {
     shown_at: Cell<f64>,
     /// The tab is being taken away: its terminal's exit isn't news.
     closing: Cell<bool>,
+    /// Its terminal runs `claude attach`, which takes the mouse wheel (see term.rs).
+    wheel_to_app: Rc<Cell<bool>>,
 }
 
 enum Step {
@@ -1576,8 +1578,9 @@ impl App {
                 app.say(&text, "info");
             }
         });
-        let t = term::new_terminal(&self.colors.borrow(), self.scale.clone(), cwd.to_owned(), say);
-        let tab = self.add_tab(kind, title, t.clone().upcast(), Some(t.clone()));
+        let wheel = Rc::new(Cell::new(matches!(kind, TabKind::Session(_))));
+        let t = term::new_terminal(&self.colors.borrow(), self.scale.clone(), cwd.to_owned(), say, wheel.clone());
+        let tab = self.add_tab(kind, title, t.clone().upcast(), Some(t.clone()), wheel);
         let weak = Rc::downgrade(self);
         let w_tab = Rc::downgrade(&tab);
         t.connect_child_exited(move |term, _| {
@@ -1597,7 +1600,7 @@ impl App {
         tab
     }
 
-    fn add_tab(self: &Rc<Self>, kind: TabKind, title: &str, page: gtk::Widget, term: Option<vte::Terminal>) -> Rc<Tab> {
+    fn add_tab(self: &Rc<Self>, kind: TabKind, title: &str, page: gtk::Widget, term: Option<vte::Terminal>, wheel_to_app: Rc<Cell<bool>>) -> Rc<Tab> {
         let head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         let title_label = gtk::Label::new(Some(title));
         title_label.set_ellipsize(pango::EllipsizeMode::End);
@@ -1612,7 +1615,7 @@ impl App {
         }));
         head.append(&title_label);
         head.append(&close);
-        let tab = Rc::new(Tab { kind: RefCell::new(kind), page: page.clone(), term, shown_at: Cell::new(now()), closing: Cell::new(false) });
+        let tab = Rc::new(Tab { kind: RefCell::new(kind), page: page.clone(), term, shown_at: Cell::new(now()), closing: Cell::new(false), wheel_to_app });
         let weak = Rc::downgrade(self);
         let w_tab = Rc::downgrade(&tab);
         close.connect_clicked(move |_| {
@@ -1751,6 +1754,7 @@ impl App {
                     *tab.kind.borrow_mut() = TabKind::Session(id.clone());
                     let argv = vec![claude.clone(), "attach".into(), id];
                     term::spawn(term, &argv, &cwd_s, |_| {});
+                    tab.wheel_to_app.set(true);
                     app.mark_shown();
                 }
                 None => {
@@ -1994,7 +1998,7 @@ impl App {
         scroll.set_hexpand(true);
         scroll.set_vexpand(true);
         let title = format!("handoff: {}", sval(h, "title"));
-        self.add_tab(TabKind::Prompt(id), &title, scroll.upcast(), None);
+        self.add_tab(TabKind::Prompt(id), &title, scroll.upcast(), None, Rc::new(Cell::new(false)));
     }
 
     // ------------------------------------------------------------------ pages
