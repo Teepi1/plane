@@ -20,7 +20,7 @@ const PATH_RE: &str = r"(?:~|\.{1,2})?/?[\w.\-]+(?:/[\w.\-]+)*\.[A-Za-z0-9]{1,8}
 /// Lines per mouse-wheel notch in a terminal's own scrollback (kitty's default).
 const WHEEL_LINES: f64 = 5.0;
 /// Touchpad, in a session: finger travel (pixels) per wheel click sent to Claude.
-const TOUCHPAD_PX_PER_CLICK: f64 = 60.0;
+const TOUCHPAD_PX_PER_CLICK: f64 = 30.0;
 /// The terminal's padding (`vte-terminal { padding: 25px }`), to find the cell under the pointer.
 const PADDING: f64 = 25.0;
 
