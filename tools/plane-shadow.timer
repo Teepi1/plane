@@ -1,0 +1,10 @@
+[Unit]
+Description=Plane: compare the Rust port with the Python version every 10 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

@@ -16,6 +16,7 @@ import json
 import math
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -57,26 +58,63 @@ def diffs(a, b, path="", out=None):
     return out
 
 
+def freeze_home():
+    """A copy of every file the refresh reads, so both versions see the same moment.
+
+    Sessions keep writing their job and status files while they work, and the status line
+    rewrites usage.json often; without a copy, the two runs a second apart would read
+    different files and disagree for no fault of the port. /proc stays live (pids are
+    checked against running processes), and branch names come from the real folders.
+    """
+    real = pathlib.Path.home()
+    root = pathlib.Path(tempfile.mkdtemp(prefix="plane-shadow-"))
+    agents = subprocess.run([claude_bin(), "agents", "--json", "--all"], capture_output=True, text=True, timeout=30).stdout
+    (root / "agents.json").write_text(agents)
+    for rel in (".claude/sessions", ".local/share/plane/live", ".local/share/plane/handoffs"):
+        src = real / rel
+        if src.is_dir():
+            dst = root / rel
+            dst.mkdir(parents=True)
+            for f in src.glob("*.json"):
+                if f.is_file():
+                    shutil.copy2(f, dst / f.name)
+    jobs = real / ".claude/jobs"
+    for d in (jobs.iterdir() if jobs.is_dir() else []):
+        if d.is_dir():
+            dst = root / ".claude/jobs" / d.name
+            dst.mkdir(parents=True, exist_ok=True)  # the job folder existing matters on its own
+            if (d / "state.json").is_file():
+                shutil.copy2(d / "state.json", dst / "state.json")
+    usage = real / ".cache/plane/usage.json"
+    if usage.is_file():
+        (root / ".cache/plane").mkdir(parents=True)
+        shutil.copy2(usage, root / ".cache/plane/usage.json")
+    return root
+
+
 def run_both(home):
-    env = dict(os.environ)
-    if home:
-        env["HOME"] = home
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-        agents = subprocess.run([claude_bin(), "agents", "--json", "--all"], capture_output=True, text=True,
-                                timeout=30).stdout if not home else (pathlib.Path(home) / "agents.json").read_text()
-        f.write(agents)
-        agents_file = f.name
+    env = dict(os.environ, HOME=home)
+    agents_file = pathlib.Path(home) / "agents.json"
+    agents = agents_file.read_text()
     now = f"{time.time():.6f}"
-    try:
-        py = subprocess.run([sys.executable, "-I", str(HERE / "py_snapshot.py"), "--agents", agents_file, "--now", now],
-                            capture_output=True, text=True, env=env, timeout=60)
-        rs = subprocess.run([str(RUST), "snapshot", "--agents", agents_file, "--now", now] + (["--home", home] if home else []),
-                            capture_output=True, text=True, env=env, timeout=60)
-    finally:
-        os.unlink(agents_file)
+    py = subprocess.run([sys.executable, "-I", str(HERE / "py_snapshot.py"), "--agents", str(agents_file), "--now", now],
+                        capture_output=True, text=True, env=env, timeout=60)
+    rs = subprocess.run([str(RUST), "snapshot", "--agents", str(agents_file), "--now", now, "--home", home],
+                        capture_output=True, text=True, env=env, timeout=60)
     if py.returncode or rs.returncode:
         raise SystemExit(f"shadow: a run failed\npython: {py.stderr[-800:]}\nrust: {rs.stderr[-800:]}")
     return agents, json.loads(py.stdout), json.loads(rs.stdout)
+
+
+def compare(fixture):
+    """Run both on a fixture home, or on a frozen copy of the real one."""
+    if fixture:
+        return run_both(fixture)
+    root = freeze_home()
+    try:
+        return run_both(str(root))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def main():
@@ -86,10 +124,10 @@ def main():
     args = ap.parse_args()
     if not RUST.exists():
         raise SystemExit(f"shadow: build it first (cargo build --release -p plane-cli): {RUST} is missing")
-    agents, py, rs = run_both(args.home)
+    agents, py, rs = compare(args.home)
     found = diffs(py, rs)
     if found:  # maybe a process started or stopped between the two runs: look once more
-        agents, py, rs = run_both(args.home)
+        agents, py, rs = compare(args.home)
         found = diffs(py, rs)
     n = len(py.get("sessions", []))
     if not found:

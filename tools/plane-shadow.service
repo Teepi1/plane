@@ -1,0 +1,9 @@
+[Unit]
+Description=Plane: compare the Rust port with the Python version (read-only)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I %h/Documents/Programming/plane/.claude/worktrees/native-app/tools/shadow.py --quiet
+Nice=15
+IOSchedulingClass=idle
+TimeoutStartSec=120
