@@ -57,6 +57,7 @@ pub struct Editor {
     show_btn: gtk::Button,
     who: gtk::Label,
     changes_btn: gtk::ToggleButton,
+    find_btn: gtk::Button,
     save_btn: gtk::Button,
     // the bar for trouble: a conflict, a deleted file, a failed save
     banner: gtk::Box,
@@ -90,9 +91,13 @@ pub struct Editor {
     hooks: Hooks,
 }
 
+/// What the status line says when nothing else is going on: true, and what the tab is for.
+const LIVE_NOTE: &str = "Live: edits by sessions appear here";
+
 fn button(text: &str) -> gtk::Button {
     let b = gtk::Button::with_label(text);
     b.set_focusable(false);
+    b.set_cursor_from_name(Some("pointer"));
     b
 }
 
@@ -237,16 +242,29 @@ impl Editor {
         who.set_hexpand(true);
         who.set_xalign(1.0);
         who.set_ellipsize(pango::EllipsizeMode::Start);
+        let find_btn = gtk::Button::new();
+        let fb = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+        fb.append(&gtk::Image::from_icon_name("edit-find-symbolic"));
+        fb.append(&gtk::Label::new(Some("Find")));
+        find_btn.set_child(Some(&fb));
+        find_btn.set_focusable(false);
+        find_btn.set_tooltip_text(Some("Find in this file (Ctrl+F)"));
         let changes_btn = gtk::ToggleButton::with_label("Changes");
         changes_btn.set_focusable(false);
-        changes_btn.set_tooltip_text(Some("What's different from the last commit"));
+        changes_btn.set_tooltip_text(Some("What's different from the last commit: lines added, changed and removed"));
         let save_btn = button("Saved");
         save_btn.set_sensitive(false);
         save_btn.set_tooltip_text(Some("Ctrl+S"));
+        for b in [&find_btn, changes_btn.upcast_ref(), &save_btn] {
+            b.set_cursor_from_name(Some("pointer"));
+        }
+        note.add_css_class("dim");
+        note.set_text(LIVE_NOTE);
         bar.append(&where_);
         bar.append(&note);
         bar.append(&show_btn);
         bar.append(&who);
+        bar.append(&find_btn);
         bar.append(&changes_btn);
         bar.append(&save_btn);
 
@@ -365,6 +383,7 @@ impl Editor {
             show_btn,
             who,
             changes_btn,
+            find_btn,
             save_btn,
             banner,
             banner_text,
@@ -409,7 +428,19 @@ impl Editor {
                 } else {
                     ed.save_btn.remove_css_class("suggested-action");
                 }
+                // the status line: what's true now (a save or a take-in says more after this)
+                if dirty {
+                    ed.set_note("Unsaved · Ctrl+S saves", "warn", None);
+                } else {
+                    ed.set_note("", "", None);
+                }
                 (ed.hooks.dirty)(dirty);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.find_btn.connect_clicked(move |_| {
+            if let Some(ed) = weak.upgrade() {
+                ed.open_find();
             }
         });
         let weak = Rc::downgrade(self);
@@ -750,9 +781,11 @@ impl Editor {
         self.compare_btn.set_label(if self.stack.visible_child_name().as_deref() == Some("compare") { "Hide comparison" } else { "Compare" });
     }
 
+    /// The status line beside the path. Empty text puts back the standing note.
     fn set_note(&self, text: &str, tone: &str, show_line: Option<i32>) {
+        let (text, tone) = if text.is_empty() { (LIVE_NOTE, "dim") } else { (text, tone) };
         self.note.set_text(text);
-        for t in ["ok", "accent", "warn"] {
+        for t in ["ok", "accent", "warn", "dim"] {
             self.note.remove_css_class(t);
         }
         if !tone.is_empty() {
@@ -917,6 +950,17 @@ impl Editor {
         });
     }
 
+    /// "Changes · N" on the button: lines added, changed and removed, kept up to date.
+    fn show_change_count(&self, n: usize, since: &str) {
+        self.changes_btn.set_label(&format!("Changes · {n}"));
+        let tip = match n {
+            0 => format!("No lines changed since {since}"),
+            1 => format!("1 line changed since {since}: click to see it"),
+            n => format!("{n} lines changed since {since}: click to see them"),
+        };
+        self.changes_btn.set_tooltip_text(Some(&tip));
+    }
+
     /// The bars beside the line numbers: lines added or changed since the last commit, and
     /// where lines were removed.
     fn update_marks(&self) {
@@ -926,10 +970,14 @@ impl Editor {
             b.remove_source_marks(&s, &e, Some(cat));
         }
         let base = self.base.borrow();
+        let since = if matches!(*base, Base::Head(_)) { "the last commit" } else { "you opened it (it isn't in git)" };
         if matches!(*base, Base::Opened(_)) && !b.is_modified() && text_of(b) == base.text() {
+            self.show_change_count(0, since);
             return;
         }
         let m = files::line_marks(base.text(), &text_of(b));
+        let removed: usize = m.removed.iter().map(|(_, n)| *n).sum();
+        self.show_change_count(m.added.len() + m.changed.len() + removed, since);
         let last = (b.line_count() - 1).max(0) as usize;
         for (cat, lines) in [(MARK_ADDED, &m.added), (MARK_CHANGED, &m.changed)] {
             for &l in lines.iter() {

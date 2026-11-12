@@ -123,6 +123,19 @@ pub fn new_terminal(theme: &HashMap<String, gdk::RGBA>, scale: Rc<Cell<f64>>, op
         let tag = term.match_add_regex(&re, 0);
         term.match_set_cursor_name(tag, "pointer");
     }
+    // a path or link under the pointer says what a click does
+    term.set_has_tooltip(true);
+    term.connect_query_tooltip(|t, x, y, _, tip| {
+        let (x, y) = (x as f64, y as f64);
+        let text = match t.check_hyperlink_at(x, y) {
+            Some(uri) if uri.starts_with("http://") || uri.starts_with("https://") => "Click to open in the browser",
+            Some(_) => "Click to open in Plane",
+            None if t.check_match_at(x, y).0.is_some() => "Click to open in Plane",
+            None => return false,
+        };
+        tip.set_text(Some(text));
+        true
+    });
 
     // kitty's copy, paste and zoom keys; Shift+Enter becomes a new line (Ctrl+J), since VTE
     // can't tell Shift+Enter from Enter the way kitty's keyboard protocol does
