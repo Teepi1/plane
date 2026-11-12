@@ -187,7 +187,7 @@ textview.editor border.left gutter { padding-right: 6px; }
 .files-page .file-tools button.danger { color: @plane_bad; }
 .files-page .file-tools button:disabled { color: alpha(@plane_dim, 0.6); background: transparent; }
 .files-page listview, .files-page listview > row { background: transparent; color: @plane_fg; }
-.files-page listview > row { padding: 2px 6px; min-height: 28px; border-left: 3px solid transparent; }
+.files-page listview > row { padding: 2px 6px; min-height: 30px; border-left: 3px solid transparent; }
 .files-page listview > row:selected { background: @term_0; border-left-color: @plane_accent; }
 .files-page listview > row:selected .name { font-weight: bold; }
 .files-page treeexpander.group-head { min-height: 32px; margin-top: 6px; }
