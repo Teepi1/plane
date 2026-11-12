@@ -559,9 +559,204 @@ pub fn transcripts(claude_dir: &Path, session_id: &str) -> Vec<PathBuf> {
     out
 }
 
+// ---------------------------------------------------------------- finding a file by name
+
+/// Most files listed for a folder that isn't a repository.
+pub const LIST_CAP: usize = 20_000;
+
+/// Every file under `root`, relative to it, for finding one by name. In a repository: what
+/// git tracks plus untracked files it doesn't ignore. Elsewhere: a walk that leaves out
+/// `.git` and `node_modules` and stops at [`LIST_CAP`] files.
+pub fn file_list(root: &Path) -> Vec<String> {
+    if repo_root(root).is_some() {
+        if let Some(out) = git(root, &["ls-files", "-co", "--exclude-standard", "-z"]) {
+            let mut seen = std::collections::HashSet::new();
+            return out
+                .split(|b| *b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .filter(|p| root.join(p).is_file() && seen.insert(p.clone())) // not deleted ones
+                .collect();
+        }
+    }
+    let mut out = vec![];
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(d) = dirs.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.filter_map(Result::ok) {
+            let Ok(t) = e.file_type() else { continue };
+            let p = e.path();
+            if t.is_dir() {
+                let n = e.file_name();
+                if n != ".git" && n != "node_modules" {
+                    dirs.push(p);
+                }
+            } else if t.is_file() || (t.is_symlink() && p.is_file()) {
+                if let Ok(rel) = p.strip_prefix(root) {
+                    out.push(rel.to_string_lossy().into_owned());
+                }
+                if out.len() >= LIST_CAP {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Letters of `q` in order in `text` (any case): a score, or None if they aren't all there.
+/// A letter at the start of a word or right after the one before counts extra.
+fn in_order(q: &[char], text: &str) -> Option<i64> {
+    let chars: Vec<char> = text.chars().collect();
+    let (mut score, mut qi, mut prev) = (0i64, 0usize, None::<usize>);
+    for (i, c) in chars.iter().enumerate() {
+        if qi == q.len() {
+            break;
+        }
+        if c.to_lowercase().eq(q[qi].to_lowercase()) {
+            let word_start = i == 0 || matches!(chars[i - 1], '/' | '_' | '-' | '.' | ' ') || (c.is_uppercase() && chars[i - 1].is_lowercase());
+            score += 1 + if word_start { 8 } else { 0 } + if prev.is_some_and(|p| p + 1 == i) { 5 } else { 0 };
+            prev = Some(i);
+            qi += 1;
+        }
+    }
+    (qi == q.len()).then_some(score)
+}
+
+/// How well `query` matches a file's relative `path`, higher is better, or None. A match in
+/// the file name beats one spread over its folders; the name starting with, or containing,
+/// what you typed beats letters picked out of it; shorter paths win ties.
+pub fn fuzzy_score(query: &str, path: &str) -> Option<i64> {
+    let q: Vec<char> = query.chars().filter(|c| !c.is_whitespace()).collect();
+    if q.is_empty() {
+        return Some(0);
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let typed: String = q.iter().collect::<String>().to_lowercase();
+    let short = -(path.chars().count() as i64);
+    if let Some(s) = in_order(&q, name) {
+        let lname = name.to_lowercase();
+        let bonus = if lname.starts_with(&typed) { 300 } else if lname.contains(&typed) { 150 } else { 0 };
+        return Some(10_000 + bonus + s * 4 + short);
+    }
+    let bonus = if path.to_lowercase().contains(&typed) { 150 } else { 0 };
+    in_order(&q, path).map(|s| bonus + s * 4 + short)
+}
+
+/// The best `limit` matches for `query` among `paths`, best first.
+pub fn find_files(query: &str, paths: &[String], limit: usize) -> Vec<String> {
+    let mut hits: Vec<(i64, &String)> = paths.iter().filter_map(|p| fuzzy_score(query, p).map(|s| (s, p))).collect();
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    hits.into_iter().take(limit).map(|(_, p)| p.clone()).collect()
+}
+
+// ---------------------------------------------------------------- new, rename
+
+/// What's wrong with a typed file or folder name, in words for beside the field.
+pub fn name_problem(name: &str) -> Option<&'static str> {
+    if name.trim().is_empty() {
+        Some("type a name")
+    } else if name.contains('/') {
+        Some("names can't contain /")
+    } else if name == "." || name == ".." {
+        Some("that name means a folder itself")
+    } else if name.contains('\0') {
+        Some("names can't contain that character")
+    } else {
+        None
+    }
+}
+
+fn taken(path: &Path) -> Option<String> {
+    let meta = path.symlink_metadata().ok()?;
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    Some(format!("a {} called {name} already exists", if meta.is_dir() { "folder" } else { "file" }))
+}
+
+/// Makes a new empty file or folder. Never replaces anything already there.
+pub fn create(path: &Path, is_dir: bool) -> Result<(), String> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if let Some(p) = name_problem(&name) {
+        return Err(p.into());
+    }
+    if let Some(t) = taken(path) {
+        return Err(t);
+    }
+    let r = if is_dir { std::fs::create_dir(path) } else { std::fs::OpenOptions::new().write(true).create_new(true).open(path).map(|_| ()) };
+    r.map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => taken(path).unwrap_or_else(|| "that name is taken".into()),
+        _ => e.to_string(),
+    })
+}
+
+/// Renames (or moves) `from` to `to`. Never replaces anything already at `to`.
+pub fn rename(from: &Path, to: &Path) -> Result<(), String> {
+    let name = to.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if let Some(p) = name_problem(&name) {
+        return Err(p.into());
+    }
+    if from == to {
+        return Ok(());
+    }
+    if let Some(t) = taken(to) {
+        return Err(t);
+    }
+    std::fs::rename(from, to).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fuzzy() {
+        // the file name first, then shorter paths
+        let paths: Vec<String> = ["crates/plane-gui/src/app.rs", "crates/plane-core/src/actions.rs", "docs/apps/readme.md", "src/a/p/p.rs"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(find_files("app", &paths, 10)[0], "crates/plane-gui/src/app.rs");
+        assert_eq!(find_files("APP.RS", &paths, 10)[0], "crates/plane-gui/src/app.rs");
+        assert!(fuzzy_score("acts", "crates/plane-core/src/actions.rs").is_some());
+        assert_eq!(fuzzy_score("xyz", "crates/plane-gui/src/app.rs"), None);
+        // spread over folders still matches, below name matches
+        assert!(fuzzy_score("guiapp", "crates/plane-gui/src/app.rs").is_some());
+        assert!(fuzzy_score("app", "src/app.rs").unwrap() > fuzzy_score("app", "docs/apps/readme.md").unwrap_or(i64::MIN));
+        assert_eq!(find_files("", &paths, 2).len(), 2);
+    }
+
+    #[test]
+    fn listing_files() {
+        let d = std::env::temp_dir().join(format!("plane-list-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("a/b")).unwrap();
+        std::fs::create_dir_all(d.join("node_modules/x")).unwrap();
+        std::fs::create_dir_all(d.join(".git")).unwrap();
+        std::fs::write(d.join("a/b/c.txt"), "").unwrap();
+        std::fs::write(d.join("top.md"), "").unwrap();
+        std::fs::write(d.join("node_modules/x/i.js"), "").unwrap();
+        // a folder named .git that isn't a real repository: walked, minus .git and node_modules
+        let mut l = file_list(&d);
+        l.sort();
+        assert_eq!(l, vec!["a/b/c.txt".to_string(), "top.md".to_string()]);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn new_and_rename() {
+        let d = std::env::temp_dir().join(format!("plane-new-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(create(&d.join("x.txt"), false), Ok(()));
+        assert!(d.join("x.txt").is_file());
+        assert_eq!(create(&d.join("x.txt"), false), Err("a file called x.txt already exists".into()));
+        assert_eq!(create(&d.join("sub"), true), Ok(()));
+        assert_eq!(create(&d.join("sub"), false), Err("a folder called sub already exists".into()));
+        assert_eq!(name_problem("a/b"), Some("names can't contain /"));
+        assert_eq!(name_problem("  "), Some("type a name"));
+        std::fs::write(d.join("x.txt"), "keep").unwrap();
+        // rename never replaces
+        assert_eq!(rename(&d.join("sub"), &d.join("x.txt")), Err("a file called x.txt already exists".into()));
+        assert_eq!(rename(&d.join("x.txt"), &d.join("y.txt")), Ok(()));
+        assert_eq!(std::fs::read_to_string(d.join("y.txt")).unwrap(), "keep");
+        assert!(!d.join("x.txt").exists());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
 
     #[test]
     fn links() {

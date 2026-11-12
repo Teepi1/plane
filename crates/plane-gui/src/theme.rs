@@ -177,13 +177,36 @@ notebook > header button.files { margin: 3px 8px; padding: 1px 12px; min-height:
 textview.editor border.left gutter { padding-right: 6px; }
 .file-message { background: alpha(@term_bg, 0.8); color: @plane_dim; }
 .file-message .big { font-size: 1.15em; color: @plane_fg; }
-.files-page .where { color: @plane_dim; }
-.files-page listview, .files-page row { background: transparent; color: @plane_fg; }
-.files-page row { padding: 2px 6px; min-height: 22px; }
-.files-page row:selected { background: @term_0; }
-.files-page .head { color: @plane_fg; font-size: 0.85em; font-weight: bold; letter-spacing: 1px; padding: 10px 0 3px 0; }
+.files-page { padding: 4px 10px 6px 10px; }
+.files-page .where { color: @plane_dim; font-size: 0.9em; padding: 0 2px 2px 2px; }
+.files-page button.folder-btn > button, .files-page menubutton.folder-btn > button { min-height: 34px; padding: 0 10px; background: @term_0; color: @plane_fg; border: 1px solid @plane_outline; border-radius: 7px; box-shadow: none; }
+.files-page .folder-name { font-weight: bold; font-size: 1.05em; }
+.files-page entry.find-file, .files-page searchbar entry, .files-page .find-file { background: @term_0; color: @plane_fg; border: 1px solid @plane_outline; min-height: 30px; margin: 2px 0; }
+.files-page .find-file:focus-within { border-color: @plane_accent; }
+.files-page .file-tools button { padding: 0 4px; min-height: 26px; font-size: 0.9em; background: @term_0; color: @plane_fg; border: 1px solid @plane_outline; box-shadow: none; }
+.files-page .file-tools button.danger { color: @plane_bad; }
+.files-page .file-tools button:disabled { color: alpha(@plane_dim, 0.6); background: transparent; }
+.files-page listview, .files-page listview > row { background: transparent; color: @plane_fg; }
+.files-page listview > row { padding: 2px 6px; min-height: 28px; border-left: 3px solid transparent; }
+.files-page listview > row:selected { background: @term_0; border-left-color: @plane_accent; }
+.files-page listview > row:selected .name { font-weight: bold; }
+.files-page treeexpander.group-head { min-height: 32px; margin-top: 6px; }
+.files-page .group-title { color: @plane_fg; font-size: 1em; font-weight: bold; }
+.files-page .count { font-size: 0.85em; font-weight: bold; color: @plane_fg; background: alpha(@plane_dim, 0.22); border-radius: 9px; padding: 0 7px; }
 .files-page .note { color: @plane_dim; font-size: 0.9em; }
 .files-page .ignored { color: @plane_dim; }
+.files-page .hints { padding: 4px 2px 0 2px; }
+popover.files-pop contents, popover.name-pop contents { background: @plane_bg_alt; color: @plane_fg; padding: 6px; }
+popover.files-pop list { background: transparent; }
+popover.files-pop list row { min-height: 30px; padding: 2px 8px; border-radius: 5px; color: @plane_fg; }
+popover.files-pop list row:hover { background: mix(@term_0, @plane_fg, 0.08); outline: 1px solid alpha(@plane_accent, 0.75); outline-offset: -1px; }
+popover.files-pop .choice-head { color: @plane_dim; font-weight: bold; font-size: 0.85em; padding-top: 6px; }
+popover.name-pop .name-title { font-weight: bold; }
+popover.name-pop entry { background: @term_0; color: @plane_fg; border: 1px solid @plane_outline; }
+popover.name-pop entry:focus-within { border-color: @plane_accent; }
+popover.name-pop .error { color: @plane_bad; }
+popover.name-pop button.suggested-action { background: @plane_primary; color: @plane_on_primary; font-weight: bold; }
+popover.name-pop button.flat { color: @plane_fg; background: transparent; border: 1px solid @plane_outline; }
 ";
 
 pub fn theme_path() -> PathBuf {

@@ -157,6 +157,7 @@ struct Origin {
     root: PathBuf,
     /// The session's job id, when it came from one.
     session: Option<String>,
+    #[allow(dead_code)] // kept for the window title once tabs show their folder
     name: String,
 }
 
@@ -233,11 +234,36 @@ pub struct App {
     ns_hint: gtk::Label,
     ns_state: RefCell<Step>,
     // the files page
-    fp_title: gtk::Label,
+    fp_folder: gtk::MenuButton,
+    fp_folder_label: gtk::Label,
     fp_where: gtk::Label,
+    fp_search: gtk::SearchEntry,
+    fp_new_file: gtk::Button,
+    fp_new_dir: gtk::Button,
+    fp_rename: gtk::Button,
+    fp_trash: gtk::Button,
     fp_store: gio::ListStore,
     fp_tree: gtk::TreeListModel,
+    /// Find-a-file results, shown in place of the groups while the find box has text.
+    fp_hits: gio::ListStore,
+    fp_hits_tree: gtk::TreeListModel,
     fp_view: gtk::ListView,
+    /// Each folder's file list for finding a file, and when it was read.
+    fp_cache: FileCache,
+    /// The open folders being watched, so the tree keeps up with the disk.
+    fp_watch: Watches,
+    fp_root_watch: RefCell<Option<gio::FileMonitor>>,
+    /// The choices in the folder button's list.
+    fp_choices: RefCell<Vec<Follow>>,
+    /// Where a right-click on the files list was (for its menu and the name box).
+    fp_menu_at: Cell<(f64, f64)>,
+    fp_menu_target: RefCell<Option<(PathBuf, bool)>>,
+    /// The folder tree is under the groups ("All files" isn't folded).
+    fp_tree_on: Cell<bool>,
+    /// A file list for finding a file is being read.
+    fp_listing: Cell<bool>,
+    /// The open name box: its field and its confirm (off-screen checks type into it).
+    name_pop: RefCell<Option<(gtk::Entry, Rc<dyn Fn()>)>>,
     fp_origin: RefCell<Option<Origin>>,
     /// Items in the store before the folder tree (the changed lists).
     fp_split: Cell<u32>,
@@ -467,29 +493,81 @@ impl App {
         let fpage = gtk::Box::new(gtk::Orientation::Vertical, 2);
         fpage.add_css_class("page");
         fpage.add_css_class("files-page");
-        let fp_title = label("", &["step"]);
+        // the folder it shows, as a button: other sessions' folders, recent ones, any folder
+        let fp_folder = gtk::MenuButton::new();
+        fp_folder.add_css_class("folder-btn");
+        fp_folder.set_tooltip_text(Some("Show another folder"));
+        fp_folder.set_focus_on_click(false);
+        let fp_folder_label = label("", &["folder-name"]);
+        fp_folder_label.set_ellipsize(pango::EllipsizeMode::End);
+        fp_folder_label.set_hexpand(true);
+        let fb = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        fb.append(&label("📁", &["folder-icon"]));
+        fb.append(&fp_folder_label);
+        fb.append(&label("▾", &["dim"]));
+        fp_folder.set_child(Some(&fb));
+        clickable(&fp_folder);
         let fp_where = label("", &["where"]);
         fp_where.set_ellipsize(pango::EllipsizeMode::Start);
+        let fp_search = gtk::SearchEntry::new();
+        fp_search.set_placeholder_text(Some("Find a file…"));
+        fp_search.add_css_class("find-file");
+        fp_search.set_tooltip_text(Some("Find a file by name (/ or Ctrl+P)"));
+        // new, rename and trash, on the selected row (or the folder itself)
+        let fp_tools = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        fp_tools.add_css_class("file-tools");
+        let tool = |text: &str, tip: &str| {
+            let b = gtk::Button::with_label(text);
+            b.set_tooltip_text(Some(tip));
+            b.set_focus_on_click(false);
+            b.set_hexpand(true);
+            clickable(&b);
+            fp_tools.append(&b);
+            b
+        };
+        let fp_new_file = tool("+ File", "New file in the selected folder (n)");
+        let fp_new_dir = tool("+ Folder", "New folder in the selected folder (Shift+N)");
+        let fp_rename = tool("Rename", "Rename the selected file or folder (F2)");
+        let fp_trash = tool("Trash", "Move the selected file or folder to the trash (Delete)");
+        fp_trash.add_css_class("danger");
         let fp_store = gio::ListStore::new::<gtk::StringObject>();
         let fp_ignored: Rc<RefCell<HashSet<PathBuf>>> = Rc::default();
-        let ig = fp_ignored.clone();
+        let fp_cache: FileCache = Rc::default();
+        let fp_watch: Watches = Rc::default();
+        let (ig, cache, watch) = (fp_ignored.clone(), fp_cache.clone(), fp_watch.clone());
         let fp_tree = gtk::TreeListModel::new(fp_store.clone(), false, false, move |item| {
             let s = item.downcast_ref::<gtk::StringObject>()?.string();
             let (kind, path, _) = fp_parse(&s);
-            (kind == "dir").then(|| folder_model(Path::new(path), &ig.borrow()).upcast())
+            if kind != "dir" {
+                return None;
+            }
+            let store = folder_model(Path::new(path), &ig.borrow());
+            // GTK also makes a model only to ask whether a row can open: the folder is
+            // watched only if its model is still held a moment later (the row is open)
+            watch_later(Path::new(path), &store, &ig, &cache, &watch);
+            Some(store.upcast())
         });
         let fp_sel = gtk::SingleSelection::new(Some(fp_tree.clone()));
         fp_sel.set_autoselect(false);
+        fp_sel.set_can_unselect(true);
+        let fp_hits = gio::ListStore::new::<gtk::StringObject>();
+        let fp_hits_tree = gtk::TreeListModel::new(fp_hits.clone(), false, false, |_| None);
         let fp_view = gtk::ListView::new(Some(fp_sel), None::<gtk::ListItemFactory>);
+        clickable(&fp_view);
         let fscroll = gtk::ScrolledWindow::new();
         fscroll.set_hscrollbar_policy(gtk::PolicyType::Never);
         fscroll.set_kinetic_scrolling(false);
         fscroll.set_child(Some(&fp_view));
         fscroll.set_vexpand(true);
-        fpage.append(&fp_title);
+        let fp_hint = label("", &["hints"]);
+        fp_hint.set_markup("<b>/</b> find   <b>n</b> new file   <b>F2</b> rename   <b>?</b> keys");
+        fp_hint.set_ellipsize(pango::EllipsizeMode::End);
+        fpage.append(&fp_folder);
         fpage.append(&fp_where);
+        fpage.append(&fp_search);
+        fpage.append(&fp_tools);
         fpage.append(&fscroll);
-        fpage.append(&label("esc back", &["dim"]));
+        fpage.append(&fp_hint);
         stack.add_named(&fpage, Some("files"));
         sidebar.append(&stack);
 
@@ -592,11 +670,28 @@ impl App {
             ns_error,
             ns_hint,
             ns_state: RefCell::new(Step::Folder),
-            fp_title,
+            fp_folder,
+            fp_folder_label,
             fp_where,
+            fp_search,
+            fp_new_file,
+            fp_new_dir,
+            fp_rename,
+            fp_trash,
             fp_store,
             fp_tree,
+            fp_hits,
+            fp_hits_tree,
             fp_view,
+            fp_cache,
+            fp_watch,
+            fp_root_watch: RefCell::new(None),
+            fp_choices: RefCell::new(vec![]),
+            fp_menu_at: Cell::new((0.0, 0.0)),
+            fp_menu_target: RefCell::new(None),
+            fp_tree_on: Cell::new(false),
+            fp_listing: Cell::new(false),
+            name_pop: RefCell::new(None),
             fp_origin: RefCell::new(None),
             fp_split: Cell::new(0),
             fp_shown: RefCell::new(vec![]),
@@ -665,6 +760,52 @@ impl App {
                 app.switch_files.set_active(true);
             } else if name == "sessions" {
                 app.switch_sessions.set_active(true);
+            } else if let Some(text) = name.strip_prefix("find:") {
+                app.find_a_file();
+                app.fp_search.set_text(&text.replace('_', " "));
+            } else if let Some(dir) = name.strip_prefix("folder:") {
+                // a folder picked by hand
+                let root = PathBuf::from(dir);
+                let n = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                app.pick_folder(Origin { root, session: None, name: n });
+            } else if let Some(rel) = name.strip_prefix("fsel:") {
+                // select a row by its path under the folder showing (opening folders on the way)
+                app.shot_select(rel);
+            } else if let Some(op) = name.strip_prefix("fop:") {
+                match op {
+                    "new" => app.files_new(false, None),
+                    "newdir" => app.files_new(true, None),
+                    "rename" => app.files_rename(None),
+                    "trash" => app.files_trash(),
+                    "menu" => app.files_menu(Some(app.fp_sel().selected()), 60.0, 300.0),
+                    "popover" => app.fp_folder.popup(),
+                    _ => {}
+                }
+            } else if let Some(p) = name.strip_prefix("touch:") {
+                // a file made outside the app, as a session would make it
+                let _ = std::fs::write(p, "made outside\n");
+            } else if let Some(out) = name.strip_prefix("dump:") {
+                // what the files list shows, one row per line, and the last message
+                let sel = app.fp_sel();
+                let mut text = String::new();
+                for i in 0..sel.n_items() {
+                    if let Some((k, p, n, _)) = app.files_row(i) {
+                        text.push_str(&format!("{k}\t{p}\t{n}\n"));
+                    }
+                }
+                text.push_str(&format!("message\t{}\n", app.message.text()));
+                if let Some((entry, _)) = app.name_pop.borrow().as_ref() {
+                    let err = entry.next_sibling().and_downcast::<gtk::Label>().map(|l| l.text().to_string()).unwrap_or_default();
+                    text.push_str(&format!("namebox\t{}\t{err}\n", entry.text()));
+                }
+                text.push_str(&format!("confirm\t{}\n", if app.confirm_bar.is_visible() { app.confirm_q.text().to_string() } else { String::new() }));
+                let _ = std::fs::write(out, text);
+            } else if let Some(text) = name.strip_prefix("name:") {
+                let pop = app.name_pop.borrow().clone();
+                if let Some((entry, go)) = pop {
+                    entry.set_text(&text.replace('_', " "));
+                    go();
+                }
             } else if let Some(sec) = name.strip_prefix("toggle:") {
                 if let Some(s) = Section::ALL.into_iter().find(|s| s.key().eq_ignore_ascii_case(sec)) {
                     app.toggle_section(s);
@@ -2630,7 +2771,7 @@ impl App {
             Ok((files::Content::Text(text), stamp)) => {
                 let base = files::head_text(&path).map(files::Base::Head).unwrap_or_else(|| files::Base::Opened(text.clone()));
                 let hooks = {
-                    let (w1, w2, w3) = (Rc::downgrade(self), Rc::downgrade(self), Rc::downgrade(self));
+                    let (w1, w2, w3, w4) = (Rc::downgrade(self), Rc::downgrade(self), Rc::downgrade(self), Rc::downgrade(self));
                     let (p1, p2, p3) = (path.clone(), path.clone(), path.clone());
                     editor::Hooks {
                         dirty: Box::new(move |d| {
@@ -2648,6 +2789,11 @@ impl App {
                         changed_on_disk: Box::new(move || {
                             if let Some(app) = w3.upgrade() {
                                 app.refresh_who(Some(&p3));
+                            }
+                        }),
+                        find_file: Box::new(move || {
+                            if let Some(app) = w4.upgrade() {
+                                app.find_a_file();
                             }
                         }),
                     }
@@ -2847,32 +2993,100 @@ impl App {
     /// `/` and Ctrl+P: the Files view with the cursor in its find box.
     fn find_a_file(self: &Rc<Self>) {
         if self.stack.visible_child_name().as_deref() != Some("files") {
-            self.open_files(true);
+            self.open_files(false);
         }
-        self.fp_view.grab_focus();
+        self.fp_search.grab_focus();
+        self.fp_search.select_region(0, -1);
     }
 
-    /// Keys in the Files view.
-    fn files_key(self: &Rc<Self>, key: gdk::Key, _mods: gdk::ModifierType) -> glib::Propagation {
-        if key == gdk::Key::Escape {
-            self.back_to_list();
+    fn has_focus_in(&self, w: &impl IsA<gtk::Widget>) -> bool {
+        let w = w.upcast_ref::<gtk::Widget>();
+        gtk::prelude::GtkWindowExt::focus(&self.window).is_some_and(|f| f == *w || f.is_ancestor(w))
+    }
+
+    /// Keys in the Files view. The find box keeps its typing; popovers keep theirs.
+    fn files_key(self: &Rc<Self>, key: gdk::Key, mods: gdk::ModifierType) -> glib::Propagation {
+        use gdk::Key as K;
+        let focus = gtk::prelude::GtkWindowExt::focus(&self.window);
+        if focus.as_ref().is_some_and(|f| f.ancestor(gtk::Popover::static_type()).is_some()) {
+            return glib::Propagation::Proceed;
+        }
+        let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
+        let other = mods.intersects(gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK);
+        if key == K::Escape {
+            if !self.fp_search.text().is_empty() {
+                self.fp_search.set_text(""); // first Esc clears the find box, the next goes back
+                self.fp_view.grab_focus();
+            } else {
+                self.back_to_list();
+            }
             return glib::Propagation::Stop;
         }
-        glib::Propagation::Proceed
+        if ctrl && !other && key.to_lower() == K::p {
+            self.find_a_file();
+            return glib::Propagation::Stop;
+        }
+        if self.has_focus_in(&self.fp_search) {
+            if key == K::Down || key == K::KP_Down {
+                self.files_into_list();
+                return glib::Propagation::Stop;
+            }
+            return glib::Propagation::Proceed;
+        }
+        if ctrl || other {
+            return glib::Propagation::Proceed;
+        }
+        match key {
+            K::slash => self.find_a_file(),
+            K::n => self.files_new(false, None),
+            K::N => self.files_new(true, None),
+            K::F2 => self.files_rename(None),
+            K::Delete | K::KP_Delete => self.files_trash(),
+            K::question => self.show_help(),
+            _ => return glib::Propagation::Proceed,
+        }
+        glib::Propagation::Stop
+    }
+
+    fn fp_sel(&self) -> gtk::SingleSelection {
+        self.fp_view.model().and_downcast::<gtk::SingleSelection>().expect("the files list has a selection")
     }
 
     fn show_files(self: &Rc<Self>, origin: Origin, focus: bool) {
         self.cancel_confirm();
         let same = self.fp_origin.borrow().as_ref().is_some_and(|o| o.root == origin.root);
-        self.fp_title.set_text(&format!("FILES · {}", origin.name));
-        self.fp_where.set_text(&tilde(&origin.root.to_string_lossy(), &self.home));
-        self.fp_where.set_tooltip_text(Some(&origin.root.to_string_lossy()));
+        let name = if origin.root == self.env.home {
+            "~ (home folder)".to_owned()
+        } else {
+            origin.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| origin.root.display().to_string())
+        };
+        self.fp_folder_label.set_text(&name);
+        let where_ = tilde(&origin.root.to_string_lossy(), &self.home);
+        let session = origin.session.as_ref().and_then(|id| self.session_obj(id)).map(|s| py_str(plane_core::or(&[pget(&s, "name"), pget(&s, "id")])));
+        self.fp_where.set_text(&match &session {
+            Some(n) => format!("{n} · {where_}"),
+            None => where_.clone(),
+        });
+        self.fp_where.set_tooltip_text(Some(&match &session {
+            Some(n) => format!("The folder session '{n}' works in: {}", origin.root.display()),
+            None => origin.root.display().to_string(),
+        }));
         *self.fp_origin.borrow_mut() = Some(origin);
         if !same {
+            for (_, _, m) in self.fp_watch.borrow_mut().drain(..) {
+                m.cancel();
+            }
+            if let Some(m) = self.fp_root_watch.borrow_mut().take() {
+                m.cancel();
+            }
             self.fp_store.remove_all();
-            self.fp_store.append(&fp_item("note", "", "reading the folder…"));
+            self.fp_store.append(&fp_item("note", "", "Reading the folder…"));
             self.fp_split.set(0);
+            self.fp_tree_on.set(false);
             self.fp_shown.borrow_mut().clear();
+            if !self.fp_search.text().is_empty() {
+                self.files_search(); // the same search, in the new folder
+            }
         }
         self.show_page("files");
         self.refresh_files_page(!same);
@@ -2892,10 +3106,16 @@ impl App {
         if focus {
             self.fp_view.grab_focus();
         }
+        self.update_file_tools();
+    }
+
+    fn group_folded(&self, group: &str) -> bool {
+        self.collapsed.borrow().contains(&format!("files:{group}"))
     }
 
     /// The changed lists at the top (git status, and what the session's transcripts say it
-    /// edited), and with `full` the folder tree under them.
+    /// edited), and with `full` the folder tree under them. Each group has a heading row
+    /// that folds it.
     fn refresh_files_page(self: &Rc<Self>, full: bool) {
         let Some(origin) = self.fp_origin.borrow().clone() else { return };
         let session = origin.session.as_ref().and_then(|id| self.session_obj(id)).map(|s| sval(&s, "sessionId").to_owned()).filter(|s| !s.is_empty());
@@ -2920,42 +3140,59 @@ impl App {
                     edits.sort_by(|a, b| b.1.total_cmp(&a.1));
                     edits.truncate(12);
                 }
-                let ignored = if full { files::git_ignored(&files::repo_root(&root).unwrap_or_else(|| root.clone())) } else { vec![] };
+                let ignored = if full { Some(files::git_ignored(&files::repo_root(&root).unwrap_or_else(|| root.clone()))) } else { None };
                 (root, changes, edits, ignored)
             },
             move |app, (root, changes, edits, ignored)| {
                 if app.fp_origin.borrow().as_ref().is_none_or(|o| o.root != root) {
                     return; // the page moved on to another folder meanwhile
                 }
+                let head = |g: &str, title: &str, n: Option<usize>| {
+                    let chevron = if app.group_folded(g) { "▸" } else { "▾" };
+                    format!("head\t{g}\t{chevron} {title}\t{}", n.map(|n| n.to_string()).unwrap_or_default())
+                };
                 let mut top: Vec<String> = vec![];
                 if let Some(mut ch) = changes {
                     ch.sort_by(|a, b| a.path.cmp(&b.path));
-                    top.push(format!("head\t\tNOT COMMITTED · {}", ch.len()));
-                    if ch.is_empty() {
-                        top.push("note\t\tnothing uncommitted".into());
-                    }
-                    for c in ch {
-                        top.push(format!("chg\t{}\t{}", c.path.display(), c.word));
+                    top.push(head("changed", "Not committed", Some(ch.len())));
+                    if !app.group_folded("changed") {
+                        if ch.is_empty() {
+                            top.push("note\t\tNothing uncommitted".into());
+                        }
+                        for c in ch {
+                            top.push(format!("chg\t{}\t{}", c.path.display(), c.word));
+                        }
                     }
                 }
                 if !edits.is_empty() {
-                    top.push("head\t\tEDITED BY THIS SESSION".into());
-                    for (p, ts) in edits {
-                        top.push(format!("edit\t{}\t{}", p.display(), ago(ts)));
+                    top.push(head("edited", "Edited by this session", Some(edits.len())));
+                    if !app.group_folded("edited") {
+                        for (p, ts) in edits {
+                            top.push(format!("edit\t{}\t{}", p.display(), ago(ts)));
+                        }
                     }
                 }
-                top.push("head\t\tALL FILES".into());
-                if full {
-                    *app.fp_ignored.borrow_mut() = ignored.into_iter().collect();
-                    let tree = folder_model(&root, &app.fp_ignored.borrow());
+                top.push(head("all", "All files", None));
+                let tree_on = !app.group_folded("all");
+                if let Some(ig) = ignored {
+                    *app.fp_ignored.borrow_mut() = ig.into_iter().collect();
+                }
+                if full || tree_on != app.fp_tree_on.get() {
                     let mut all: Vec<glib::Object> = top.iter().map(|s| gtk::StringObject::new(s).upcast()).collect();
-                    for i in 0..tree.n_items() {
-                        if let Some(o) = tree.item(i) {
-                            all.push(o);
+                    if tree_on {
+                        let tree = folder_model(&root, &app.fp_ignored.borrow());
+                        for i in 0..tree.n_items() {
+                            if let Some(o) = tree.item(i) {
+                                all.push(o);
+                            }
                         }
+                        app.watch_root(&root);
+                    } else if let Some(m) = app.fp_root_watch.borrow_mut().take() {
+                        m.cancel();
                     }
                     let n = app.fp_store.n_items();
                     app.fp_store.splice(0, n, &all);
+                    app.fp_tree_on.set(tree_on);
                 } else if *app.fp_shown.borrow() != top {
                     let objs: Vec<gtk::StringObject> = top.iter().map(|s| gtk::StringObject::new(s)).collect();
                     app.fp_store.splice(0, app.fp_split.get(), &objs);
@@ -2966,6 +3203,559 @@ impl App {
                 *app.fp_shown.borrow_mut() = top;
             },
         );
+    }
+
+    /// The top folder of the tree, watched like the open folders below it.
+    fn watch_root(self: &Rc<Self>, root: &Path) {
+        if let Some(m) = self.fp_root_watch.borrow_mut().take() {
+            m.cancel();
+        }
+        let Ok(mon) = gio::File::for_path(root).monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, None::<&gio::Cancellable>) else { return };
+        let queued = Rc::new(Cell::new(false));
+        let weak = Rc::downgrade(self);
+        let root = root.to_path_buf();
+        mon.connect_changed(move |_, _, _, _| {
+            if queued.replace(true) {
+                return;
+            }
+            let (q, weak, root) = (queued.clone(), weak.clone(), root.clone());
+            glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
+                q.set(false);
+                let Some(app) = weak.upgrade() else { return };
+                app.fp_cache.borrow_mut().remove(&root);
+                let showing = app.fp_origin.borrow().as_ref().is_some_and(|o| o.root == root);
+                if showing && app.fp_tree_on.get() {
+                    let rows = folder_entries(&root, &app.fp_ignored.borrow());
+                    relist(&app.fp_store, app.fp_split.get(), &rows);
+                }
+            });
+        });
+        *self.fp_root_watch.borrow_mut() = Some(mon);
+    }
+
+    /// The find box changed: the best matches by name replace the groups, or come back.
+    fn files_search(self: &Rc<Self>) {
+        let text = self.fp_search.text().trim().to_owned();
+        let sel = self.fp_sel();
+        if text.is_empty() {
+            if sel.model().as_ref() != Some(self.fp_tree.upcast_ref()) {
+                sel.set_model(Some(&self.fp_tree));
+                sel.set_selected(gtk::INVALID_LIST_POSITION);
+            }
+            self.update_file_tools();
+            return;
+        }
+        let Some(root) = self.fp_origin.borrow().as_ref().map(|o| o.root.clone()) else { return };
+        let list = self.fp_cache.borrow().get(&root).filter(|(_, at)| now() - at < 30.0).map(|(l, _)| l.clone());
+        let rows: Vec<String> = match list {
+            Some(list) => {
+                let hits = files::find_files(&text, &list, 200);
+                if hits.is_empty() {
+                    vec![format!("note\t\tNo file matches '{text}'")]
+                } else {
+                    hits.iter().map(|p| format!("hit\t{}\t", root.join(p).display())).collect()
+                }
+            }
+            None => {
+                if !self.fp_listing.replace(true) {
+                    let r = root.clone();
+                    self.off_thread(
+                        move || files::file_list(&r),
+                        move |app, list| {
+                            app.fp_listing.set(false);
+                            app.fp_cache.borrow_mut().insert(root, (list, now()));
+                            app.files_search();
+                        },
+                    );
+                }
+                vec!["note\t\tListing the folder's files…".into()]
+            }
+        };
+        let objs: Vec<gtk::StringObject> = rows.iter().map(|s| gtk::StringObject::new(s)).collect();
+        self.fp_hits.splice(0, self.fp_hits.n_items(), &objs);
+        if sel.model().as_ref() != Some(self.fp_hits_tree.upcast_ref()) {
+            sel.set_model(Some(&self.fp_hits_tree));
+        }
+        let found = rows.first().is_some_and(|r| r.starts_with("hit\t"));
+        sel.set_selected(if found { 0 } else { gtk::INVALID_LIST_POSITION });
+        self.update_file_tools();
+    }
+
+    /// ↓ in the find box: into the results.
+    fn files_into_list(&self) {
+        let sel = self.fp_sel();
+        if sel.n_items() == 0 {
+            return;
+        }
+        let pos = if sel.selected() == gtk::INVALID_LIST_POSITION { 0 } else { sel.selected() };
+        self.fp_view.scroll_to(pos, gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT, None);
+    }
+
+    /// The row at `pos` in what the files list shows (groups and tree, or results).
+    fn files_row(&self, pos: u32) -> Option<(String, String, String, gtk::TreeListRow)> {
+        let row = self.fp_sel().item(pos).and_downcast::<gtk::TreeListRow>()?;
+        let s = row.item().and_downcast::<gtk::StringObject>()?.string();
+        let (k, p, n) = fp_parse(&s);
+        Some((k.to_owned(), p.to_owned(), n.to_owned(), row))
+    }
+
+    fn files_activate(self: &Rc<Self>, pos: u32) {
+        let Some((kind, path, note, row)) = self.files_row(pos) else { return };
+        if kind != "note" {
+            self.fp_sel().set_selected(pos);
+        }
+        match kind.as_str() {
+            "head" => {
+                self.toggle_collapsed(&format!("files:{path}"));
+                self.refresh_files_page(false);
+            }
+            "dir" => row.set_expanded(!row.is_expanded()),
+            "file" | "chg" | "edit" | "hit" if note == "deleted" => self.say("deleted: it's only in the last commit now", "info"),
+            "file" | "chg" | "edit" | "hit" => {
+                let origin = self.fp_origin.borrow().clone();
+                self.open_file(Path::new(&path), None, None, origin);
+            }
+            _ => {}
+        }
+        self.update_file_tools();
+    }
+
+    /// The selected file or folder (and whether it's a folder), if it still exists.
+    fn files_target(&self) -> Option<(PathBuf, bool)> {
+        let sel = self.fp_sel();
+        let pos = sel.selected();
+        if pos == gtk::INVALID_LIST_POSITION {
+            return None;
+        }
+        let (kind, path, _, _) = self.files_row(pos)?;
+        if !matches!(kind.as_str(), "file" | "dir" | "chg" | "edit" | "hit") {
+            return None;
+        }
+        let p = PathBuf::from(path);
+        let meta = p.symlink_metadata().ok()?;
+        Some((p, meta.is_dir()))
+    }
+
+    /// The folder a new file goes in: the selected folder, the selected file's folder, or
+    /// the folder showing.
+    fn files_new_parent(&self) -> Option<PathBuf> {
+        match self.fp_menu_target.borrow().clone().or_else(|| self.files_target()) {
+            Some((p, true)) => Some(p),
+            Some((p, false)) => p.parent().map(Path::to_path_buf),
+            None => self.fp_origin.borrow().as_ref().map(|o| o.root.clone()),
+        }
+    }
+
+    /// Rename and Trash need a selection: say why when there isn't one.
+    fn update_file_tools(&self) {
+        let target = self.files_target();
+        let name = target.as_ref().and_then(|(p, _)| p.file_name()).map(|n| n.to_string_lossy().into_owned());
+        self.fp_rename.set_sensitive(target.is_some());
+        self.fp_trash.set_sensitive(target.is_some());
+        match &name {
+            Some(n) => {
+                self.fp_rename.set_tooltip_text(Some(&format!("Rename {n} (F2)")));
+                self.fp_trash.set_tooltip_text(Some(&format!("Move {n} to the trash (Delete)")));
+            }
+            None => {
+                self.fp_rename.set_tooltip_text(Some("Select a file or folder below to rename it"));
+                self.fp_trash.set_tooltip_text(Some("Select a file or folder below to move it to the trash"));
+            }
+        }
+        let parent = self.files_new_parent();
+        let root = self.fp_origin.borrow().as_ref().map(|o| o.root.clone());
+        let in_ = match (&parent, &root) {
+            (Some(p), Some(r)) if p == r => "this folder".to_owned(),
+            (Some(p), Some(r)) => p.strip_prefix(r).map(|x| x.display().to_string()).unwrap_or_else(|_| tilde(&p.to_string_lossy(), &self.home)),
+            _ => "this folder".to_owned(),
+        };
+        self.fp_new_file.set_tooltip_text(Some(&format!("New file in {in_} (n)")));
+        self.fp_new_dir.set_tooltip_text(Some(&format!("New folder in {in_} (Shift+N)")));
+    }
+
+    /// A rectangle in sidebar coordinates for a popover: under `w`, or the files tools.
+    fn anchor(&self, w: Option<&gtk::Widget>) -> gdk::Rectangle {
+        let w = w.cloned().unwrap_or_else(|| self.fp_new_file.parent().map(|p| p.upcast()).unwrap_or_else(|| self.fp_view.clone().upcast()));
+        match w.compute_bounds(&self.sidebar) {
+            Some(b) => gdk::Rectangle::new(b.x() as i32, b.y() as i32, b.width() as i32, b.height() as i32),
+            None => gdk::Rectangle::new(10, 10, 1, 1),
+        }
+    }
+
+    /// A small box for typing a name, under `at`: its error shows beside the field and what
+    /// you typed stays. `done` returns the error, or Ok when it's done.
+    fn ask_name(self: &Rc<Self>, title: &str, initial: &str, select_stem: bool, verb: &str, at: gdk::Rectangle, done: Rc<dyn Fn(&Rc<App>, &str) -> Result<(), String>>) {
+        let pop = gtk::Popover::new();
+        pop.add_css_class("name-pop");
+        let b = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let t = label(title, &["name-title"]);
+        let entry = gtk::Entry::new();
+        entry.set_text(initial);
+        entry.set_width_chars(26);
+        let err = label("", &["error"]);
+        err.set_wrap(true);
+        err.set_visible(false);
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        buttons.set_halign(gtk::Align::End);
+        let cancel = gtk::Button::with_label("Cancel");
+        cancel.add_css_class("flat");
+        let ok = gtk::Button::with_label(verb);
+        ok.add_css_class("suggested-action");
+        for w in [&cancel, &ok] {
+            clickable(w);
+        }
+        buttons.append(&cancel);
+        buttons.append(&ok);
+        b.append(&t);
+        b.append(&entry);
+        b.append(&err);
+        b.append(&buttons);
+        pop.set_child(Some(&b));
+        pop.set_parent(&self.sidebar);
+        pop.set_position(gtk::PositionType::Bottom);
+        pop.set_pointing_to(Some(&at));
+        let go = {
+            let (weak, entry, err, pop) = (Rc::downgrade(self), entry.clone(), err.clone(), pop.clone());
+            Rc::new(move || {
+                let Some(app) = weak.upgrade() else { return };
+                match done(&app, entry.text().trim()) {
+                    Ok(()) => pop.popdown(),
+                    Err(e) => {
+                        err.set_text(&e);
+                        err.set_visible(true);
+                        entry.grab_focus(); // what you typed stays
+                    }
+                }
+            })
+        };
+        let g = go.clone();
+        entry.connect_activate(move |_| g());
+        let g = go.clone();
+        ok.connect_clicked(move |_| g());
+        let p = pop.clone();
+        cancel.connect_clicked(move |_| p.popdown());
+        let weak = Rc::downgrade(self);
+        pop.connect_closed(move |p| {
+            let p = p.clone();
+            let weak = weak.clone();
+            glib::idle_add_local_once(move || {
+                p.unparent();
+                if let Some(app) = weak.upgrade() {
+                    *app.fp_menu_target.borrow_mut() = None;
+                    *app.name_pop.borrow_mut() = None;
+                    if app.stack.visible_child_name().as_deref() == Some("files") && gtk::prelude::GtkWindowExt::focus(&app.window).is_none_or(|f| !f.is_ancestor(&app.notebook)) {
+                        app.fp_view.grab_focus();
+                    }
+                }
+            });
+        });
+        pop.popup();
+        entry.grab_focus();
+        if select_stem {
+            let stem = Path::new(initial).file_stem().map(|s| s.to_string_lossy().chars().count()).unwrap_or(0);
+            entry.select_region(0, if stem == 0 { -1 } else { stem as i32 });
+        }
+        *self.name_pop.borrow_mut() = Some((entry, go)); // for the `name:` picture key
+    }
+
+    fn files_new(self: &Rc<Self>, is_dir: bool, at: Option<&gtk::Widget>) {
+        let Some(dir) = self.files_new_parent() else { return };
+        let root = self.fp_origin.borrow().as_ref().map(|o| o.root.clone()).unwrap_or_default();
+        let shown = if dir == root { dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "/".into()) } else { dir.strip_prefix(&root).map(|p| p.display().to_string()).unwrap_or_else(|_| tilde(&dir.to_string_lossy(), &self.home)) };
+        let title = format!("New {} in {shown}", if is_dir { "folder" } else { "file" });
+        let rect = if at.is_none() && self.fp_menu_target.borrow().is_some() { let (x, y) = self.fp_menu_at.get(); gdk::Rectangle::new(x as i32, y as i32, 1, 1) } else { self.anchor(at) };
+        self.ask_name(
+            &title,
+            "",
+            false,
+            "Create",
+            rect,
+            Rc::new(move |app, name| {
+                if let Some(p) = files::name_problem(name) {
+                    return Err(p.into());
+                }
+                let path = dir.join(name);
+                files::create(&path, is_dir)?;
+                app.fp_cache.borrow_mut().clear();
+                app.refresh_files_page(false);
+                if is_dir {
+                    app.say(&format!("made the folder {name}"), "ok");
+                } else {
+                    let origin = app.fp_origin.borrow().clone();
+                    app.open_file(&path, None, None, origin);
+                    app.say(&format!("made {name} · it's open on the right"), "ok");
+                }
+                Ok(())
+            }),
+        );
+    }
+
+    /// The open tabs showing `path` or a file inside it.
+    fn tabs_under(&self, path: &Path) -> Vec<(Rc<Tab>, PathBuf)> {
+        self.tabs
+            .borrow()
+            .iter()
+            .filter_map(|t| match &*t.kind.borrow() {
+                TabKind::File(p) if p.starts_with(path) => Some((t.clone(), p.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn files_rename(self: &Rc<Self>, at: Option<&gtk::Widget>) {
+        let Some((from, _)) = self.fp_menu_target.borrow().clone().or_else(|| self.files_target()) else {
+            self.say("select a file or folder first, then Rename", "info");
+            return;
+        };
+        let name = from.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let rect = if at.is_none() && self.fp_menu_target.borrow().is_some() { let (x, y) = self.fp_menu_at.get(); gdk::Rectangle::new(x as i32, y as i32, 1, 1) } else { self.anchor(at) };
+        let from2 = from.clone();
+        self.ask_name(
+            &format!("Rename {name}"),
+            &name,
+            true,
+            "Rename",
+            rect,
+            Rc::new(move |app, new_name| {
+                if let Some(p) = files::name_problem(new_name) {
+                    return Err(p.into());
+                }
+                let Some(parent) = from2.parent() else { return Err("can't rename this".into()) };
+                let to = parent.join(new_name);
+                let open = app.tabs_under(&from2);
+                if let Some((t, _)) = open.iter().find(|(t, _)| t.editor.borrow().as_ref().is_some_and(|e| e.is_dirty())) {
+                    return Err(format!("save or close {} first", t.name));
+                }
+                files::rename(&from2, &to)?;
+                app.fp_cache.borrow_mut().clear();
+                app.refresh_files_page(false);
+                // open tabs follow the file to its new name
+                for (tab, old) in open {
+                    let origin = tab.origin.borrow().clone();
+                    let new_path = to.join(old.strip_prefix(&from2).unwrap_or(Path::new("")));
+                    let new_path = if old == from2 { to.clone() } else { new_path };
+                    app.remove_tab(&tab);
+                    app.open_file(&new_path, None, None, origin);
+                }
+                app.say(&format!("renamed to {new_name}"), "ok");
+                Ok(())
+            }),
+        );
+    }
+
+    fn files_trash(self: &Rc<Self>) {
+        let Some((path, is_dir)) = self.fp_menu_target.borrow().clone().or_else(|| self.files_target()) else {
+            self.say("select a file or folder first, then Trash", "info");
+            return;
+        };
+        *self.fp_menu_target.borrow_mut() = None;
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let what = if is_dir { format!("the folder {name} and everything in it") } else { name.clone() };
+        self.ask(&format!("Move {what} to the trash?"), "move to trash", move |app| match gio::File::for_path(&path).trash(None::<&gio::Cancellable>) {
+            Ok(()) => {
+                app.fp_cache.borrow_mut().clear();
+                app.refresh_files_page(false);
+                app.say(&format!("moved {name} to the trash · you can restore it from there"), "info");
+            }
+            Err(e) => app.say(&format!("couldn't move {name} to the trash: {e}"), "bad"),
+        });
+    }
+
+    /// Right-click on the files list: what you can do with that row (or the folder itself).
+    fn files_menu(self: &Rc<Self>, pos: Option<u32>, x: f64, y: f64) {
+        self.cancel_confirm();
+        let target = pos.and_then(|p| {
+            let (kind, path, _, _) = self.files_row(p)?;
+            if !matches!(kind.as_str(), "file" | "dir" | "chg" | "edit" | "hit") {
+                return None;
+            }
+            self.fp_sel().set_selected(p);
+            let pb = PathBuf::from(path);
+            let is_dir = pb.is_dir();
+            pb.symlink_metadata().ok().map(|_| (pb, is_dir))
+        });
+        let root = self.fp_origin.borrow().as_ref().map(|o| (o.root.clone(), true));
+        *self.fp_menu_target.borrow_mut() = target.clone().or(root);
+        self.fp_menu_at.set((x, y));
+        let menu = gio::Menu::new();
+        let make = gio::Menu::new();
+        make.append(Some("New file…"), Some("files.new-file"));
+        make.append(Some("New folder…"), Some("files.new-dir"));
+        menu.append_section(None, &make);
+        if target.is_some() {
+            let change = gio::Menu::new();
+            change.append(Some("Rename…"), Some("files.rename"));
+            change.append(Some("Move to trash"), Some("files.trash"));
+            menu.append_section(None, &change);
+        }
+        let copy = gio::Menu::new();
+        copy.append(Some("Copy path"), Some("files.copy-path"));
+        menu.append_section(None, &copy);
+        let pop = gtk::PopoverMenu::from_model(Some(&menu));
+        pop.set_parent(&self.sidebar);
+        pop.set_has_arrow(false);
+        pop.set_halign(gtk::Align::Start);
+        pop.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        let weak = Rc::downgrade(self);
+        pop.connect_closed(move |p| {
+            let p = p.clone();
+            let weak = weak.clone();
+            // after its action has run (the action reads the target first)
+            glib::idle_add_local_once(move || {
+                p.unparent();
+                if let Some(app) = weak.upgrade() {
+                    app.update_file_tools();
+                }
+            });
+        });
+        pop.popup();
+    }
+
+    fn install_file_actions(self: &Rc<Self>) {
+        let group = gio::SimpleActionGroup::new();
+        let add = |name: &str, f: fn(&Rc<App>)| {
+            let a = gio::SimpleAction::new(name, None);
+            let weak = Rc::downgrade(self);
+            a.connect_activate(move |_, _| {
+                if let Some(app) = weak.upgrade() {
+                    f(&app);
+                }
+            });
+            group.add_action(&a);
+        };
+        add("new-file", |app| app.files_new(false, None));
+        add("new-dir", |app| app.files_new(true, None));
+        add("rename", |app| app.files_rename(None));
+        add("trash", |app| app.files_trash());
+        add("copy-path", |app| {
+            let target = app.fp_menu_target.borrow_mut().take();
+            if let Some((p, _)) = target {
+                app.window.clipboard().set_text(&p.to_string_lossy());
+                app.say(&format!("copied {}", tilde(&p.to_string_lossy(), &app.home)), "info");
+            }
+        });
+        self.sidebar.insert_action_group("files", Some(&group));
+    }
+
+    /// The folder button's list: the running sessions' folders, recent folders, home, and
+    /// any folder through the file chooser.
+    fn folder_popover(self: &Rc<Self>, pop: &gtk::Popover) -> gtk::Widget {
+        let list = gtk::ListBox::new();
+        list.add_css_class("choices");
+        list.set_activate_on_single_click(true);
+        clickable(&list);
+        let mut choices: Vec<Follow> = vec![];
+        let heading = |text: &str| {
+            let r = gtk::ListBoxRow::new();
+            r.set_child(Some(&label(text, &["choice-head"])));
+            r.set_selectable(false);
+            r.set_activatable(false);
+            r
+        };
+        let choice = |name: &str, note: &str, key: String| {
+            let r = gtk::ListBoxRow::new();
+            r.set_widget_name(&key);
+            let b = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            let n = label(name, &["name"]);
+            n.set_ellipsize(pango::EllipsizeMode::End);
+            n.set_max_width_chars(28);
+            let d = label(note, &["dim"]);
+            d.set_ellipsize(pango::EllipsizeMode::Start);
+            d.set_hexpand(true);
+            d.set_xalign(1.0);
+            d.set_max_width_chars(26);
+            b.append(&n);
+            b.append(&d);
+            r.set_child(Some(&b));
+            r
+        };
+        let (_, mine, _, _, _, _) = self.snap_lists();
+        if !mine.is_empty() {
+            list.append(&heading("Sessions"));
+            for s in &mine {
+                let name = py_str(plane_core::or(&[pget(s, "name"), pget(s, "id")]));
+                list.append(&choice(&name, &tilde(sval(s, "cwd"), &self.home), choices.len().to_string()));
+                choices.push(Follow::Session(py_str(pget(s, "id"))));
+            }
+        }
+        let recent = actions::recent_projects(&self.env, 8);
+        list.append(&heading("Recent folders"));
+        for p in recent.iter().map(PathBuf::from).chain(std::iter::once(self.env.home.clone())) {
+            let is_home = p == self.env.home;
+            let name = if is_home { "~ (home folder)".to_owned() } else { p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default() };
+            let parent = if is_home { String::new() } else { p.parent().map(|d| tilde(&d.to_string_lossy(), &self.home)).unwrap_or_default() };
+            list.append(&choice(&name, &parent, choices.len().to_string()));
+            choices.push(Follow::Folder(Origin { root: p, session: None, name }));
+        }
+        list.append(&choice("Choose a folder…", "", "choose".into()));
+        *self.fp_choices.borrow_mut() = choices;
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
+        scroll.set_propagate_natural_height(true);
+        scroll.set_propagate_natural_width(true);
+        scroll.set_max_content_height(460);
+        scroll.set_child(Some(&list));
+        let weak = Rc::downgrade(self);
+        let p = pop.clone();
+        list.connect_row_activated(move |_, row| {
+            let Some(app) = weak.upgrade() else { return };
+            p.popdown();
+            let key = row.widget_name().to_string();
+            if key == "choose" {
+                app.choose_folder();
+                return;
+            }
+            let picked = key.parse::<usize>().ok().and_then(|i| app.fp_choices.borrow().get(i).cloned());
+            match picked {
+                Some(Follow::Session(id)) => {
+                    app.follow(Follow::Session(id), true);
+                    app.open_files(true);
+                }
+                Some(Follow::Folder(o)) => app.pick_folder(o),
+                None => {}
+            }
+        });
+        scroll.upcast()
+    }
+
+    /// For off-screen checks: selects the tree row for `rel` (relative to the folder
+    /// showing), opening the folders above it.
+    fn shot_select(&self, rel: &str) {
+        let Some(root) = self.fp_origin.borrow().as_ref().map(|o| o.root.clone()) else { return };
+        let want = root.join(rel);
+        let sel = self.fp_sel();
+        let mut i = 0;
+        while let Some((kind, path, _, row)) = self.files_row(i) {
+            let p = Path::new(&path);
+            if (kind == "file" || kind == "dir") && p == want {
+                sel.set_selected(i);
+                return;
+            }
+            if kind == "dir" && want.starts_with(p) && !row.is_expanded() {
+                row.set_expanded(true);
+            }
+            i += 1;
+        }
+    }
+
+    /// A folder picked by hand: Files stays on it until the next click on a session.
+    fn pick_folder(self: &Rc<Self>, o: Origin) {
+        self.fp_pinned.set(true);
+        self.show_files(o, true);
+    }
+
+    fn choose_folder(self: &Rc<Self>) {
+        let dialog = gtk::FileDialog::builder().title("Show a folder in Files").modal(true).build();
+        if let Some(o) = self.fp_origin.borrow().as_ref() {
+            dialog.set_initial_folder(Some(&gio::File::for_path(&o.root)));
+        }
+        let weak = Rc::downgrade(self);
+        dialog.select_folder(Some(&self.window), None::<&gio::Cancellable>, move |r| {
+            let (Some(app), Ok(f)) = (weak.upgrade(), r) else { return };
+            let Some(p) = f.path() else { return };
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "/".into());
+            app.pick_folder(Origin { root: p, session: None, name });
+        });
     }
 
     fn wire_files_page(self: &Rc<Self>) {
@@ -2982,6 +3772,7 @@ impl App {
             dir.set_ellipsize(pango::EllipsizeMode::Start);
             dir.set_max_width_chars(4); // the name gets the room first; the folder takes what's left
             let note = label("", &["note"]);
+            note.set_valign(gtk::Align::Center);
             b.append(&name);
             b.append(&dir);
             b.append(&note);
@@ -2989,6 +3780,11 @@ impl App {
             // one click opens a file or opens and folds a folder, as in other file lists
             let click = gtk::GestureClick::new();
             click.set_button(1);
+            click.connect_pressed(move |g, _, _, _| {
+                if let Some(w) = g.widget() {
+                    flash_pressed(&w);
+                }
+            });
             let (w, l) = (weak.clone(), li.downgrade());
             click.connect_released(move |g, n, _, _| {
                 let (Some(app), Some(li)) = (w.upgrade(), l.upgrade()) else { return };
@@ -2997,6 +3793,18 @@ impl App {
                 }
             });
             exp.add_controller(click);
+            // right-click: new, rename, trash, copy path
+            let menu = gtk::GestureClick::new();
+            menu.set_button(3);
+            let (w, l) = (weak.clone(), li.downgrade());
+            menu.connect_pressed(move |g, _, x, y| {
+                let (Some(app), Some(li)) = (w.upgrade(), l.upgrade()) else { return };
+                g.set_state(gtk::EventSequenceState::Claimed);
+                let Some(e) = g.widget() else { return };
+                let at = e.compute_point(&app.sidebar, &gtk::graphene::Point::new(x as f32, y as f32)).map(|p| (p.x() as f64, p.y() as f64)).unwrap_or((x, y));
+                app.files_menu(Some(li.position()), at.0, at.1);
+            });
+            exp.add_controller(menu);
             li.set_child(Some(&exp));
         });
         let home = self.home.clone();
@@ -3016,24 +3824,35 @@ impl App {
             let file_name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let root = weak.upgrade().and_then(|a| a.fp_origin.borrow().as_ref().map(|o| o.root.clone())).unwrap_or_default();
             let rel_dir = p.parent().and_then(|d| d.strip_prefix(&root).ok()).map(|d| d.display().to_string()).unwrap_or_else(|| p.parent().map(|d| tilde(&d.to_string_lossy(), &home)).unwrap_or_default());
-            let heading = kind == "head" || kind == "note";
-            li.set_selectable(!heading);
-            li.set_activatable(!heading);
+            let (head, plain) = (kind == "head", kind == "note");
+            li.set_selectable(!plain);
+            li.set_activatable(!plain);
             exp.set_hide_expander(kind != "dir");
             exp.set_indent_for_icon(kind == "dir" || kind == "file");
-            for (w, c, on) in [(&name, "head", kind == "head"), (&name, "dim", kind == "note"), (&name, "ignored", note == "ignored"), (&name, "strike", note == "deleted")] {
+            for (w, c, on) in [(&name, "group-title", head), (&name, "dim", plain), (&note_l, "count", head), (&name, "ignored", note == "ignored"), (&name, "strike", note == "deleted")] {
                 if on { w.add_css_class(c) } else { w.remove_css_class(c) }
             }
-            dir.set_visible(!heading);
-            note_l.set_visible(!heading);
-            name.set_hexpand(heading);
+            // (on the expander: changing the row widget itself while it's bound breaks GTK's list)
+            if head { exp.add_css_class("group-head") } else { exp.remove_css_class("group-head") }
+            dir.set_visible(!head && !plain);
+            note_l.set_visible(!plain);
+            name.set_hexpand(plain);
             match kind {
-                "head" | "note" => {
+                "head" => {
+                    let (title, count) = note.split_once('\t').unwrap_or((note, ""));
+                    name.set_text(title);
+                    dir.set_text("");
+                    note_l.set_text(count);
+                    note_l.set_visible(!count.is_empty());
+                    exp.set_tooltip_text(Some(if title.starts_with('▸') { "Click to show this group" } else { "Click to fold this group" }));
+                }
+                "note" => {
                     name.set_text(note);
                     dir.set_text("");
                     note_l.set_text("");
+                    exp.set_tooltip_text(None);
                 }
-                "chg" | "edit" => {
+                "chg" | "edit" | "hit" => {
                     name.set_text(&file_name);
                     dir.set_text(&rel_dir);
                     note_l.set_text(note);
@@ -3054,6 +3873,28 @@ impl App {
                 app.files_activate(pos);
             }
         });
+        let weak = Rc::downgrade(self);
+        self.fp_sel().connect_selection_changed(move |_, _, _| {
+            // after GTK has finished changing the list: reading it from inside its own
+            // change breaks the list's bookkeeping
+            let weak = weak.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(app) = weak.upgrade() {
+                    app.update_file_tools();
+                }
+            });
+        });
+        // a right-click below the last row: the folder's own menu
+        let menu = gtk::GestureClick::new();
+        menu.set_button(3);
+        let weak = Rc::downgrade(self);
+        menu.connect_pressed(move |_, _, x, y| {
+            if let Some(app) = weak.upgrade() {
+                let at = app.fp_view.compute_point(&app.sidebar, &gtk::graphene::Point::new(x as f32, y as f32)).map(|p| (p.x() as f64, p.y() as f64)).unwrap_or((x, y));
+                app.files_menu(None, at.0, at.1);
+            }
+        });
+        self.fp_view.add_controller(menu);
         // → opens a folder, ← folds it (or goes up to the folder it's in)
         let keys = gtk::EventControllerKey::new();
         let weak = Rc::downgrade(self);
@@ -3062,7 +3903,7 @@ impl App {
             if !mods.is_empty() || !matches!(key, gdk::Key::Left | gdk::Key::Right) {
                 return glib::Propagation::Proceed;
             }
-            let Some(sel) = app.fp_view.model().and_downcast::<gtk::SingleSelection>() else { return glib::Propagation::Proceed };
+            let sel = app.fp_sel();
             let Some(row) = sel.selected_item().and_downcast::<gtk::TreeListRow>() else { return glib::Propagation::Proceed };
             if key == gdk::Key::Right {
                 if row.is_expandable() {
@@ -3078,26 +3919,54 @@ impl App {
             glib::Propagation::Stop
         });
         self.fp_view.add_controller(keys);
-    }
-
-    fn files_activate(self: &Rc<Self>, pos: u32) {
-        let Some(row) = self.fp_tree.item(pos).and_downcast::<gtk::TreeListRow>() else { return };
-        let Some(s) = row.item().and_downcast::<gtk::StringObject>().map(|o| o.string()) else { return };
-        let (kind, path, note) = fp_parse(&s);
-        if let Some(sel) = self.fp_view.model().and_downcast::<gtk::SingleSelection>() {
-            if kind != "head" && kind != "note" {
-                sel.set_selected(pos);
+        // find a file
+        let weak = Rc::downgrade(self);
+        self.fp_search.connect_search_changed(move |_| {
+            if let Some(app) = weak.upgrade() {
+                app.files_search();
             }
-        }
-        match kind {
-            "dir" => row.set_expanded(!row.is_expanded()),
-            "file" | "chg" | "edit" if note == "deleted" => self.say("deleted: it's only in the last commit now", "info"),
-            "file" | "chg" | "edit" => {
-                let origin = self.fp_origin.borrow().clone();
-                self.open_file(Path::new(path), None, None, origin);
+        });
+        let weak = Rc::downgrade(self);
+        self.fp_search.connect_activate(move |_| {
+            // Enter opens the best match
+            let Some(app) = weak.upgrade() else { return };
+            let first = app.fp_hits.item(0).and_downcast::<gtk::StringObject>().map(|o| o.string().to_string());
+            if let Some(s) = first {
+                let (kind, path, _) = fp_parse(&s);
+                if kind == "hit" {
+                    let origin = app.fp_origin.borrow().clone();
+                    app.open_file(Path::new(path), None, None, origin);
+                }
             }
-            _ => {}
+        });
+        // the folder button
+        // one popover, its list made afresh each time it opens
+        let pop = gtk::Popover::new();
+        pop.add_css_class("files-pop");
+        let weak = Rc::downgrade(self);
+        pop.connect_show(move |p| {
+            if let Some(app) = weak.upgrade() {
+                p.set_child(Some(&app.folder_popover(p)));
+            }
+        });
+        self.fp_folder.set_popover(Some(&pop));
+        // new, rename, trash
+        let tools: [(&gtk::Button, fn(&Rc<App>, &gtk::Widget)); 4] = [
+            (&self.fp_new_file, |app, w| app.files_new(false, Some(w))),
+            (&self.fp_new_dir, |app, w| app.files_new(true, Some(w))),
+            (&self.fp_rename, |app, w| app.files_rename(Some(w))),
+            (&self.fp_trash, |app, _| app.files_trash()),
+        ];
+        for (b, f) in tools {
+            let weak = Rc::downgrade(self);
+            b.connect_clicked(move |b| {
+                if let Some(app) = weak.upgrade() {
+                    *app.fp_menu_target.borrow_mut() = None;
+                    f(&app, b.upcast_ref());
+                }
+            });
         }
+        self.install_file_actions();
     }
 
     // ------------------------------------------------------------------ pages
@@ -3248,12 +4117,15 @@ fn fp_item(kind: &str, path: &str, note: &str) -> gtk::StringObject {
     gtk::StringObject::new(&format!("{kind}\t{path}\t{note}"))
 }
 
-/// One folder's entries for the tree, folders first; `.git` left out, ignored ones marked.
-fn folder_model(dir: &Path, ignored: &HashSet<PathBuf>) -> gio::ListStore {
-    let store = gio::ListStore::new::<gtk::StringObject>();
+/// A folder's file list for finding a file (relative paths), and when it was read.
+type FileCache = Rc<RefCell<HashMap<PathBuf, (Vec<String>, f64)>>>;
+/// Watched open folders: the folder, its rows (gone once the folder is folded), the watch.
+type Watches = Rc<RefCell<Vec<(PathBuf, glib::WeakRef<gio::ListStore>, gio::FileMonitor)>>>;
+
+/// One folder's rows for the tree, folders first; `.git` left out, ignored ones marked.
+fn folder_entries(dir: &Path, ignored: &HashSet<PathBuf>) -> Vec<String> {
     let Ok(rd) = std::fs::read_dir(dir) else {
-        store.append(&fp_item("note", "", "can't read this folder"));
-        return store;
+        return vec!["note\t\tcan't read this folder".into()];
     };
     let mut entries: Vec<(bool, String, PathBuf)> = rd
         .filter_map(Result::ok)
@@ -3262,13 +4134,86 @@ fn folder_model(dir: &Path, ignored: &HashSet<PathBuf>) -> gio::ListStore {
         .collect();
     entries.sort_by(|a, b| (!a.0, a.1.to_lowercase()).cmp(&(!b.0, b.1.to_lowercase())));
     if entries.is_empty() {
-        store.append(&fp_item("note", "", "empty folder"));
+        return vec!["note\t\tEmpty folder · + File adds one".into()];
     }
-    for (is_dir, _, p) in entries {
-        let ign = p.ancestors().any(|a| ignored.contains(a));
-        store.append(&fp_item(if is_dir { "dir" } else { "file" }, &p.to_string_lossy(), if ign { "ignored" } else { "" }));
-    }
+    entries
+        .into_iter()
+        .map(|(is_dir, _, p)| {
+            let ign = p.ancestors().any(|a| ignored.contains(a));
+            format!("{}\t{}\t{}", if is_dir { "dir" } else { "file" }, p.to_string_lossy(), if ign { "ignored" } else { "" })
+        })
+        .collect()
+}
+
+fn folder_model(dir: &Path, ignored: &HashSet<PathBuf>) -> gio::ListStore {
+    let store = gio::ListStore::new::<gtk::StringObject>();
+    let items: Vec<gtk::StringObject> = folder_entries(dir, ignored).iter().map(|s| gtk::StringObject::new(s)).collect();
+    store.extend_from_slice(&items);
     store
+}
+
+/// Brings `store[offset..]` in line with `new`, changing only the rows that differ, so the
+/// folders open inside it stay open.
+fn relist(store: &gio::ListStore, offset: u32, new: &[String]) {
+    let wanted: HashSet<&str> = new.iter().map(String::as_str).collect();
+    let (mut pos, mut i) = (offset, 0usize);
+    loop {
+        let old = store.item(pos).and_downcast::<gtk::StringObject>().map(|o| o.string().to_string());
+        match (old, new.get(i)) {
+            (None, None) => break,
+            (Some(o), Some(n)) if o == *n => {
+                pos += 1;
+                i += 1;
+            }
+            (Some(o), _) if !wanted.contains(o.as_str()) => store.remove(pos),
+            (_, Some(n)) => {
+                store.insert(pos, &gtk::StringObject::new(n));
+                pos += 1;
+                i += 1;
+            }
+            (Some(_), None) => store.remove(pos),
+        }
+    }
+}
+
+/// Watches `dir` once it's clear its rows are kept (an open folder), and keeps the rows in
+/// step with the disk. A watch costs nothing while nothing changes (inotify).
+fn watch_later(dir: &Path, store: &gio::ListStore, ignored: &Rc<RefCell<HashSet<PathBuf>>>, cache: &FileCache, watches: &Watches) {
+    let (dir, weak, ig, cache, watches) = (dir.to_path_buf(), store.downgrade(), ignored.clone(), cache.clone(), watches.clone());
+    glib::idle_add_local_once(move || {
+        // folded folders and models made only to ask a question are gone by now
+        watches.borrow_mut().retain(|(_, w, m)| {
+            let alive = w.upgrade().is_some();
+            if !alive {
+                m.cancel();
+            }
+            alive
+        });
+        let Some(store) = weak.upgrade() else { return };
+        if watches.borrow().iter().any(|(d, w, _)| *d == dir && w.upgrade().as_ref() == Some(&store)) {
+            return;
+        }
+        let Ok(mon) = gio::File::for_path(&dir).monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, None::<&gio::Cancellable>) else { return };
+        let queued = Rc::new(Cell::new(false));
+        let (d, w) = (dir.clone(), store.downgrade());
+        mon.connect_changed(move |m, _, _, _| {
+            if queued.replace(true) {
+                return;
+            }
+            let (q, d, w, ig, cache, m) = (queued.clone(), d.clone(), w.clone(), ig.clone(), cache.clone(), m.clone());
+            glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
+                q.set(false);
+                cache.borrow_mut().clear(); // the file lists for finding a file are stale too
+                match w.upgrade() {
+                    Some(store) => relist(&store, 0, &folder_entries(&d, &ig.borrow())),
+                    None => {
+                        m.cancel();
+                    }
+                }
+            });
+        });
+        watches.borrow_mut().push((dir, store.downgrade(), mon));
+    });
 }
 
 /// The session the kitty Plane window has in its pane, if it's running (read-only).

@@ -30,6 +30,8 @@ pub struct Hooks {
     pub close: Box<dyn Fn()>,
     /// The file changed on disk (the app looks up who changed it).
     pub changed_on_disk: Box<dyn Fn()>,
+    /// Ctrl+P: find a file to open.
+    pub find_file: Box<dyn Fn()>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -571,6 +573,7 @@ impl Editor {
                 }
                 gdk::Key::f if ctrl => ed.open_find(),
                 gdk::Key::w if ctrl => (ed.hooks.close)(),
+                gdk::Key::p if ctrl => (ed.hooks.find_file)(),
                 gdk::Key::g if ctrl => ed.find(true, false),
                 gdk::Key::g if ctrl_shift => ed.find(false, false),
                 gdk::Key::F3 if m.is_empty() => ed.find(true, false),
