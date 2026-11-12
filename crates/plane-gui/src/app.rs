@@ -24,7 +24,7 @@ use vte::prelude::*;
 use crate::editor::{self, Editor};
 use crate::store::{Snap, Store};
 use crate::text::{ago, esc, fmt_reset, now, short_needs, tilde};
-use crate::{term, theme};
+use crate::{icons, term, theme};
 use plane_core::files;
 
 /// Newest handoffs listed before "N more handoffs" (the list folds above 5).
@@ -34,6 +34,8 @@ const HANDOFFS_SHOWN: usize = 4;
 const MAX_ATTACHED: usize = 4;
 /// A click on a row that moved this recently is refused (seconds).
 const MOVED_GUARD: f64 = 0.7;
+/// How long the switcher takes to make room for Files, or give it back (ms).
+const SWITCH_MS: u32 = 240;
 /// Messages stay this long (seconds).
 const MESSAGE_SECS: f64 = 6.0;
 
@@ -101,6 +103,15 @@ fn clickable(w: &impl IsA<gtk::Widget>) {
     w.set_cursor_from_name(Some("pointer"));
 }
 
+/// + New at `p` of its size (0..1): squashed sideways, faded, and its gap closing with it.
+fn squish(slot: &gtk::Fixed, btn: &gtk::Button, p: f64) {
+    let p = p.clamp(0.0, 1.0);
+    let s = p.max(0.001) as f32; // a zero scale can't be laid out
+    slot.set_child_transform(btn, Some(&gtk::gsk::Transform::new().scale(s, 1.0)));
+    btn.set_opacity(p.sqrt());
+    slot.set_margin_start((6.0 * p).round() as i32);
+}
+
 /// A short press look on a row (the list takes the click itself, so `:active` never shows).
 fn flash_pressed(w: &impl IsA<gtk::Widget>) {
     let w = w.clone().upcast::<gtk::Widget>();
@@ -131,6 +142,8 @@ struct Item {
 struct Row {
     row: gtk::ListBoxRow,
     shown: gtk::Label,
+    /// The status icon (icons.rs), in place of `icon` for sessions and handoffs.
+    glyph: gtk::Image,
     icon: gtk::Label,
     name: gtk::Label,
     state: gtk::Label,
@@ -205,6 +218,10 @@ pub struct App {
     switch_sessions: gtk::ToggleButton,
     switch_files: gtk::ToggleButton,
     new_btn: gtk::Button,
+    new_slot: gtk::Fixed,
+    /// How much of + New shows (1 on Sessions, 0 on Files), and the animation moving it.
+    new_shown: Rc<Cell<f64>>,
+    new_anim: Rc<RefCell<Option<gtk::TickCallbackId>>>,
     /// The switcher is being set from code: its toggles aren't clicks.
     switching: Cell<bool>,
     /// The selection fell on a heading only because nothing else was listed yet.
@@ -357,6 +374,7 @@ impl App {
         provider.load_from_string(&theme::css(&defines));
         gtk::style_context_add_provider_for_display(&gdk::Display::default().expect("no display"), &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
         editor::install_scheme(&theme::colors(&defines));
+        icons::install();
 
         let window = gtk::ApplicationWindow::builder().application(app).title("Plane").default_width(1346).default_height(713).build();
         window.add_css_class("plane");
@@ -417,7 +435,7 @@ impl App {
         sidebar.append(&usage_note);
 
         // Sessions | Files, side by side, and a new session
-        let switch_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let switch_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         switch_row.add_css_class("switch-row");
         let views = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         views.add_css_class("linked");
@@ -439,8 +457,15 @@ impl App {
         }
         views.append(&switch_sessions);
         views.append(&switch_files);
+        // On Files, + New squishes away to nothing while Sessions | Files widen into its room;
+        // on Sessions it grows back (`animate_new`). A Fixed lays it out with a scale, and
+        // its width follows the scale, so the switcher takes the room frame by frame.
+        let new_slot = gtk::Fixed::new();
+        new_slot.put(&new_btn, 0.0, 0.0);
+        new_slot.set_margin_start(6);
+        new_slot.set_overflow(gtk::Overflow::Hidden);
         switch_row.append(&views);
-        switch_row.append(&new_btn);
+        switch_row.append(&new_slot);
         sidebar.append(&switch_row);
 
         let stack = gtk::Stack::new();
@@ -646,6 +671,9 @@ impl App {
             switch_sessions,
             switch_files,
             new_btn,
+            new_slot,
+            new_shown: Rc::new(Cell::new(1.0)),
+            new_anim: Rc::default(),
             switching: Cell::new(false),
             auto_head: Cell::new(false),
             help,
@@ -1284,13 +1312,14 @@ impl App {
             }
             Kind::Session => {
                 let state = session_state(o);
+                // "svg:NAME" is a status icon (icons.rs); anything else is shown as text
                 let (icon, tone) = match state {
-                    "working" => ("●", "ok"),
-                    "needs you" => ("!", "warn"),
-                    "your turn" => ("○", "accent"),
-                    "paused" => ("‖", "dim"),
-                    "failed" => ("✕", "bad"),
-                    _ => ("○", "dim"),
+                    "working" => ("svg:working", "ok"),
+                    "needs you" => ("svg:needs", "warn"),
+                    "your turn" => ("svg:turn", "accent"),
+                    "paused" => ("svg:paused", "dim"),
+                    "failed" => ("svg:failed", "bad"),
+                    _ => ("svg:idle", "dim"),
                 };
                 let name = py_str(plane_core::or(&[pget(o, "name"), pget(o, "id"), &Value::String("?".into())]));
                 let emph = if truthy(pget(o, "stopped")) { "dim" } else if state == "needs you" { "bold" } else { "" };
@@ -1298,14 +1327,14 @@ impl App {
             }
             Kind::Lost if pget(o, "cause") == "standby" => {
                 if pget(o, "jobState") == "blocked" {
-                    ("!".into(), "warn", lost_label(o), "needs you".into(), "warn", "bold")
+                    ("svg:needs".into(), "warn", lost_label(o), "needs you".into(), "warn", "bold")
                 } else {
-                    ("○".into(), "accent", lost_label(o), "your turn".into(), "accent", "")
+                    ("svg:turn".into(), "accent", lost_label(o), "your turn".into(), "accent", "")
                 }
             }
             Kind::Lost => {
                 let cause = sval(o, "cause");
-                ("↯".into(), "warn", lost_label(o), if cause == "crashed" { "crash".into() } else { cause.into() }, "warn", "")
+                ("svg:crash".into(), "warn", lost_label(o), if cause == "crashed" { "crash".into() } else { cause.into() }, "warn", "")
             }
             Kind::More => {
                 let hidden = num(pget(o, "hidden")) as usize;
@@ -1315,8 +1344,8 @@ impl App {
                     ("−".into(), "dim", "show fewer".into(), String::new(), "dim", "dim")
                 }
             }
-            Kind::Handoff if truthy(pget(o, "ready")) => ("→".into(), "accent", sval(o, "title").to_owned(), String::new(), "accent", ""),
-            Kind::Handoff => ("…".into(), "warn", sval(o, "title").to_owned(), "not ready".into(), "warn", "dim"),
+            Kind::Handoff if truthy(pget(o, "ready")) => ("svg:ready".into(), "accent", sval(o, "title").to_owned(), "ready to start".into(), "accent", ""),
+            Kind::Handoff => ("svg:waiting".into(), "warn", sval(o, "title").to_owned(), "not ready".into(), "warn", "dim"),
             Kind::Note => (String::new(), "dim", o.as_str().unwrap_or("").to_owned(), String::new(), "dim", "dim"),
         }
     }
@@ -1328,6 +1357,10 @@ impl App {
         let shown = label("", &["shown"]);
         let icon = label("", &["icon"]);
         icon.set_xalign(0.5);
+        let glyph = gtk::Image::new();
+        glyph.add_css_class("glyph");
+        glyph.set_pixel_size(16);
+        glyph.set_visible(false);
         let name = label("", &["name"]);
         name.set_hexpand(true);
         name.set_ellipsize(pango::EllipsizeMode::End);
@@ -1335,6 +1368,7 @@ impl App {
         let caption = label("", &["caption"]);
         caption.set_visible(false);
         b.append(&shown);
+        b.append(&glyph);
         b.append(&icon);
         b.append(&name);
         b.append(&state);
@@ -1364,27 +1398,38 @@ impl App {
             shown.set_visible(false);
             icon.set_visible(false);
         }
-        Row { row, shown, icon, name, state, caption }
+        Row { row, shown, glyph, icon, name, state, caption }
     }
 
     fn update_row(&self, r: &Row, item: &Item, shown_id: Option<&str>) {
         let (icon, itone, name, state, stone, emph) = self.row_look(item);
-        r.icon.set_text(&icon);
-        set_tone(&r.icon, itone);
+        // a status icon in place of the old letter and state word: the name gets the room
+        match icon.strip_prefix("svg:") {
+            Some(n) => {
+                r.glyph.set_icon_name(Some(&icons::name(n)));
+                set_tone(&r.glyph, itone);
+                r.glyph.set_visible(true);
+                r.icon.set_visible(false);
+            }
+            None => {
+                r.icon.set_text(&icon);
+                set_tone(&r.icon, itone);
+                r.icon.set_visible(item.kind != Kind::Note);
+                r.glyph.set_visible(false);
+            }
+        }
         r.name.set_text(&name);
-        r.name.set_tooltip_text(Some(&name));
         r.state.set_text(&state);
-        r.state.set_visible(!state.is_empty());
         set_tone(&r.state, stone);
         if item.kind == Kind::Head {
+            r.state.set_visible(!state.is_empty()); // the count
             r.name.set_tooltip_text(Some(if truthy(pget(&item.obj, "folded")) { "Click to show this section" } else { "Click to fold this section" }));
             return;
         }
-        // "needs you" is the one filled pill; "your turn" is outlined
-        let (needs, turn) = (state == "needs you", state == "your turn");
-        for (class, on) in [("pill", needs || turn), ("pill-needs", needs), ("pill-turn", turn)] {
-            if on { r.state.add_css_class(class) } else { r.state.remove_css_class(class) }
-        }
+        // the state in words: the icon's tooltip, the row's tooltip and the details panel
+        r.state.set_visible(false);
+        r.glyph.set_tooltip_text((!state.is_empty()).then_some(state.as_str()));
+        r.name.set_tooltip_text(Some(&if state.is_empty() { name.clone() } else { format!("{name} · {state}") }));
         let shown = item.kind == Kind::Session && shown_id.is_some_and(|id| py_str(pget(&item.obj, "id")) == id);
         r.shown.set_text(if shown { "▶" } else { "" });
         for (class, on) in [("dimmed", emph == "dim"), ("urgent", emph == "bold")] {
@@ -1703,6 +1748,20 @@ impl App {
                 }
             }
             Kind::Session => {
+                // the state in words, now that the row shows it as an icon
+                let state = session_state(o);
+                let asked = truthy(pget(o, "needs")) && state == "needs you"; // its own line below says what
+                let words = match state {
+                    "working" => Some(("working", "ok")),
+                    "needs you" if !asked => Some(("needs you: it's waiting on your answer", "warn")),
+                    "your turn" => Some(("your turn: it finished and waits for your next message", "accent")),
+                    "paused" => Some(("paused: open it to continue", "")),
+                    "failed" => Some(("failed", "bad")),
+                    _ => None,
+                };
+                if let Some((w, tone)) = words {
+                    out.push((w.into(), tone, 2));
+                }
                 out.push((tilde(sval(o, "cwd"), home), "", 2));
                 let mut bits = vec![];
                 if !sval(o, "branch").is_empty() {
@@ -4026,7 +4085,50 @@ impl App {
             self.switch_sessions.set_active(true);
         }
         self.switching.set(false);
-        self.new_btn.set_visible(name != "files");
+        self.animate_new(name != "files");
+    }
+
+    /// Squishes + New away (`show` false) or grows it back, over SWITCH_MS, eased. Sessions
+    /// | Files take or give back the room as it goes. A switch mid-way turns round from
+    /// where it is. (GTK_SLOWDOWN slows it, as it does GTK's own animations.)
+    fn animate_new(&self, show: bool) {
+        let target = if show { 1.0 } else { 0.0 };
+        let from = self.new_shown.get();
+        if let Some(id) = self.new_anim.borrow_mut().take() {
+            id.remove();
+        }
+        if from == target {
+            return;
+        }
+        let slow: f64 = std::env::var("GTK_SLOWDOWN").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        let dur = SWITCH_MS as f64 * 1000.0 * slow * (target - from).abs(); // µs
+        let (shown, anim, btn) = (self.new_shown.clone(), self.new_anim.clone(), self.new_btn.clone());
+        self.new_slot.set_visible(true);
+        let start = Cell::new(None::<i64>);
+        let id = self.new_slot.add_tick_callback(move |slot, clock| {
+            let now = clock.frame_time();
+            let t0 = match start.get() {
+                Some(t0) => t0,
+                None => {
+                    start.set(Some(now));
+                    now
+                }
+            };
+            let t = ((now - t0) as f64 / dur.max(1.0)).clamp(0.0, 1.0);
+            let eased = if t < 0.5 { 4.0 * t * t * t } else { 1.0 - (-2.0 * t + 2.0).powi(3) / 2.0 };
+            let p = from + (target - from) * eased;
+            squish(slot, &btn, p);
+            shown.set(p);
+            if t >= 1.0 {
+                if target == 0.0 {
+                    slot.set_visible(false); // gone: not even a click target
+                }
+                anim.borrow_mut().take(); // finished on its own
+                return glib::ControlFlow::Break;
+            }
+            glib::ControlFlow::Continue
+        });
+        *self.new_anim.borrow_mut() = Some(id);
     }
 
     fn back_to_list(&self) {

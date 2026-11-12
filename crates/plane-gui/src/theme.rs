@@ -81,10 +81,6 @@ list.sessions row.head-row .chevron { color: @plane_dim; min-width: 12px; }
 list.sessions row.head-row.warn .title, list.sessions row.head-row.warn .chevron { color: @plane_warn; }
 list.sessions row.head-row .count { font-size: 0.85em; font-weight: bold; color: @plane_fg; background: alpha(@plane_dim, 0.22); border-radius: 9px; padding: 0 7px; min-width: 8px; }
 list.sessions row.head-row .caption { color: @plane_dim; font-size: 0.9em; }
-/* states: \"needs you\" is the one filled pill */
-.pill { font-size: 0.85em; font-weight: bold; border-radius: 10px; padding: 1px 8px; }
-.pill.pill-needs { background: @plane_warn; color: @plane_bg; }
-.pill.pill-turn { border: 1px solid @plane_accent; color: @plane_accent; padding: 0 7px; }
 /* the header counts, as buttons */
 button.count-btn { padding: 1px 8px; min-height: 20px; border-radius: 10px; font-weight: bold; font-size: 0.85em; background: transparent; border: 1px solid transparent; box-shadow: none; }
 button.count-btn.needs { background: @plane_warn; color: @plane_bg; }

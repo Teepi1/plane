@@ -9,6 +9,7 @@
 
 mod app;
 mod editor;
+mod icons;
 mod shot;
 mod store;
 mod term;
