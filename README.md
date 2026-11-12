@@ -45,6 +45,11 @@ one [kitty](https://sw.kovidgoyal.net/kitty/) window:
 
 <sub>Screenshots use made-up demo data. See <a href="docs/screenshots/make.py">docs/screenshots/make.py</a>.</sub>
 
+> **A native app is being built** on the `worktree-native-app` branch: Plane as a GTK 4 app
+> in Rust, with built-in terminal tabs and an editor for the files sessions work on. It runs
+> beside this kitty version (as `plane-next`) until it's ready to replace it. See
+> [docs/native-app.md](docs/native-app.md).
+
 ## Requirements
 
 - **Linux**
