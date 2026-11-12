@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Plane editor
+Comment=Open a text file in Plane (the new app)
+Exec=/home/nate/Documents/Programming/plane/.claude/worktrees/native-app/target/release/plane-next edit %f
+Icon=plane
+Terminal=false
+NoDisplay=true
+Categories=Development;TextEditor;
+MimeType=text/plain;text/markdown;text/x-rust;text/x-python;text/x-python3;text/x-csrc;text/x-chdr;text/x-c++src;text/x-c++hdr;text/x-go;text/x-java;text/javascript;application/javascript;text/x-typescript;application/x-typescript;application/json;application/toml;text/x-toml;application/x-yaml;text/x-yaml;application/xml;text/xml;text/html;text/css;text/x-shellscript;application/x-shellscript;text/x-lua;text/x-log;text/csv;
+StartupWMClass=plane-next

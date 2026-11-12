@@ -794,6 +794,13 @@ impl App {
                     }
                 }
                 text.push_str(&format!("message\t{}\n", app.message.text()));
+                for t in app.tabs.borrow().iter() {
+                    let line = t.editor.borrow().as_ref().map(|e| {
+                        let b = e.view.buffer();
+                        b.iter_at_mark(&b.get_insert()).line() + 1
+                    });
+                    text.push_str(&format!("tab\t{}\t{}\n", t.name, line.map(|l| format!("line {l}")).unwrap_or_default()));
+                }
                 if let Some((entry, _)) = app.name_pop.borrow().as_ref() {
                     let err = entry.next_sibling().and_downcast::<gtk::Label>().map(|l| l.text().to_string()).unwrap_or_default();
                     text.push_str(&format!("namebox\t{}\t{err}\n", entry.text()));
@@ -1136,6 +1143,17 @@ impl App {
             "raise" => {
                 self.window.present();
                 std::thread::spawn(|| hypr::focus("class:^(plane-next)$"));
+                "ok"
+            }
+            // `plane-next edit PATH[:LINE]`, from a file manager or a terminal elsewhere
+            c if c.starts_with("edit ") => {
+                let mut parts = c["edit ".len()..].splitn(2, ' ');
+                let line = parts.next().and_then(|l| l.parse::<u32>().ok()).filter(|l| *l > 0);
+                if let Some(path) = parts.next().filter(|p| !p.is_empty()) {
+                    self.window.present();
+                    std::thread::spawn(|| hypr::focus("class:^(plane-next)$"));
+                    self.open_file(Path::new(path), line, None, None);
+                }
                 "ok"
             }
             "focus left" if !in_sidebar => {
