@@ -463,6 +463,9 @@ impl App {
         let new_slot = gtk::Fixed::new();
         new_slot.put(&new_btn, 0.0, 0.0);
         new_slot.set_margin_start(6);
+        // GtkFixed clips its children by default, which cut the top off the hover lift; the
+        // squish never draws outside it, so nothing needs clipping
+        new_slot.set_overflow(gtk::Overflow::Visible);
         switch_row.append(&views);
         switch_row.append(&new_slot);
         sidebar.append(&switch_row);
@@ -830,6 +833,11 @@ impl App {
                             let _ = std::fs::write(out, format!("{} {}\n", at.x(), at.y()));
                         }
                     }
+                }
+            } else if let Some(out) = name.strip_prefix("where-new:") {
+                // the middle of + New, in window pixels (for a real pointer to go to)
+                if let Some(b) = app.new_btn.compute_bounds(&app.window) {
+                    let _ = std::fs::write(out, format!("{} {}\n", b.x() + b.width() / 2.0, b.y() + b.height() / 2.0));
                 }
             } else if let Some(p) = name.strip_prefix("touch:") {
                 // a file made outside the app, as a session would make it
