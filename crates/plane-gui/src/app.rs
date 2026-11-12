@@ -463,7 +463,6 @@ impl App {
         let new_slot = gtk::Fixed::new();
         new_slot.put(&new_btn, 0.0, 0.0);
         new_slot.set_margin_start(6);
-        new_slot.set_overflow(gtk::Overflow::Hidden);
         switch_row.append(&views);
         switch_row.append(&new_slot);
         sidebar.append(&switch_row);
