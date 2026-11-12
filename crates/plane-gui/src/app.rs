@@ -47,22 +47,71 @@ enum Section {
 }
 
 impl Section {
+    const ALL: [Section; 5] = [Section::Lost, Section::Sessions, Section::Paused, Section::Windows, Section::Handoffs];
+
     fn title(self) -> &'static str {
         match self {
-            Section::Lost => "CUT OFF BY CRASH/REBOOT",
-            Section::Sessions => "SESSIONS",
-            Section::Paused => "PAUSED",
-            Section::Windows => "IN OTHER WINDOWS",
-            Section::Handoffs => "HANDOFFS",
+            Section::Lost => "Cut off by a crash",
+            Section::Sessions => "Sessions",
+            Section::Paused => "Paused",
+            Section::Windows => "In other windows",
+            Section::Handoffs => "Handoffs",
         }
+    }
+    /// The short dim words beside the title: what the rows in it are.
+    fn caption(self) -> &'static str {
+        match self {
+            Section::Lost => "resume or close",
+            Section::Sessions => "running",
+            Section::Paused => "open to continue",
+            Section::Windows => "click to go there",
+            Section::Handoffs => "waiting to start",
+        }
+    }
+    /// Its name in `app.json`'s "collapsed" list.
+    fn key(self) -> String {
+        format!("{self:?}")
     }
     fn order(self) -> u8 {
         self as u8
     }
 }
 
+/// What Files follows: the session you last picked, or a tab's folder.
+#[derive(Clone, Debug)]
+enum Follow {
+    Session(String),
+    Folder(Origin),
+}
+
+/// `~/.config/plane/app.json`: the app's own remembered choices (folded sections).
+fn app_config_path() -> PathBuf {
+    theme::theme_path().with_file_name("app.json")
+}
+
+fn load_collapsed() -> HashSet<String> {
+    plane_core::read_json(&app_config_path())
+        .and_then(|v| v.get("collapsed").and_then(Value::as_array).cloned())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect())
+        .unwrap_or_default()
+}
+
+/// The pointer becomes a hand over anything you can click.
+fn clickable(w: &impl IsA<gtk::Widget>) {
+    w.set_cursor_from_name(Some("pointer"));
+}
+
+/// A short press look on a row (the list takes the click itself, so `:active` never shows).
+fn flash_pressed(w: &impl IsA<gtk::Widget>) {
+    let w = w.clone().upcast::<gtk::Widget>();
+    w.add_css_class("pressed");
+    glib::timeout_add_local_once(std::time::Duration::from_millis(140), move || w.remove_css_class("pressed"));
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
+    /// A section's heading row: click to fold or show it.
+    Head,
     Session,
     Lost,
     Handoff,
@@ -85,6 +134,9 @@ struct Row {
     icon: gtk::Label,
     name: gtk::Label,
     state: gtk::Label,
+    /// Heading rows only: the dim words after the count.
+    #[allow(dead_code)]
+    caption: gtk::Label,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -147,9 +199,18 @@ pub struct App {
     window: gtk::ApplicationWindow,
     store: Store,
     sidebar: gtk::Box,
-    needs_label: gtk::Label,
-    dot_label: gtk::Label,
-    turn_label: gtk::Label,
+    needs_btn: gtk::Button,
+    turn_btn: gtk::Button,
+    switch_sessions: gtk::ToggleButton,
+    switch_files: gtk::ToggleButton,
+    new_btn: gtk::Button,
+    /// The switcher is being set from code: its toggles aren't clicks.
+    switching: Cell<bool>,
+    /// The selection fell on a heading only because nothing else was listed yet.
+    auto_head: Cell<bool>,
+    help: gtk::Widget,
+    /// Sections and Files groups folded by hand (remembered in app.json).
+    collapsed: RefCell<HashSet<String>>,
     usage_rows: Vec<(gtk::ProgressBar, gtk::Label, gtk::Label)>,
     usage_note: gtk::Label,
     stack: gtk::Stack,
@@ -183,7 +244,10 @@ pub struct App {
     fp_shown: RefCell<Vec<String>>,
     fp_ignored: Rc<RefCell<HashSet<PathBuf>>>,
     fp_timer: RefCell<Option<glib::SourceId>>,
-    files_btn: gtk::Button,
+    /// What Files shows next time it opens (or now, when it's open).
+    fp_follow: RefCell<Option<Follow>>,
+    /// A folder picked by hand: it stays until the next click on a session.
+    fp_pinned: Cell<bool>,
     /// What each session's transcripts say about edits, read a little more each time.
     scans: Arc<Mutex<HashMap<PathBuf, files::TranscriptScan>>>,
     /// Unsaved files were dealt with: the window may close.
@@ -193,8 +257,6 @@ pub struct App {
     items: RefCell<Vec<Item>>,
     rows: RefCell<HashMap<String, Row>>,
     order: Rc<RefCell<HashMap<String, (u8, u8, usize)>>>,
-    heads: Rc<RefCell<HashMap<String, Section>>>,
-    counts: Rc<RefCell<HashMap<Section, usize>>>,
     placed: RefCell<HashMap<String, (usize, f64)>>,
     tabs: RefCell<Vec<Rc<Tab>>>,
     handoffs_open: Cell<bool>,
@@ -282,13 +344,23 @@ impl App {
         head.add_css_class("head");
         let brand = label("PLANE", &["brand"]);
         brand.set_hexpand(true);
-        let needs_label = label("", &["warn", "strong"]);
-        let dot_label = label("·", &["dim"]);
-        let turn_label = label("", &["accent", "strong"]);
+        // "2 need you" and "1 your turn": each click selects the next session in that state
+        let needs_btn = gtk::Button::with_label("");
+        needs_btn.add_css_class("count-btn");
+        needs_btn.add_css_class("needs");
+        needs_btn.set_tooltip_text(Some("Select the next session that needs you"));
+        let turn_btn = gtk::Button::with_label("");
+        turn_btn.add_css_class("count-btn");
+        turn_btn.add_css_class("turn");
+        turn_btn.set_tooltip_text(Some("Select the next session waiting for your message"));
+        for b in [&needs_btn, &turn_btn] {
+            b.set_focus_on_click(false);
+            b.set_valign(gtk::Align::Center);
+            clickable(b);
+        }
         head.append(&brand);
-        head.append(&needs_label);
-        head.append(&dot_label);
-        head.append(&turn_label);
+        head.append(&needs_btn);
+        head.append(&turn_btn);
         sidebar.append(&head);
         // one grid, so both bars share a width, as in the kitty sidebar
         let usage = gtk::Grid::new();
@@ -318,6 +390,33 @@ impl App {
         usage_note.set_visible(false);
         sidebar.append(&usage_note);
 
+        // Sessions | Files, side by side, and a new session
+        let switch_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        switch_row.add_css_class("switch-row");
+        let views = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        views.add_css_class("linked");
+        views.add_css_class("switcher");
+        views.set_homogeneous(true);
+        views.set_hexpand(true);
+        let switch_sessions = gtk::ToggleButton::with_label("Sessions");
+        switch_sessions.set_tooltip_text(Some("Your sessions and handoffs (Esc)"));
+        let switch_files = gtk::ToggleButton::with_label("Files");
+        switch_files.set_tooltip_text(Some("The files of the session you picked (f)"));
+        switch_files.set_group(Some(&switch_sessions));
+        switch_sessions.set_active(true);
+        let new_btn = gtk::Button::with_label("+ New");
+        new_btn.add_css_class("new");
+        new_btn.set_tooltip_text(Some("Start a new session (n)"));
+        for b in [switch_sessions.upcast_ref::<gtk::Button>(), switch_files.upcast_ref(), &new_btn] {
+            b.set_focus_on_click(false);
+            clickable(b);
+        }
+        views.append(&switch_sessions);
+        views.append(&switch_files);
+        switch_row.append(&views);
+        switch_row.append(&new_btn);
+        sidebar.append(&switch_row);
+
         let stack = gtk::Stack::new();
         stack.set_vexpand(true);
         stack.set_transition_type(gtk::StackTransitionType::None);
@@ -325,6 +424,7 @@ impl App {
         list.add_css_class("sessions");
         list.set_selection_mode(gtk::SelectionMode::Single);
         list.set_activate_on_single_click(false);
+        clickable(&list);
         let scroller = gtk::ScrolledWindow::new();
         scroller.add_css_class("list");
         scroller.set_hscrollbar_policy(gtk::PolicyType::Never);
@@ -358,8 +458,10 @@ impl App {
         page.append(&ns_entry);
         page.append(&ns_error);
         page.append(&ns_hint);
+        clickable(&ns_folders);
         stack.add_named(&page, Some("new"));
-        stack.add_named(&help_page(), Some("help"));
+        let (help_scroll, help) = help_page();
+        stack.add_named(&help_scroll, Some("help"));
 
         // files: a session's changed files, then its folder as a tree
         let fpage = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -427,12 +529,7 @@ impl App {
         notebook.set_show_border(false);
         notebook.set_hexpand(true);
         notebook.set_vexpand(true);
-        let files_btn = gtk::Button::with_label("Files");
-        files_btn.add_css_class("files");
-        files_btn.set_focusable(false);
-        files_btn.set_tooltip_text(Some("The changed files and folder of what this tab shows"));
-        notebook.set_action_widget(&files_btn, gtk::PackType::End);
-        let empty =gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let empty = gtk::Box::new(gtk::Orientation::Vertical, 8);
         empty.add_css_class("empty");
         empty.set_valign(gtk::Align::Fill);
         let inner = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -440,9 +537,11 @@ impl App {
         inner.set_vexpand(true);
         let big = gtk::Label::new(Some("No session open"));
         big.add_css_class("big");
-        let small = gtk::Label::new(Some("Pick one on the left, or press n there to start one."));
+        let small = gtk::Label::new(Some("Click a session on the left to open it, or + New to start one."));
+        let small2 = gtk::Label::new(Some("Click a file path in a session, or open Files, to edit a file."));
         inner.append(&big);
         inner.append(&small);
+        inner.append(&small2);
         empty.append(&inner);
         let right = gtk::Stack::new();
         right.add_named(&empty, Some("empty"));
@@ -464,9 +563,15 @@ impl App {
             window,
             store: Store::start(Env::from_env()),
             sidebar,
-            needs_label,
-            dot_label,
-            turn_label,
+            needs_btn,
+            turn_btn,
+            switch_sessions,
+            switch_files,
+            new_btn,
+            switching: Cell::new(false),
+            auto_head: Cell::new(false),
+            help,
+            collapsed: RefCell::new(load_collapsed()),
             usage_rows,
             usage_note,
             stack,
@@ -497,15 +602,14 @@ impl App {
             fp_shown: RefCell::new(vec![]),
             fp_ignored,
             fp_timer: RefCell::new(None),
-            files_btn,
+            fp_follow: RefCell::new(None),
+            fp_pinned: Cell::new(false),
             scans: Arc::default(),
             allow_close: Cell::new(false),
             snap: RefCell::new(Snap::default()),
             items: RefCell::new(vec![]),
             rows: RefCell::new(HashMap::new()),
             order: Rc::new(RefCell::new(HashMap::new())),
-            heads: Rc::new(RefCell::new(HashMap::new())),
-            counts: Rc::new(RefCell::new(HashMap::new())),
             placed: RefCell::new(HashMap::new()),
             tabs: RefCell::new(vec![]),
             handoffs_open: Cell::new(false),
@@ -558,7 +662,23 @@ impl App {
                     ed.shot_command(cmd);
                 }
             } else if name == "files" {
-                app.files_for_current_tab();
+                app.switch_files.set_active(true);
+            } else if name == "sessions" {
+                app.switch_sessions.set_active(true);
+            } else if let Some(sec) = name.strip_prefix("toggle:") {
+                if let Some(s) = Section::ALL.into_iter().find(|s| s.key().eq_ignore_ascii_case(sec)) {
+                    app.toggle_section(s);
+                }
+            } else if let Some(what) = name.strip_prefix("hover:") {
+                // the hover look, for pictures (broadway has no pointer): hover:row:N, hover:files, hover:new
+                let w: Option<gtk::Widget> = match what {
+                    "files" => Some(app.switch_files.clone().upcast()),
+                    "new" => Some(app.new_btn.clone().upcast()),
+                    _ => what.strip_prefix("row:").and_then(|n| n.parse().ok()).and_then(|n| app.list.row_at_index(n)).map(|r| r.upcast()),
+                };
+                if let Some(w) = w {
+                    w.add_css_class("shot-hover"); // theme.rs copies the :hover rules to it
+                }
             } else if let Some(key) = gdk::Key::from_name(name) {
                 app.on_key(key, gdk::ModifierType::empty());
             }
@@ -576,39 +696,71 @@ impl App {
             let kb = o.get(b.widget_name().as_str()).copied().unwrap_or((9, 9, usize::MAX));
             ka.cmp(&kb).into()
         });
-        let (heads, counts) = (self.heads.clone(), self.counts.clone());
-        self.list.set_header_func(move |row, before| {
-            let h = heads.borrow();
-            let sec = h.get(row.widget_name().as_str()).copied();
-            let prev = before.and_then(|b| h.get(b.widget_name().as_str()).copied());
-            match sec {
-                Some(sec) if Some(sec) != prev => {
-                    let n = counts.borrow().get(&sec).copied().unwrap_or(0);
-                    let b = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-                    b.add_css_class("section");
-                    if before.is_none() {
-                        b.add_css_class("first");
-                    }
-                    if sec == Section::Lost {
-                        b.add_css_class("warn");
-                    }
-                    b.append(&gtk::Label::new(Some(sec.title())));
-                    if n > 0 {
-                        b.append(&label(&n.to_string(), &["dim"]));
-                    }
-                    row.set_header(Some(&b));
-                }
-                _ => row.set_header(None::<&gtk::Widget>),
-            }
-        });
         let weak = Rc::downgrade(self);
         self.list.connect_selected_rows_changed(move |_| {
             if let Some(app) = weak.upgrade() {
                 if !app.syncing.get() {
+                    app.auto_head.set(false);
                     app.show_details();
+                    // Files follows the session you pick (a folder picked by hand stays)
+                    if let Some(i) = app.current().filter(|i| i.kind == Kind::Session && truthy(pget(&i.obj, "bg"))) {
+                        app.follow(Follow::Session(py_str(pget(&i.obj, "id"))), false);
+                    }
                 }
             }
         });
+
+        // Sessions | Files
+        let weak = Rc::downgrade(self);
+        self.switch_sessions.connect_toggled(move |b| {
+            if let Some(app) = weak.upgrade() {
+                if b.is_active() && !app.switching.get() {
+                    app.back_to_list();
+                }
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.switch_files.connect_toggled(move |b| {
+            if let Some(app) = weak.upgrade() {
+                if b.is_active() && !app.switching.get() {
+                    app.open_files(true);
+                }
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.new_btn.connect_clicked(move |_| {
+            if let Some(app) = weak.upgrade() {
+                app.new_session();
+            }
+        });
+        for (b, state) in [(&self.needs_btn, "needs you"), (&self.turn_btn, "your turn")] {
+            let weak = Rc::downgrade(self);
+            b.connect_clicked(move |_| {
+                if let Some(app) = weak.upgrade() {
+                    app.select_next_in_state(state);
+                }
+            });
+        }
+
+        // a click anywhere in the sidebar gives it the keyboard (Esc, the letter keys), unless
+        // the click itself sent focus somewhere (a session opened on the right, say)
+        let any_click = gtk::GestureClick::new();
+        any_click.set_button(0);
+        any_click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = Rc::downgrade(self);
+        any_click.connect_pressed(move |_, _, _, _| {
+            let weak = weak.clone();
+            glib::idle_add_local_once(move || {
+                let Some(app) = weak.upgrade() else { return };
+                let focus = gtk::prelude::GtkWindowExt::focus(&app.window);
+                let inside = focus.as_ref().is_some_and(|w| w.is_ancestor(&app.sidebar));
+                let in_popover = focus.as_ref().is_some_and(|w| w.ancestor(gtk::Popover::static_type()).is_some());
+                if !inside && !in_popover {
+                    app.focus_list();
+                }
+            });
+        });
+        self.sidebar.add_controller(any_click);
 
         // left click: one click opens, a handoff needs two (it starts a whole session)
         let click = gtk::GestureClick::new();
@@ -701,17 +853,14 @@ impl App {
                     tab.shown_at.set(now());
                 }
                 let a = app.clone();
-                glib::idle_add_local_once(move || a.mark_shown());
+                glib::idle_add_local_once(move || {
+                    a.mark_shown();
+                    a.follow_current_tab(); // after the tab's folder is set
+                });
             }
         });
 
         // files
-        let weak = Rc::downgrade(self);
-        self.files_btn.connect_clicked(move |_| {
-            if let Some(app) = weak.upgrade() {
-                app.files_for_current_tab();
-            }
-        });
         self.wire_files_page();
         // unsaved files are asked about before the window goes
         let weak = Rc::downgrade(self);
@@ -881,6 +1030,7 @@ impl App {
         let (lost, mine, standby, paused, windows, handoffs) = self.snap_lists();
         let loaded = self.snap.borrow().loaded;
         let mut items = vec![];
+        // `sub` orders rows inside a section; 0 is the heading's
         let mut push = |kind, section, sub, obj: Value| {
             let id = match kind {
                 Kind::Lost => py_str(pget(&obj, "sessionId")),
@@ -892,44 +1042,64 @@ impl App {
             items.push(Item { key, kind, section, sub, obj });
         };
         for r in lost {
-            push(Kind::Lost, Section::Lost, 0, r);
+            push(Kind::Lost, Section::Lost, 1, r);
         }
         let none_running = mine.is_empty() && standby.is_empty();
         for s in mine {
-            push(Kind::Session, Section::Sessions, 0, s);
+            push(Kind::Session, Section::Sessions, 1, s);
         }
         for r in standby {
-            push(Kind::Lost, Section::Sessions, 1, r);
+            push(Kind::Lost, Section::Sessions, 2, r);
         }
         if none_running {
-            let text = if loaded { "none running · n starts one" } else { "loading sessions…" };
-            push(Kind::Note, Section::Sessions, 9, Value::String(text.into()));
+            let text = if loaded { "None running. Click + New to start one." } else { "loading sessions…" };
+            push(Kind::Note, Section::Sessions, 10, Value::String(text.into()));
         }
         for s in paused {
-            push(Kind::Session, Section::Paused, 0, s);
+            push(Kind::Session, Section::Paused, 1, s);
         }
         for s in windows {
-            push(Kind::Session, Section::Windows, 0, s);
+            push(Kind::Session, Section::Windows, 1, s);
         }
         let total = handoffs.len();
         let fold = total > HANDOFFS_SHOWN + 1;
         let hidden = if fold && !self.handoffs_open.get() { total - HANDOFFS_SHOWN } else { 0 };
         for h in handoffs.into_iter().take(total - hidden) {
-            push(Kind::Handoff, Section::Handoffs, 0, h);
+            push(Kind::Handoff, Section::Handoffs, 1, h);
         }
         if fold {
-            push(Kind::More, Section::Handoffs, 1, serde_json::json!({ "hidden": hidden }));
+            push(Kind::More, Section::Handoffs, 2, serde_json::json!({ "hidden": hidden }));
         }
         if total == 0 && loaded {
-            push(Kind::Note, Section::Handoffs, 9, Value::String("none queued".into()));
+            push(Kind::Note, Section::Handoffs, 10, Value::String("None queued.".into()));
         }
-        items
+        // each section with rows gets a heading row; a folded section shows only its heading
+        let collapsed = self.collapsed.borrow();
+        let mut out = vec![];
+        for sec in Section::ALL {
+            let rows: Vec<Item> = items.iter().filter(|i| i.section == sec).cloned().collect();
+            if rows.is_empty() {
+                continue;
+            }
+            let count = if sec == Section::Handoffs { total } else { rows.iter().filter(|i| !matches!(i.kind, Kind::Note | Kind::More)).count() };
+            let folded = collapsed.contains(&sec.key());
+            out.push(Item { key: format!("Head:{sec:?}"), kind: Kind::Head, section: sec, sub: 0, obj: serde_json::json!({ "count": count, "folded": folded }) });
+            if !folded {
+                out.extend(rows);
+            }
+        }
+        out
     }
 
     /// (icon, icon tone, name, state word, state tone, emphasis) for one row.
     fn row_look(&self, item: &Item) -> (String, &'static str, String, String, &'static str, &'static str) {
         let o = &item.obj;
         match item.kind {
+            Kind::Head => {
+                let chevron = if truthy(pget(o, "folded")) { "▸" } else { "▾" };
+                let tone = if item.section == Section::Lost { "warn" } else { "" };
+                (chevron.into(), "dim", item.section.title().into(), py_str(pget(o, "count")), tone, "")
+            }
             Kind::Session => {
                 let state = session_state(o);
                 let (icon, tone) = match state {
@@ -980,11 +1150,30 @@ impl App {
         name.set_hexpand(true);
         name.set_ellipsize(pango::EllipsizeMode::End);
         let state = label("", &["state"]);
+        let caption = label("", &["caption"]);
+        caption.set_visible(false);
         b.append(&shown);
         b.append(&icon);
         b.append(&name);
         b.append(&state);
+        b.append(&caption);
         row.set_child(Some(&b));
+        if item.kind == Kind::Head {
+            row.add_css_class("head-row");
+            if item.section == Section::Lost {
+                row.add_css_class("warn");
+            }
+            shown.set_visible(false);
+            icon.add_css_class("chevron");
+            name.add_css_class("title");
+            name.set_hexpand(false);
+            state.add_css_class("count");
+            state.set_valign(gtk::Align::Center);
+            caption.set_text(item.section.caption());
+            caption.set_hexpand(true);
+            caption.set_ellipsize(pango::EllipsizeMode::End);
+            caption.set_visible(true);
+        }
         if item.kind == Kind::Note {
             row.add_css_class("note");
             row.set_selectable(false);
@@ -993,7 +1182,7 @@ impl App {
             shown.set_visible(false);
             icon.set_visible(false);
         }
-        Row { row, shown, icon, name, state }
+        Row { row, shown, icon, name, state, caption }
     }
 
     fn update_row(&self, r: &Row, item: &Item, shown_id: Option<&str>) {
@@ -1005,6 +1194,15 @@ impl App {
         r.state.set_text(&state);
         r.state.set_visible(!state.is_empty());
         set_tone(&r.state, stone);
+        if item.kind == Kind::Head {
+            r.name.set_tooltip_text(Some(if truthy(pget(&item.obj, "folded")) { "Click to show this section" } else { "Click to fold this section" }));
+            return;
+        }
+        // "needs you" is the one filled pill; "your turn" is outlined
+        let (needs, turn) = (state == "needs you", state == "your turn");
+        for (class, on) in [("pill", needs || turn), ("pill-needs", needs), ("pill-turn", turn)] {
+            if on { r.state.add_css_class(class) } else { r.state.remove_css_class(class) }
+        }
         let shown = item.kind == Kind::Session && shown_id.is_some_and(|id| py_str(pget(&item.obj, "id")) == id);
         r.shown.set_text(if shown { "▶" } else { "" });
         for (class, on) in [("dimmed", emph == "dim"), ("urgent", emph == "bold")] {
@@ -1054,18 +1252,6 @@ impl App {
                 let rank = if frozen && !placed.is_empty() { placed.get(&it.key).map(|p| p.0).unwrap_or(1_000_000 + i) } else { i };
                 order.insert(it.key.clone(), (it.section.order(), it.sub, rank));
             }
-            let mut heads = self.heads.borrow_mut();
-            heads.clear();
-            let mut counts = self.counts.borrow_mut();
-            counts.clear();
-            for it in &items {
-                heads.insert(it.key.clone(), it.section);
-                if it.kind != Kind::Note && it.kind != Kind::More {
-                    *counts.entry(it.section).or_insert(0) += 1;
-                }
-            }
-            let total = self.snap.borrow().handoffs.len();
-            counts.insert(Section::Handoffs, total);
         }
         *self.items.borrow_mut() = items.clone();
         self.syncing.set(true);
@@ -1091,7 +1277,6 @@ impl App {
             }
         }
         self.list.invalidate_sort();
-        self.list.invalidate_headers();
         // when each row last moved, for the "list just changed" guard
         let t = now();
         let mut i = 0;
@@ -1108,6 +1293,8 @@ impl App {
         }
         // the selection follows its item; if that's gone, it stays at the same place
         let pending = self.pending_key.borrow_mut().take();
+        // a heading the app fell back to (nothing else was there yet) gives way to a row
+        let selected = selected.filter(|k| !(self.auto_head.get() && k.starts_with("Head:")));
         let want = pending.or(selected).filter(|k| self.rows.borrow().contains_key(k));
         match want {
             Some(k) => {
@@ -1133,7 +1320,15 @@ impl App {
             rows.push(r);
             i += 1;
         }
-        let pick = rows.iter().skip(index.max(0) as usize).find(|r| r.is_selectable()).or_else(|| rows.iter().rev().find(|r| r.is_selectable()));
+        // a session or handoff before a heading: the details then say something useful
+        let item_row = |r: &&gtk::ListBoxRow| r.is_selectable() && !r.widget_name().starts_with("Head:");
+        let pick = rows
+            .iter()
+            .skip(index.max(0) as usize)
+            .find(item_row)
+            .or_else(|| rows.iter().rev().find(item_row))
+            .or_else(|| rows.iter().find(|r| r.is_selectable()));
+        self.auto_head.set(pick.is_some_and(|r| r.widget_name().starts_with("Head:")));
         if let Some(r) = pick {
             self.list.select_row(Some(r));
         }
@@ -1162,10 +1357,28 @@ impl App {
         rows[next].grab_focus();
     }
 
+    /// The keyboard to the sidebar's page: the list, or the main widget of the page showing.
     fn focus_list(&self) {
-        if self.stack.visible_child_name().as_deref() != Some("list") {
-            self.stack.visible_child().map(|w| w.grab_focus());
-            return;
+        match self.stack.visible_child_name().as_deref() {
+            Some("files") => {
+                self.fp_view.grab_focus();
+                return;
+            }
+            Some("help") => {
+                self.help.grab_focus();
+                return;
+            }
+            Some("new") => {
+                if WidgetExt::is_visible(&self.ns_entry) {
+                    self.ns_entry.grab_focus();
+                } else if let Some(r) = self.ns_folders.selected_row() {
+                    r.grab_focus();
+                } else {
+                    self.ns_folders.grab_focus();
+                }
+                return;
+            }
+            _ => {}
         }
         match self.list.selected_row() {
             Some(r) => {
@@ -1183,11 +1396,84 @@ impl App {
         states.extend(standby.iter().map(|r| if pget(r, "jobState") == "blocked" { "needs you" } else { "your turn" }));
         let needs = states.iter().filter(|s| **s == "needs you").count();
         let turn = states.iter().filter(|s| **s == "your turn").count();
-        self.needs_label.set_text(&format!("{needs} need{} you", if needs == 1 { "s" } else { "" }));
-        self.needs_label.set_visible(needs > 0);
-        self.turn_label.set_text(&format!("{turn} your turn"));
-        self.turn_label.set_visible(turn > 0);
-        self.dot_label.set_visible(needs > 0 && turn > 0);
+        self.needs_btn.set_label(&format!("{needs} need{} you", if needs == 1 { "s" } else { "" }));
+        self.needs_btn.set_visible(needs > 0);
+        self.turn_btn.set_label(&format!("{turn} your turn"));
+        self.turn_btn.set_visible(turn > 0);
+    }
+
+    /// The header count buttons: select the next running session in `state` (after the
+    /// selected one, round to the first), opening the Sessions section if it's folded.
+    fn select_next_in_state(self: &Rc<Self>, state: &str) {
+        self.cancel_confirm();
+        if self.stack.visible_child_name().as_deref() != Some("list") {
+            self.back_to_list();
+        }
+        if self.collapsed.borrow().contains(&Section::Sessions.key()) {
+            self.toggle_collapsed(&Section::Sessions.key());
+            self.sync();
+        }
+        let in_state: Vec<gtk::ListBoxRow> = self
+            .selectable_rows()
+            .into_iter()
+            .filter(|r| {
+                self.item(&r.widget_name())
+                    .is_some_and(|i| i.section == Section::Sessions && matches!(i.kind, Kind::Session | Kind::Lost) && self.row_look(&i).3 == state)
+            })
+            .collect();
+        if in_state.is_empty() {
+            return;
+        }
+        let cur = self.list.selected_row().and_then(|s| in_state.iter().position(|r| *r == s));
+        let next = &in_state[cur.map(|c| (c + 1) % in_state.len()).unwrap_or(0)];
+        self.list.select_row(Some(next));
+        next.grab_focus();
+    }
+
+    /// Folds or opens a section by hand (remembered).
+    fn toggle_section(self: &Rc<Self>, sec: Section) {
+        self.toggle_collapsed(&sec.key());
+        self.auto_head.set(false);
+        *self.pending_key.borrow_mut() = Some(format!("Head:{sec:?}"));
+        self.sync();
+        self.focus_list();
+    }
+
+    /// ← and → on the list: fold (`true`) or open a section, and select its heading.
+    fn fold_section(self: &Rc<Self>, sec: Section, fold: bool) {
+        if self.collapsed.borrow().contains(&sec.key()) != fold {
+            self.toggle_collapsed(&sec.key());
+        }
+        self.auto_head.set(false);
+        *self.pending_key.borrow_mut() = Some(format!("Head:{sec:?}"));
+        self.sync();
+        self.focus_list();
+    }
+
+    /// Folds or opens one section or Files group, and remembers it in app.json. This is a
+    /// user action, so it writes; nothing else in the app's refreshes does.
+    fn toggle_collapsed(&self, key: &str) -> bool {
+        let folded = {
+            let mut c = self.collapsed.borrow_mut();
+            if c.remove(key) {
+                false
+            } else {
+                c.insert(key.to_owned());
+                true
+            }
+        };
+        if std::env::var_os("PLANE_SHOT").is_none() {
+            // (off-screen pictures don't change your saved choices)
+            let path = app_config_path();
+            let mut v = plane_core::read_json(&path).filter(Value::is_object).unwrap_or_else(|| serde_json::json!({}));
+            let mut list: Vec<String> = self.collapsed.borrow().iter().cloned().collect();
+            list.sort();
+            v["collapsed"] = serde_json::json!(list);
+            if let Err(e) = plane_core::write_json_atomic(&path, &v) {
+                self.say(&format!("couldn't remember that: {e}"), "warn");
+            }
+        }
+        folded
     }
 
     fn show_usage(&self) {
@@ -1226,6 +1512,14 @@ impl App {
         }
         let home = self.home.as_str();
         match item.kind {
+            Kind::Head => {
+                let n = py_str(pget(o, "count"));
+                if truthy(pget(o, "folded")) {
+                    out.push((format!("Folded: {n} hidden. Click the heading, or press →, to show them."), "", 3));
+                } else {
+                    out.push((format!("{n} {}. Click the heading, or press ←, to fold it.", item.section.caption()), "", 3));
+                }
+            }
             Kind::Session => {
                 out.push((tilde(sval(o, "cwd"), home), "", 2));
                 let mut bits = vec![];
@@ -1315,6 +1609,7 @@ impl App {
 
     fn show_hints(&self, item: Option<&Item>) {
         let hint = match item.map(|i| (i.kind, &i.obj)) {
+            Some((Kind::Head, _)) => "←→ fold  n new  ? keys",
             Some((Kind::Handoff, _)) => "v read  x discard  n new  ? keys",
             Some((Kind::Lost, _)) => "x close  n new  ? keys",
             Some((Kind::Session, o)) if truthy(pget(o, "bg")) && truthy(pget(o, "stopped")) => "x close  f files  n new  ? keys",
@@ -1380,7 +1675,16 @@ impl App {
         }
         if n == 1 {
             *self.press.borrow_mut() = (key.clone(), t);
+            flash_pressed(&row);
+            if item.kind == Kind::Head {
+                self.toggle_section(item.section);
+                return;
+            }
             self.list.select_row(Some(&row));
+            if item.kind == Kind::Session && truthy(pget(&item.obj, "bg")) {
+                // a click on a session points Files at it, even over a folder picked by hand
+                self.follow(Follow::Session(py_str(pget(&item.obj, "id"))), true);
+            }
             if item.kind == Kind::Handoff {
                 row.grab_focus();
                 self.say("double-click or press Enter to start", "info");
@@ -1420,12 +1724,19 @@ impl App {
             self.back_to_list();
             return glib::Propagation::Stop;
         }
-        if page == "new" || page == "files" {
+        if page == "files" {
+            return self.files_key(key, mods);
+        }
+        if page == "new" {
             if key == K::Escape {
                 self.back_to_list();
                 return glib::Propagation::Stop;
             }
             return glib::Propagation::Proceed;
+        }
+        if ctrl && !shift && !other && key.to_lower() == K::p {
+            self.find_a_file();
+            return glib::Propagation::Stop;
         }
         // a paste in the sidebar was meant for the session
         if (ctrl && key.to_lower() == K::v) || (shift && key == K::Insert) {
@@ -1442,11 +1753,27 @@ impl App {
             K::Down | K::j | K::KP_Down => self.move_selection(|c, _| c + 1),
             K::Home | K::g => self.move_selection(|_, _| 0),
             K::End | K::G => self.move_selection(|_, n| n - 1),
+            K::Right | K::l if kind == Some(Kind::Head) => {
+                if let Some(i) = item {
+                    self.fold_section(i.section, false);
+                }
+            }
+            K::Left | K::h => {
+                if let Some(i) = item {
+                    self.fold_section(i.section, true);
+                }
+            }
+            K::space if kind == Some(Kind::Head) => {
+                if let Some(i) = item {
+                    self.toggle_section(i.section);
+                }
+            }
             K::Return | K::KP_Enter | K::Right | K::l => {
                 if let Some(item) = item {
                     self.activate(&item);
                 }
             }
+            K::slash => self.find_a_file(),
             K::n => self.new_session(),
             K::x | K::X | K::d => match (kind, item) {
                 (Some(Kind::Session), Some(i)) => self.close(&i.obj),
@@ -1459,11 +1786,10 @@ impl App {
                     self.pause(&i.obj);
                 }
             }
-            K::f => {
-                if let (Some(Kind::Session), Some(i)) = (kind, item) {
-                    self.files_for_session(&i.obj);
-                }
-            }
+            K::f => match (kind, item) {
+                (Some(Kind::Session), Some(i)) => self.files_for_session(&i.obj),
+                _ => self.open_files(true),
+            },
             K::u => self.undo_discard(),
             K::v => {
                 if let (Some(Kind::Handoff), Some(i)) = (kind, item) {
@@ -1491,6 +1817,7 @@ impl App {
 
     fn activate(self: &Rc<Self>, item: &Item) {
         match item.kind {
+            Kind::Head => self.toggle_section(item.section),
             Kind::Session => self.attach(&item.obj),
             Kind::Handoff => self.launch_handoff(&item.obj),
             Kind::Lost => self.resume_lost(&item.obj),
@@ -1585,6 +1912,7 @@ impl App {
                     acts.append(Some("Discard"), Some("row.close"));
                 }
                 Kind::More => acts.append(Some(if num(pget(o, "hidden")) > 0.0 { "Show all handoffs" } else { "Show fewer" }), Some("row.open")),
+                Kind::Head => acts.append(Some(if truthy(pget(o, "folded")) { "Show this section" } else { "Fold this section" }), Some("row.open")),
                 Kind::Note => {}
             }
             menu.append_section(None, &acts);
@@ -1764,6 +2092,8 @@ impl App {
         }
         head.append(&title_label);
         head.append(&close);
+        clickable(&head);
+        clickable(&close);
         let tab = Rc::new(Tab {
             kind: RefCell::new(kind),
             page: page.clone(),
@@ -2451,31 +2781,87 @@ impl App {
         );
     }
 
+    /// `f` or the menu's Files on a session: that session's files, now.
     fn files_for_session(self: &Rc<Self>, s: &Value) {
-        let (_, origin) = self.session_origin(s);
-        self.show_files(origin);
+        if truthy(pget(s, "bg")) {
+            self.follow(Follow::Session(py_str(pget(s, "id"))), true);
+            self.open_files(true);
+        } else {
+            let (_, origin) = self.session_origin(s);
+            self.fp_pinned.set(false);
+            *self.fp_follow.borrow_mut() = Some(Follow::Folder(origin.clone()));
+            self.show_files(origin, true);
+        }
     }
 
-    /// The Files button: the files of the session (or folder) the current tab belongs to.
-    fn files_for_current_tab(self: &Rc<Self>) {
+    /// Points Files at a session or folder: shown now if Files is open, else next time.
+    /// `by_click` (a click on a session) overrides a folder picked by hand; tab switches
+    /// and selection moves don't.
+    fn follow(self: &Rc<Self>, f: Follow, by_click: bool) {
+        if by_click {
+            self.fp_pinned.set(false);
+        } else if self.fp_pinned.get() {
+            return;
+        }
+        *self.fp_follow.borrow_mut() = Some(f);
+        if self.stack.visible_child_name().as_deref() == Some("files") {
+            self.open_files(false);
+        }
+    }
+
+    /// A tab came to the front: Files follows its session, or the folder its file came from.
+    fn follow_current_tab(self: &Rc<Self>) {
         let Some(tab) = self.current_tab() else { return };
         let kind = tab.kind.borrow().clone();
-        if let TabKind::Session(id) = &kind {
-            if let Some(s) = self.session_obj(id) {
-                return self.files_for_session(&s);
-            }
-        }
-        let origin = tab.origin.borrow().clone();
-        match origin {
-            Some(o) => match o.session.as_ref().and_then(|id| self.session_obj(id)) {
-                Some(s) => self.files_for_session(&s),
-                None => self.show_files(o),
-            },
-            None => self.say("this tab has no folder to show", "info"),
+        let f = match kind {
+            TabKind::Session(id) => Some(Follow::Session(id)),
+            _ => tab.origin.borrow().clone().map(|o| match &o.session {
+                Some(id) if self.session_obj(id).is_some() => Follow::Session(id.clone()),
+                _ => Follow::Folder(o),
+            }),
+        };
+        if let Some(f) = f {
+            self.follow(f, false);
         }
     }
 
-    fn show_files(self: &Rc<Self>, origin: Origin) {
+    fn follow_origin(&self) -> Option<Origin> {
+        match self.fp_follow.borrow().clone()? {
+            Follow::Session(id) => self.session_obj(&id).map(|s| self.session_origin(&s).1),
+            Follow::Folder(o) => Some(o),
+        }
+    }
+
+    /// Shows the Files view: a folder picked by hand, else what it follows (the session you
+    /// last picked or the tab in front), else the folder it last showed, else home.
+    fn open_files(self: &Rc<Self>, focus: bool) {
+        let pinned = if self.fp_pinned.get() { self.fp_origin.borrow().clone() } else { None };
+        let origin = pinned.or_else(|| self.follow_origin()).or_else(|| self.fp_origin.borrow().clone()).unwrap_or_else(|| Origin {
+            root: self.env.home.clone(),
+            session: None,
+            name: "~".into(),
+        });
+        self.show_files(origin, focus);
+    }
+
+    /// `/` and Ctrl+P: the Files view with the cursor in its find box.
+    fn find_a_file(self: &Rc<Self>) {
+        if self.stack.visible_child_name().as_deref() != Some("files") {
+            self.open_files(true);
+        }
+        self.fp_view.grab_focus();
+    }
+
+    /// Keys in the Files view.
+    fn files_key(self: &Rc<Self>, key: gdk::Key, _mods: gdk::ModifierType) -> glib::Propagation {
+        if key == gdk::Key::Escape {
+            self.back_to_list();
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    }
+
+    fn show_files(self: &Rc<Self>, origin: Origin, focus: bool) {
         self.cancel_confirm();
         let same = self.fp_origin.borrow().as_ref().is_some_and(|o| o.root == origin.root);
         self.fp_title.set_text(&format!("FILES · {}", origin.name));
@@ -2503,7 +2889,9 @@ impl App {
             });
             *self.fp_timer.borrow_mut() = Some(id);
         }
-        self.fp_view.grab_focus();
+        if focus {
+            self.fp_view.grab_focus();
+        }
     }
 
     /// The changed lists at the top (git status, and what the session's transcripts say it
@@ -2720,6 +3108,15 @@ impl App {
         self.stack.set_visible_child_name(name);
         self.details.set_visible(name == "list");
         self.hints.set_visible(name == "list");
+        // the switcher shows which view this is (New and Keys belong to Sessions)
+        self.switching.set(true);
+        if name == "files" {
+            self.switch_files.set_active(true);
+        } else {
+            self.switch_sessions.set_active(true);
+        }
+        self.switching.set(false);
+        self.new_btn.set_visible(name != "files");
     }
 
     fn back_to_list(&self) {
@@ -2731,9 +3128,7 @@ impl App {
     fn show_help(&self) {
         self.cancel_confirm();
         self.show_page("help");
-        if let Some(h) = self.stack.child_by_name("help") {
-            h.grab_focus();
-        }
+        self.help.grab_focus();
     }
 
     fn new_session(self: &Rc<Self>) {
@@ -2899,7 +3294,8 @@ fn kitty_plane_shows() -> Option<String> {
     None
 }
 
-fn help_page() -> gtk::Widget {
+/// The keys page: (the scrolled page, the grid that takes the keyboard).
+fn help_page() -> (gtk::Widget, gtk::Widget) {
     let rows: &[(&str, &str)] = &[
         ("#", "ANY ROW"),
         ("Enter / click", "open it"),
@@ -2959,5 +3355,5 @@ fn help_page() -> gtk::Widget {
     let s = gtk::ScrolledWindow::new();
     s.set_hscrollbar_policy(gtk::PolicyType::Never);
     s.set_child(Some(&b));
-    s.upcast()
+    (s.upcast(), b.upcast())
 }

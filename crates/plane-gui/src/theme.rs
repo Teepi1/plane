@@ -64,21 +64,65 @@ progressbar.usage progress { margin: 0; min-width: 0; min-height: 6px; border-ra
 progressbar.usage.warn progress { background: @plane_warn; }
 progressbar.usage.bad progress { background: @plane_bad; }
 scrolledwindow.list, list.sessions { background: transparent; }
-list.sessions row { padding: 3px 10px 3px 7px; min-height: 26px; border-left: 3px solid transparent; color: @plane_fg; outline: none; }
+list.sessions row { padding: 3px 10px 3px 7px; min-height: 30px; border-left: 3px solid transparent; color: @plane_fg; font-size: 1em; }
 list.sessions row:selected { background: @term_0; border-left-color: @plane_accent; }
 list.sessions row:selected .name { font-weight: bold; }
-list.sessions row:hover:not(:selected) { background: alpha(@term_0, 0.55); }
-list.sessions row.note { color: @plane_dim; min-height: 22px; }
+list.sessions row.note { color: @plane_dim; min-height: 26px; }
 list.sessions row .icon { font-weight: bold; min-width: 14px; }
 list.sessions row .shown { color: @plane_accent; min-width: 10px; }
 list.sessions row.dimmed .name, list.sessions row.dimmed .state { color: @plane_dim; }
 list.sessions row.urgent .name { font-weight: bold; }
-.section { color: @plane_fg; font-size: 0.85em; font-weight: bold; letter-spacing: 1px; padding: 12px 12px 3px 12px; }
-.section.first { padding-top: 4px; }
-.section.warn { color: @plane_warn; }
+list.sessions row .state { font-size: 0.9em; }
+/* section headings: real rows with a chevron, a count and a caption */
+list.sessions row.head-row { min-height: 32px; margin-top: 8px; padding-left: 9px; }
+list.sessions row.head-row:first-child { margin-top: 2px; }
+list.sessions row.head-row .title { font-weight: bold; font-size: 1em; }
+list.sessions row.head-row .chevron { color: @plane_dim; min-width: 12px; }
+list.sessions row.head-row.warn .title, list.sessions row.head-row.warn .chevron { color: @plane_warn; }
+list.sessions row.head-row .count { font-size: 0.85em; font-weight: bold; color: @plane_fg; background: alpha(@plane_dim, 0.22); border-radius: 9px; padding: 0 7px; min-width: 8px; }
+list.sessions row.head-row .caption { color: @plane_dim; font-size: 0.9em; }
+/* states: \"needs you\" is the one filled pill */
+.pill { font-size: 0.85em; font-weight: bold; border-radius: 10px; padding: 1px 8px; }
+.pill.pill-needs { background: @plane_warn; color: @plane_bg; }
+.pill.pill-turn { border: 1px solid @plane_accent; color: @plane_accent; padding: 0 7px; }
+/* the header counts, as buttons */
+button.count-btn { padding: 1px 8px; min-height: 20px; border-radius: 10px; font-weight: bold; font-size: 0.85em; background: transparent; border: 1px solid transparent; box-shadow: none; }
+button.count-btn.needs { background: @plane_warn; color: @plane_bg; }
+button.count-btn.turn { color: @plane_accent; border-color: @plane_accent; }
+/* Sessions | Files, and + New */
+.switch-row { padding: 8px 10px 6px 10px; }
+.switcher button { min-height: 32px; padding: 0 10px; font-weight: bold; color: @plane_dim; background: @term_0; border: 1px solid @plane_outline; box-shadow: none; }
+.switcher button:first-child { border-radius: 7px 0 0 7px; }
+.switcher button:last-child { border-radius: 0 7px 7px 0; border-left-width: 0; }
+.switcher button:checked { color: @plane_fg; background: alpha(@plane_accent, 0.22); border-color: @plane_accent; box-shadow: inset 0 -3px @plane_accent; }
+.switch-row button.new { min-height: 32px; padding: 0 12px; border-radius: 7px; font-weight: bold; color: @plane_accent; background: @term_0; border: 1px solid @plane_outline; box-shadow: none; }
+
+/* hover and press, everywhere you can click (\"Bigger\"): a tint, a lift with a shadow and
+   an accent outline on hover; a dip on press. Dense list rows don't move up, so the list
+   doesn't jitter. */
+.sidebar button, .files-page button, .file button, .file-message button, .empty button, notebook > header tabs > tab, popover.files-pop button, popover.name-pop button {
+  transition: background-color 120ms ease-out, box-shadow 120ms ease-out, transform 120ms ease-out, outline-color 120ms ease-out, color 120ms ease-out;
+  outline: 1px solid transparent; outline-offset: -1px;
+}
+.sidebar button:hover, .files-page button:hover, .file button:hover, .file-message button:hover, .empty button:hover, notebook > header tabs > tab:hover, popover.files-pop button:hover, popover.name-pop button:hover {
+  outline-color: @plane_accent; box-shadow: 0 3px 8px alpha(black, 0.45); transform: translateY(-1px);
+}
+.sidebar button:hover:not(.count-btn):not(:checked), .files-page button:hover, notebook > header tabs > tab:hover:not(:checked) { background-color: mix(@term_0, @plane_fg, 0.1); }
+.sidebar button:active, .files-page button:active, .file button:active, .file-message button:active, .empty button:active, notebook > header tabs > tab:active, popover.files-pop button:active, popover.name-pop button:active {
+  transform: scale(0.97); box-shadow: none; background-color: mix(@term_0, black, 0.3);
+}
+list.sessions row, .files-page listview > row {
+  transition: background-color 120ms ease-out, box-shadow 120ms ease-out, outline-color 120ms ease-out;
+  outline: 1px solid transparent; outline-offset: -1px;
+}
+list.sessions row:hover:not(.note), .files-page listview > row:hover {
+  background-color: mix(@term_0, @plane_fg, 0.06); outline-color: alpha(@plane_accent, 0.75); box-shadow: 0 2px 6px alpha(black, 0.35);
+}
+list.sessions row:selected:hover { background-color: mix(@term_0, @plane_fg, 0.1); }
+list.sessions row.pressed, .files-page listview > row.pressed, .files-page row .pressed { background-color: mix(@term_0, black, 0.3); box-shadow: none; }
 .more-above, .more-below { font-size: 0.85em; padding: 0 12px; }
 .details { padding: 6px 12px 4px 12px; border-top: 1px solid @plane_outline; min-height: 118px; }
-.details .name { font-weight: bold; }
+.details .name { font-weight: bold; font-size: 1.05em; }
 .message { padding: 2px 12px; min-height: 22px; }
 .confirm { padding: 4px 12px; }
 .confirm .question { color: @plane_warn; font-weight: bold; }
@@ -156,7 +200,10 @@ pub fn defines() -> String {
 }
 
 pub fn css(defines: &str) -> String {
-    format!("{defines}\n{APP_CSS}")
+    // off-screen pictures: broadway with no browser never runs a transition to its end
+    // and has no pointer, so the hover look is pictured through a class (`hover:` keys)
+    let shot = if std::env::var_os("PLANE_SHOT").is_some() { format!("* {{ transition: none; }}\n{}", APP_CSS.replace(":hover", ".shot-hover")) } else { String::new() };
+    format!("{defines}\n{APP_CSS}\n{shot}")
 }
 
 /// name -> color, from `@define-color name #rrggbb;` lines.
