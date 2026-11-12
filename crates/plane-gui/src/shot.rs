@@ -35,7 +35,11 @@ pub fn arm(window: &gtk::ApplicationWindow, press: std::rc::Rc<dyn Fn(&str)>) {
         glib::timeout_add_local_once(delay, move || p(&k));
     }
     let w = window.clone();
+    let late = std::env::var("PLANE_DUMP_LATE").ok(); // a `dump:` right before the picture
     glib::timeout_add_local_once(std::time::Duration::from_secs_f64(after), move || {
+        if let Some(f) = &late {
+            press(&format!("dump:{f}"));
+        }
         let (width, height) = (w.width(), w.height());
         let content = w.child().unwrap_or_else(|| w.clone().upcast());
 

@@ -781,6 +781,29 @@ impl App {
                     "popover" => app.fp_folder.popup(),
                     _ => {}
                 }
+            } else if let Some(cmd) = name.strip_prefix("term:") {
+                // a tab running CMD (words split on `,`) in the folder Files shows, as a session tab
+                let cwd = app.fp_origin.borrow().as_ref().map(|o| o.root.to_string_lossy().into_owned()).unwrap_or_else(|| app.home.clone());
+                let tab = app.add_term_tab(TabKind::Session("test".into()), "test", &cwd);
+                if let Some(t) = &tab.term {
+                    let argv: Vec<String> = cmd.split(',').map(str::to_owned).collect();
+                    term::spawn(t, &argv, &cwd, |_| {});
+                }
+            } else if let Some(spec) = name.strip_prefix("locate:") {
+                // locate:TEXT=OUTFILE: where TEXT shows in the current terminal, in window pixels
+                let (text, out) = spec.split_once('=').unwrap_or((spec, "/dev/null"));
+                // (the terminal is scanned for the spot where VTE sees TEXT as a path or link)
+                if let Some(t) = app.current_tab().and_then(|t| t.term.clone()) {
+                    let (w, h) = (t.width() as f64, t.height() as f64);
+                    let hit = (0..(h as i32)).step_by(3).flat_map(|y| (0..(w as i32)).step_by(4).map(move |x| (x as f64, y as f64))).find(|&(x, y)| {
+                        t.check_match_at(x, y).0.is_some_and(|m| m.contains(text)) || t.check_hyperlink_at(x, y).is_some() && t.check_match_at(x, y).0.is_some_and(|m| m.contains(text))
+                    });
+                    if let Some((x, y)) = hit {
+                        if let Some(at) = t.compute_point(&app.window, &gtk::graphene::Point::new(x as f32 + 6.0, y as f32 + 4.0)) {
+                            let _ = std::fs::write(out, format!("{} {}\n", at.x(), at.y()));
+                        }
+                    }
+                }
             } else if let Some(p) = name.strip_prefix("touch:") {
                 // a file made outside the app, as a session would make it
                 let _ = std::fs::write(p, "made outside\n");

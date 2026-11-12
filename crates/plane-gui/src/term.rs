@@ -168,30 +168,47 @@ pub fn new_terminal(theme: &HashMap<String, gdk::RGBA>, scale: Rc<Cell<f64>>, op
     });
     term.add_controller(keys);
 
-    // a click (not a drag) on a file path or a link opens it; the click still reaches the
-    // terminal, so selecting text and the session's own mouse use are untouched
-    let click = gtk::GestureClick::new();
-    click.set_button(1);
-    click.set_propagation_phase(gtk::PropagationPhase::Capture);
-    let down = Rc::new(Cell::new((0.0, 0.0)));
-    let d = down.clone();
-    click.connect_pressed(move |_, _, x, y| d.set((x, y)));
+    // a click (not a drag) on a file path or a link opens it. The raw press and release are
+    // watched, not a click gesture: VTE takes over the press for its own selection and for
+    // the session's mouse use (`claude attach` turns mouse reporting on), so a gesture never
+    // hears the release. Both still reach the terminal untouched.
+    let raw = gtk::EventControllerLegacy::new();
+    raw.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let down: Rc<Cell<Option<(f64, f64)>>> = Rc::default();
     let t = term.clone();
-    click.connect_released(move |_, _, x, y| {
-        let (x0, y0) = down.get();
+    raw.connect_event(move |_, ev| {
+        let left = ev.downcast_ref::<gdk::ButtonEvent>().is_some_and(|b| b.button() == 1);
+        let pressed = ev.event_type() == gdk::EventType::ButtonPress;
+        if !left || !(pressed || ev.event_type() == gdk::EventType::ButtonRelease) {
+            return glib::Propagation::Proceed;
+        }
+        let Some((x, y)) = event_point(&t, ev) else { return glib::Propagation::Proceed };
+        if pressed {
+            down.set(Some((x, y)));
+            return glib::Propagation::Proceed;
+        }
+        let Some((x0, y0)) = down.take() else { return glib::Propagation::Proceed };
         if (x - x0).hypot(y - y0) > 4.0 {
-            return;
+            return glib::Propagation::Proceed; // a drag: selecting text
         }
         if let Some(uri) = t.check_hyperlink_at(x, y) {
             open(uri.to_string());
-            return;
-        }
-        if let (Some(text), _) = t.check_match_at(x, y) {
+        } else if let (Some(text), _) = t.check_match_at(x, y) {
             open(text.to_string());
         }
+        glib::Propagation::Proceed
     });
-    term.add_controller(click);
+    term.add_controller(raw);
     term
+}
+
+/// Where an event happened, in `w`'s own coordinates (raw events come in the window's).
+fn event_point(w: &impl IsA<gtk::Widget>, ev: &gdk::Event) -> Option<(f64, f64)> {
+    let (ex, ey) = ev.position()?;
+    let native = w.native()?;
+    let (nx, ny) = native.surface_transform();
+    let p = native.compute_point(w, &gtk::graphene::Point::new((ex - nx) as f32, (ey - ny) as f32))?;
+    Some((p.x() as f64, p.y() as f64))
 }
 
 /// Runs `argv` in the terminal, in `cwd`.
