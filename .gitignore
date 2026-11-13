@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+
+# Claude Code
+.claude/worktrees/
+CLAUDE.local.md
+.claude/settings.local.json
