@@ -209,6 +209,11 @@ pub fn new_terminal(theme: &HashMap<String, gdk::RGBA>, scale: Rc<Cell<f64>>, op
         glib::Propagation::Stop
     });
     term.add_controller(raw);
+    // a program that has ended has no pid to hang up (the number may be another program's by now)
+    // SAFETY: CHILD only ever holds an i32
+    term.connect_child_exited(|t, _| unsafe {
+        t.steal_data::<i32>(CHILD);
+    });
     term
 }
 
@@ -221,8 +226,32 @@ fn event_point(w: &impl IsA<gtk::Widget>, ev: &gdk::Event) -> Option<(f64, f64)>
     Some((p.x() as f64, p.y() as f64))
 }
 
+/// Where a terminal keeps the pid of the program it runs, for `hang_up`.
+const CHILD: &str = "plane-child";
+
+/// Ends the program in a terminal whose tab is going away, as closing a terminal window
+/// does (SIGHUP: `claude attach` just detaches). Taking the tab away isn't enough: the
+/// terminal's own event handlers keep the widget alive, so its pty stays open and the
+/// program ran on, unseen; opening that session again then attached it a second time.
+pub fn hang_up(term: &vte::Terminal) {
+    // SAFETY: CHILD only ever holds an i32, set in `spawn`
+    if let Some(pid) = unsafe { term.steal_data::<i32>(CHILD) } {
+        if pid > 0 {
+            unsafe { libc::kill(pid, libc::SIGHUP) };
+        }
+    }
+}
+
 /// Runs `argv` in the terminal, in `cwd`.
 pub fn spawn(term: &vte::Terminal, argv: &[String], cwd: &str, done: impl FnOnce(Result<glib::Pid, glib::Error>) + 'static) {
+    let t = term.clone();
+    let done = move |r: Result<glib::Pid, glib::Error>| {
+        if let Ok(pid) = &r {
+            // SAFETY: CHILD only ever holds an i32
+            unsafe { t.set_data(CHILD, pid.0) };
+        }
+        done(r)
+    };
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
     let env = child_env();
     let env: Vec<&str> = env.iter().map(String::as_str).collect();
