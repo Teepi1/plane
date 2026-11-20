@@ -171,11 +171,20 @@ pub fn new_terminal(theme: &HashMap<String, gdk::RGBA>, scale: Rc<Cell<f64>>, op
     // a click (not a drag) on a file path or a link opens it. The raw press and release are
     // watched, not a click gesture: VTE takes over the press for its own selection and for
     // the session's mouse use (`claude attach` turns mouse reporting on), so a gesture never
-    // hears the release. Both still reach the terminal untouched.
+    // hears the release. A press on a link or path is kept from the terminal, with its
+    // release: passed on, it reached Claude too, which opened the link itself, so every
+    // click opened two browser tabs. Presses anywhere else reach the terminal untouched.
     let raw = gtk::EventControllerLegacy::new();
     raw.set_propagation_phase(gtk::PropagationPhase::Capture);
-    let down: Rc<Cell<Option<(f64, f64)>>> = Rc::default();
+    // where the press was, and whether it was on something this click opens
+    let down: Rc<Cell<Option<(f64, f64, bool)>>> = Rc::default();
     let t = term.clone();
+    let target = |t: &vte::Terminal, x: f64, y: f64| -> Option<String> {
+        if let Some(uri) = t.check_hyperlink_at(x, y) {
+            return Some(uri.to_string());
+        }
+        t.check_match_at(x, y).0.map(|s| s.to_string())
+    };
     raw.connect_event(move |_, ev| {
         let left = ev.downcast_ref::<gdk::ButtonEvent>().is_some_and(|b| b.button() == 1);
         let pressed = ev.event_type() == gdk::EventType::ButtonPress;
@@ -184,19 +193,20 @@ pub fn new_terminal(theme: &HashMap<String, gdk::RGBA>, scale: Rc<Cell<f64>>, op
         }
         let Some((x, y)) = event_point(&t, ev) else { return glib::Propagation::Proceed };
         if pressed {
-            down.set(Some((x, y)));
-            return glib::Propagation::Proceed;
+            let ours = target(&t, x, y).is_some();
+            down.set(Some((x, y, ours)));
+            return if ours { glib::Propagation::Stop } else { glib::Propagation::Proceed };
         }
-        let Some((x0, y0)) = down.take() else { return glib::Propagation::Proceed };
-        if (x - x0).hypot(y - y0) > 4.0 {
-            return glib::Propagation::Proceed; // a drag: selecting text
+        let Some((x0, y0, ours)) = down.take() else { return glib::Propagation::Proceed };
+        if !ours {
+            return glib::Propagation::Proceed; // the terminal (and Claude) had the press: theirs
         }
-        if let Some(uri) = t.check_hyperlink_at(x, y) {
-            open(uri.to_string());
-        } else if let (Some(text), _) = t.check_match_at(x, y) {
-            open(text.to_string());
+        if (x - x0).hypot(y - y0) <= 4.0 {
+            if let Some(text) = target(&t, x, y) {
+                open(text);
+            }
         }
-        glib::Propagation::Proceed
+        glib::Propagation::Stop
     });
     term.add_controller(raw);
     term
