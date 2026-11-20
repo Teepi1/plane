@@ -206,11 +206,22 @@ function fitViewport() {
   if (!vv) return;
   // Only while the keyboard is up: otherwise the CSS fills the whole screen (sizing from the
   // viewport left the app short by the status bar's height, a blank band at the bottom).
-  const keyboard = window.innerHeight - vv.height > 80;
+  // vv.height shrinks when the page is zoomed too; times the zoom, only the keyboard counts
+  // (a zoomed page read as "keyboard up" shrank the app to a corner of the screen).
+  const keyboard = window.innerHeight - vv.height * vv.scale > 80;
+  const was = app.classList.contains("kb");
   app.classList.toggle("kb", keyboard);
   app.style.height = keyboard ? `${vv.height}px` : "";
   app.style.top = keyboard ? `${vv.offsetTop}px` : "";
+  // iOS scrolls the page to show a text box and can leave it scrolled once the keyboard is
+  // gone: the app is drawn in place but taps land off by that much, so buttons and
+  // scrolling stop answering. Put the page back.
+  if (was && !keyboard) unscroll();
 }
+function unscroll() { if (window.scrollX || window.scrollY) window.scrollTo(0, 0); }
+// the page itself never scrolls (everything is inside #app); undo it whenever iOS does
+window.addEventListener("scroll", () => { if (!app.classList.contains("kb")) unscroll(); }, { passive: true });
+document.addEventListener("focusout", () => setTimeout(() => { if (!app.classList.contains("kb")) unscroll(); }, 300));
 window.visualViewport && visualViewport.addEventListener("resize", fitViewport);
 window.visualViewport && visualViewport.addEventListener("scroll", fitViewport);
 
@@ -830,6 +841,45 @@ function termView(id) {
   };
   $("#tin").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); $("#tsend").click(); } });
   $("#term").addEventListener("pointerdown", () => $("#tin").blur());  // tap the screen to put the keyboard away
+
+  // Scrolling. Claude runs full screen and takes the mouse, so the terminal has no scrollback
+  // of its own and xterm leaves touches alone: a drag is turned into mouse-wheel clicks for
+  // Claude, which scrolls its conversation (finger down shows older text, as anywhere on a
+  // phone). A program that didn't ask for the mouse scrolls xterm's own scrollback as before.
+  const PX_PER_CLICK = 24;
+  let owed = 0, sendingScroll = false, lastY = null;
+  const claudeHasMouse = () => term && term.modes && term.modes.mouseTrackingMode !== "none";
+  async function flushScroll() {
+    sendingScroll = true;
+    while (Math.trunc(owed)) {
+      const clicks = Math.max(-20, Math.min(20, Math.trunc(owed)));
+      owed -= clicks;
+      try { await api(`/api/session/${id}/key`, { key: "scroll", clicks }); }
+      catch (e) { owed = 0; toast(e.message); }
+    }
+    sendingScroll = false;
+  }
+  function scrollBy(clicks) {  // negative: back to older text
+    if (Math.sign(clicks) !== Math.sign(owed)) owed = 0;  // turned round: drop the rest
+    owed += clicks;
+    if (!sendingScroll) flushScroll();
+  }
+  const tw = $("#term");
+  tw.classList.add("claude");
+  tw.addEventListener("touchstart", e => { lastY = e.touches.length === 1 ? e.touches[0].clientY : null; }, { capture: true, passive: true });
+  tw.addEventListener("touchmove", e => {
+    if (lastY === null || e.touches.length !== 1 || !claudeHasMouse()) return;
+    e.preventDefault();
+    const y = e.touches[0].clientY;
+    const steps = Math.trunc((lastY - y) / PX_PER_CLICK);
+    if (steps) { lastY -= steps * PX_PER_CLICK; scrollBy(steps); }
+  }, { capture: true, passive: false });
+  tw.addEventListener("touchend", () => { lastY = null; }, { capture: true });
+  tw.addEventListener("wheel", e => {  // a mouse or trackpad on a tablet or laptop browser
+    if (!claudeHasMouse()) return;
+    e.preventDefault(); e.stopPropagation();
+    scrollBy(Math.sign(e.deltaY));
+  }, { capture: true, passive: false });
   return { cleanup() { st && st.close(); ro && ro.disconnect(); term && term.dispose(); app.onclick = null; } };
 }
 

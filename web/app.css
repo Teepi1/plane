@@ -230,7 +230,12 @@ textarea.field { max-height: 9.5em; }
 .sugg button { text-align: left; background: var(--surface); border: 0; border-top: 1px solid var(--line); min-height: 44px; padding: 0 14px;
   font-family: var(--mono); font-size: 13px; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sugg button:first-child { border-top: 0; }
-.mono { font-family: var(--mono); font-size: 14px; }
+/* 16px, not smaller: iOS zooms the page in on any text box under 16px when it's tapped and never
+   zooms back out, which left the app zoomed with its buttons off the screen */
+.mono { font-family: var(--mono); font-size: 16px; }
+.xterm .xterm-helper-textarea { font-size: 16px !important; }
+/* a finger on the session terminal scrolls Claude's screen (app.js), not the page */
+#term.claude { touch-action: none; }
 .prompt { padding: 14px 18px 20px; font-size: 15.5px; line-height: 1.55; display: grid; gap: 10px; }
 .warn { margin: 12px 18px 0; padding: 12px 14px; border-radius: 12px; background: var(--surface); font-size: 14.5px; line-height: 1.45; border-left: 3px solid var(--coral); }
 .center { padding: 50px 24px; text-align: center; display: grid; gap: 10px; justify-items: center; line-height: 1.45; }
