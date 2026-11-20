@@ -497,6 +497,7 @@ name = "plane-gui"
 version = "0.1.0"
 dependencies = [
  "gtk4",
+ "libc",
  "plane-core",
  "serde_json",
  "sourceview5",

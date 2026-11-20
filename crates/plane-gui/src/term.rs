@@ -171,11 +171,20 @@ pub fn new_terminal(theme: &HashMap<String, gdk::RGBA>, scale: Rc<Cell<f64>>, op
     // a click (not a drag) on a file path or a link opens it. The raw press and release are
     // watched, not a click gesture: VTE takes over the press for its own selection and for
     // the session's mouse use (`claude attach` turns mouse reporting on), so a gesture never
-    // hears the release. Both still reach the terminal untouched.
+    // hears the release. A press on a link or path is kept from the terminal, with its
+    // release: passed on, it reached Claude too, which opened the link itself, so every
+    // click opened two browser tabs. Presses anywhere else reach the terminal untouched.
     let raw = gtk::EventControllerLegacy::new();
     raw.set_propagation_phase(gtk::PropagationPhase::Capture);
-    let down: Rc<Cell<Option<(f64, f64)>>> = Rc::default();
+    // where the press was, and whether it was on something this click opens
+    let down: Rc<Cell<Option<(f64, f64, bool)>>> = Rc::default();
     let t = term.clone();
+    let target = |t: &vte::Terminal, x: f64, y: f64| -> Option<String> {
+        if let Some(uri) = t.check_hyperlink_at(x, y) {
+            return Some(uri.to_string());
+        }
+        t.check_match_at(x, y).0.map(|s| s.to_string())
+    };
     raw.connect_event(move |_, ev| {
         let left = ev.downcast_ref::<gdk::ButtonEvent>().is_some_and(|b| b.button() == 1);
         let pressed = ev.event_type() == gdk::EventType::ButtonPress;
@@ -184,21 +193,27 @@ pub fn new_terminal(theme: &HashMap<String, gdk::RGBA>, scale: Rc<Cell<f64>>, op
         }
         let Some((x, y)) = event_point(&t, ev) else { return glib::Propagation::Proceed };
         if pressed {
-            down.set(Some((x, y)));
-            return glib::Propagation::Proceed;
+            let ours = target(&t, x, y).is_some();
+            down.set(Some((x, y, ours)));
+            return if ours { glib::Propagation::Stop } else { glib::Propagation::Proceed };
         }
-        let Some((x0, y0)) = down.take() else { return glib::Propagation::Proceed };
-        if (x - x0).hypot(y - y0) > 4.0 {
-            return glib::Propagation::Proceed; // a drag: selecting text
+        let Some((x0, y0, ours)) = down.take() else { return glib::Propagation::Proceed };
+        if !ours {
+            return glib::Propagation::Proceed; // the terminal (and Claude) had the press: theirs
         }
-        if let Some(uri) = t.check_hyperlink_at(x, y) {
-            open(uri.to_string());
-        } else if let (Some(text), _) = t.check_match_at(x, y) {
-            open(text.to_string());
+        if (x - x0).hypot(y - y0) <= 4.0 {
+            if let Some(text) = target(&t, x, y) {
+                open(text);
+            }
         }
-        glib::Propagation::Proceed
+        glib::Propagation::Stop
     });
     term.add_controller(raw);
+    // a program that has ended has no pid to hang up (the number may be another program's by now)
+    // SAFETY: CHILD only ever holds an i32
+    term.connect_child_exited(|t, _| unsafe {
+        t.steal_data::<i32>(CHILD);
+    });
     term
 }
 
@@ -211,8 +226,32 @@ fn event_point(w: &impl IsA<gtk::Widget>, ev: &gdk::Event) -> Option<(f64, f64)>
     Some((p.x() as f64, p.y() as f64))
 }
 
+/// Where a terminal keeps the pid of the program it runs, for `hang_up`.
+const CHILD: &str = "plane-child";
+
+/// Ends the program in a terminal whose tab is going away, as closing a terminal window
+/// does (SIGHUP: `claude attach` just detaches). Taking the tab away isn't enough: the
+/// terminal's own event handlers keep the widget alive, so its pty stays open and the
+/// program ran on, unseen; opening that session again then attached it a second time.
+pub fn hang_up(term: &vte::Terminal) {
+    // SAFETY: CHILD only ever holds an i32, set in `spawn`
+    if let Some(pid) = unsafe { term.steal_data::<i32>(CHILD) } {
+        if pid > 0 {
+            unsafe { libc::kill(pid, libc::SIGHUP) };
+        }
+    }
+}
+
 /// Runs `argv` in the terminal, in `cwd`.
 pub fn spawn(term: &vte::Terminal, argv: &[String], cwd: &str, done: impl FnOnce(Result<glib::Pid, glib::Error>) + 'static) {
+    let t = term.clone();
+    let done = move |r: Result<glib::Pid, glib::Error>| {
+        if let Ok(pid) = &r {
+            // SAFETY: CHILD only ever holds an i32
+            unsafe { t.set_data(CHILD, pid.0) };
+        }
+        done(r)
+    };
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
     let env = child_env();
     let env: Vec<&str> = env.iter().map(String::as_str).collect();

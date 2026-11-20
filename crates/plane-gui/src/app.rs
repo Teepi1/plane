@@ -2434,6 +2434,9 @@ impl App {
 
     fn remove_tab(self: &Rc<Self>, tab: &Rc<Tab>) {
         tab.closing.set(true);
+        if let Some(t) = &tab.term {
+            term::hang_up(t); // or it runs on: a closed session tab left its `claude attach` behind
+        }
         // a handoff still starting (at a trust prompt, say) stops with its tab: back in the queue
         if let TabKind::Starting(Some(done)) = tab.kind.borrow().clone() {
             let started = plane_core::read_json(&done).is_some_and(|h| truthy(pget(&h, "launchedSessionId")));
