@@ -434,6 +434,16 @@ class PtyScreen:
         time.sleep(0.1)
         self.write(b"\r")
 
+    def scroll(self, clicks):
+        """Mouse-wheel clicks in the middle of the screen (SGR mouse): up (older) when
+        negative, down when positive. At most 20 a call."""
+        clicks = max(-20, min(20, int(clicks)))
+        if not clicks:
+            return
+        button = 64 if clicks < 0 else 65
+        x, y = max(1, self.cols // 2), max(1, self.rows // 2)
+        self.write(f"\x1b[<{button};{x};{y}M".encode() * abs(clicks))
+
     def close(self):
         if self.dead:
             return
@@ -2043,6 +2053,8 @@ class Handler(BaseHTTPRequestHandler):
             key = b.get("key")
             if key == "text":
                 a.send_text(str(b.get("text") or ""), enter=bool(b.get("enter")))
+            elif key == "scroll":  # the phone's terminal: Claude full screen scrolls on the mouse wheel
+                a.scroll(int(b.get("clicks") or 0))
             elif key in KEYS:
                 a.write(KEYS[key])
             elif re.fullmatch(r"[0-9]", str(key)):
