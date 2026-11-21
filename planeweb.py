@@ -1952,6 +1952,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/push/seen":  # from the phone's service worker
                 hub.push.seen(str(b.get("id", "")), b.get("shown"), b.get("error") or "")
                 return self.send_json({"ok": True})
+            if path == "/api/debug/keyboard":  # the phone's keyboard measurements (app.js logKeyboard)
+                log("keyboard " + " ".join(f"{k}={str(v)[:40]}" for k, v in list(b.items() if isinstance(b, dict) else [])[:20]))
+                return self.send_json({"ok": True})
             if path == "/api/push/test":
                 # to this phone only, a few seconds from now, so there's time to leave the app
                 if not hub.push.ok:

@@ -217,6 +217,9 @@ function fitViewport() {
   // gone: the app is drawn in place but taps land off by that much, so buttons and
   // scrolling stop answering. Put the page back.
   if (was && !keyboard) unscroll();
+  // WebKit scrolls even an overflow:hidden box to show a focused field. #app never scrolls
+  // (its lists do), and a scrolled #app puts everything off by that much.
+  if (app.scrollTop) app.scrollTop = 0;
   if (keyboard) revealField();
 }
 // a text box has focus, so the keyboard is up or on its way
@@ -224,16 +227,47 @@ function typingNow() {
   const el = document.activeElement;
   return !!el && (el.tagName === "TEXTAREA" || (el.tagName === "INPUT" && el.type !== "file") || el.isContentEditable);
 }
+// the box that scrolls el into view: its nearest ancestor (inside #app) that can scroll
+function scrollerOf(el) {
+  for (let p = el.parentElement; p && p !== app; p = p.parentElement) {
+    const oy = getComputedStyle(p).overflowY;
+    if ((oy === "auto" || oy === "scroll") && p.scrollHeight > p.clientHeight) return p;
+  }
+  return null;
+}
 // With the app sized to what's above the keyboard, a field inside a scrolling list (the
 // new-session form) can still sit below its bottom edge: scroll that list, never the page.
+// The edge is the list's or the keyboard's, whichever is higher: the app's box can still
+// reach under the keyboard while it's on its way up, so the list's edge alone isn't enough.
 function revealField() {
   const el = document.activeElement;
-  if (!typingNow()) return;
-  const box = el.closest(".scroll");
+  if (!typingNow() || !app.contains(el)) return;
+  const box = scrollerOf(el);
   if (!box) return;
-  const r = el.getBoundingClientRect(), b = box.getBoundingClientRect(), pad = 12;
-  if (r.bottom > b.bottom - pad) box.scrollTop += r.bottom - b.bottom + pad;
-  else if (r.top < b.top + pad) box.scrollTop -= b.top + pad - r.top;
+  const vv = window.visualViewport, pad = 12;
+  const r = el.getBoundingClientRect(), b = box.getBoundingClientRect();
+  const top = Math.max(b.top, vv ? vv.offsetTop : 0) + pad;
+  const bottom = Math.min(b.bottom, vv ? vv.offsetTop + vv.height : window.innerHeight) - pad;
+  // a field taller than the room left (the first-message box) shows its top, where you type first
+  if (r.bottom > bottom && r.height <= bottom - top) box.scrollTop += r.bottom - bottom;
+  else if (r.top < top || r.height > bottom - top) box.scrollTop -= top - r.top;
+}
+// What the keyboard measured as it settled, in the laptop's log (journalctl --user -u
+// plane-web): when a field still ends up under the keyboard, these numbers say why.
+function logKeyboard() {
+  const el = document.activeElement, vv = window.visualViewport;
+  if (!typingNow() || !vv) return;
+  const n = x => Math.round(x);
+  const r = el.getBoundingClientRect(), a = app.getBoundingClientRect(), box = scrollerOf(el);
+  const b = box && box.getBoundingClientRect();
+  api("/api/debug/keyboard", {
+    view: (location.hash.match(/^#\/?(\w*)/) || [])[1] || "home",
+    field: el.id || el.className || el.tagName, kb: app.classList.contains("kb"),
+    inner: n(window.innerHeight), vvH: n(vv.height), vvTop: n(vv.offsetTop), scale: +vv.scale.toFixed(2),
+    scrollY: n(window.scrollY), appTop: n(a.top), appBottom: n(a.bottom), appScroll: n(app.scrollTop),
+    fieldTop: n(r.top), fieldBottom: n(r.bottom),
+    box: b ? `${n(b.top)}-${n(b.bottom)} scrolled ${n(box.scrollTop)}` : "none",
+  }).catch(() => {});
 }
 function unscroll() { if (window.scrollX || window.scrollY) window.scrollTo(0, 0); }
 // The page itself never scrolls (everything is inside #app); undo it whenever iOS does. But
@@ -244,8 +278,15 @@ window.addEventListener("scroll", () => {
   else unscroll();
 }, { passive: true });
 document.addEventListener("focusout", () => setTimeout(() => { if (!typingNow() && !app.classList.contains("kb")) unscroll(); }, 300));
-// moving between fields with the keyboard already up gives no viewport event
-document.addEventListener("focusin", () => setTimeout(() => { if (app.classList.contains("kb")) revealField(); }, 50));
+// Moving between fields with the keyboard already up gives no viewport event. And the last
+// viewport event can come before the keyboard and the app's layout have settled (a terminal
+// refits after its box shrinks), so look again once they have.
+document.addEventListener("focusin", () => {
+  setTimeout(() => { if (app.classList.contains("kb")) revealField(); }, 50);
+  setTimeout(() => { fitViewport(); logKeyboard(); }, 400);
+});
+// a box that grows as you type (or a new line in it) can run under the keyboard
+document.addEventListener("input", () => { if (app.classList.contains("kb")) requestAnimationFrame(revealField); });
 window.visualViewport && visualViewport.addEventListener("resize", fitViewport);
 window.visualViewport && visualViewport.addEventListener("scroll", fitViewport);
 
@@ -853,7 +894,7 @@ function termView(id) {
     };
     connect();
     let last = `${term.cols}x${term.rows}`, rt;
-    ro = new ResizeObserver(() => { clearTimeout(rt); rt = setTimeout(() => { fit.fit(); const now = `${term.cols}x${term.rows}`; if (now !== last) { last = now; connect(); } }, 250); });
+    ro = new ResizeObserver(() => { clearTimeout(rt); rt = setTimeout(() => { fit.fit(); if (typingNow()) term.scrollToBottom(); const now = `${term.cols}x${term.rows}`; if (now !== last) { last = now; connect(); } }, 250); });
     ro.observe($("#term"));
   }).catch(() => { $("#term").innerHTML = `<div class="center"><span>Couldn't load the terminal.</span></div>`; });
 
@@ -1028,7 +1069,8 @@ function shellView() {
       term.textarea.addEventListener("focus", () => setTyping(true));
       term.textarea.addEventListener("blur", () => setTyping(false));
     }
-    ro = new ResizeObserver(() => { try { fit.fit(); } catch { /* not laid out yet */ } });
+    // the keyboard coming up shrinks the screen: keep the line you're typing on in view
+    ro = new ResizeObserver(() => { try { fit.fit(); if (typingNow()) term.scrollToBottom(); } catch { /* not laid out yet */ } });
     ro.observe($("#term"));
     open();
   }).catch(failed);
