@@ -973,7 +973,14 @@ function termView(id) {
   // of its own and xterm leaves touches alone: a drag is turned into mouse-wheel clicks for
   // Claude, which scrolls its conversation (finger down shows older text, as anywhere on a
   // phone). A program that didn't ask for the mouse scrolls xterm's own scrollback as before.
-  const PX_PER_CLICK = 24;
+  // One wheel click scrolls Claude one line (measured on a real screen), so one click per line
+  // height of finger travel keeps the text under your finger. (24px a click moved it at about
+  // half the finger's speed.) tw is set below, before any touch arrives.
+  const pxPerClick = () => {
+    const el = term && tw.querySelector(".xterm-screen");
+    const h = el && term.rows ? el.clientHeight / term.rows : 0;
+    return h > 4 ? h : 14;
+  };
   let owed = 0, sendingScroll = false, lastY = null;
   const claudeHasMouse = () => term && term.modes && term.modes.mouseTrackingMode !== "none";
   async function flushScroll() {
@@ -998,8 +1005,8 @@ function termView(id) {
     if (lastY === null || e.touches.length !== 1 || !claudeHasMouse()) return;
     e.preventDefault();
     const y = e.touches[0].clientY;
-    const steps = Math.trunc((lastY - y) / PX_PER_CLICK);
-    if (steps) { lastY -= steps * PX_PER_CLICK; scrollBy(steps); }
+    const px = pxPerClick(), steps = Math.trunc((lastY - y) / px);
+    if (steps) { lastY -= steps * px; scrollBy(steps); }
   }, { capture: true, passive: false });
   tw.addEventListener("touchend", () => { lastY = null; }, { capture: true });
   tw.addEventListener("wheel", e => {  // a mouse or trackpad on a tablet or laptop browser
