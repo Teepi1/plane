@@ -1,0 +1,40 @@
+
+ ▐▛███▛█   Claude Code v2.1.330
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   ~/code/demo/ws · /rc
+
+  Updated: 30 features, 282 fixes, 134 other changes
+  code.claude.com/docs/en/changelog for details
+
+  Fable 5.2 is here for your longest and toughest coding tasks. It draws down usage faster than Opus
+  5.5. Switch with /model.
+
+❯ Use the AskUserQuestion tool to ask me one question: tea or coffee? Offer those two options.
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Drink
+
+Tea or coffee?
+
+  1. Tea
+     Tea it is.
+  2. Coffee
+     Coffee it is.
+❯ 3. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · ctrl+g to edit in VS Code · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+──────────────────────────────────────────────────────────────────────── plane-web spike ─

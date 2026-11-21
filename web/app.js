@@ -201,6 +201,7 @@ function stream(url, handlers) {
 }
 
 // Keep the layout above the iOS keyboard.
+let fullHeight = window.innerHeight;
 function fitViewport() {
   const vv = window.visualViewport;
   if (!vv) return;
@@ -208,7 +209,12 @@ function fitViewport() {
   // viewport left the app short by the status bar's height, a blank band at the bottom).
   // vv.height shrinks when the page is zoomed too; times the zoom, only the keyboard counts
   // (a zoomed page read as "keyboard up" shrank the app to a corner of the screen).
-  const keyboard = window.innerHeight - vv.height * vv.scale > 80;
+  // The page's own height (innerHeight) can shrink with the keyboard too (seen on an iPhone
+  // 17: innerHeight 416 = the visible height, page scrolled 396), so it alone can't tell the
+  // keyboard is up. Compare with the height from before you started typing.
+  const typing = typingNow();
+  if (!typing) fullHeight = window.innerHeight;
+  const keyboard = Math.max(window.innerHeight, typing ? fullHeight : 0) - vv.height * vv.scale > 80;
   const was = app.classList.contains("kb");
   app.classList.toggle("kb", keyboard);
   app.style.height = keyboard ? `${vv.height}px` : "";
@@ -216,7 +222,8 @@ function fitViewport() {
   // iOS scrolls the page to show a text box and can leave it scrolled once the keyboard is
   // gone: the app is drawn in place but taps land off by that much, so buttons and
   // scrolling stop answering. Put the page back.
-  if (was && !keyboard) unscroll();
+  // (Also whenever nothing has focus: a scroll left over from typing is the same trap.)
+  if ((was && !keyboard) || (!keyboard && !typing)) unscroll();
   // WebKit scrolls even an overflow:hidden box to show a focused field. #app never scrolls
   // (its lists do), and a scrolled #app puts everything off by that much.
   if (app.scrollTop) app.scrollTop = 0;
@@ -262,7 +269,7 @@ function logKeyboard() {
   const b = box && box.getBoundingClientRect();
   api("/api/debug/keyboard", {
     view: (location.hash.match(/^#\/?(\w*)/) || [])[1] || "home",
-    field: el.id || el.className || el.tagName, kb: app.classList.contains("kb"),
+    field: el.id || el.className || el.tagName, kb: app.classList.contains("kb"), full: n(fullHeight),
     inner: n(window.innerHeight), vvH: n(vv.height), vvTop: n(vv.offsetTop), scale: +vv.scale.toFixed(2),
     scrollY: n(window.scrollY), appTop: n(a.top), appBottom: n(a.bottom), appScroll: n(app.scrollTop),
     fieldTop: n(r.top), fieldBottom: n(r.bottom),
@@ -560,6 +567,14 @@ function promptCard(p, opts = {}) {
     let cls = "";
     if (/^yes\b/i.test(o.label)) { if (firstYes) cls = "yes"; firstYes = false; }
     else if (/^no\b/i.test(o.label)) cls = "no";
+    // "Type something.": a box to type the answer in, here on the card
+    if (o.type && opts.canType) {
+      const t = opts.typing && opts.typing.i === i ? opts.typing : null;
+      if (!t) return `<button class="opt" data-type="${i}"><b>${o.n ?? ""}</b><span>Type your own answer</span></button>`;
+      return `<div class="typed"><label class="label" for="typedIn">${o.n ? `${o.n}. ` : ""}Your answer</label>
+        <div class="inrow"><textarea class="field" id="typedIn" rows="2" enterkeyhint="send">${esc(t.text)}</textarea>
+        <button class="send" data-typesend="${i}">Send</button></div></div>`;
+    }
     return `<button class="opt ${cls}" data-choose="${i}"><b>${o.n ?? ""}</b><span>${esc(o.label)}</span>${o.desc ? `<small>${esc(o.desc)}</small>` : ""}</button>`;
   }).join("");
   const plan = opts.plan ? `<button class="linkbtn" data-act="togglePlan">${opts.planOpen ? "Hide the plan" : "Read the plan"}</button>
@@ -610,6 +625,7 @@ function itemHtml(it, idx, open) {
 
 function chatView(id, wake) {
   let items = [], base = 0, pending = [], prompt = null, info = "", planOpen = false, atts = [];
+  let typed = null;  // {sig, i, text}: the answer being typed for "Type something."
   const open = new Set();
   const openedAt = Date.now();
   const late = setTimeout(() => header(), 4500);
@@ -653,7 +669,8 @@ function chatView(id, wake) {
     const s = sessionById(id);
     if (prompt) {
       const isPlan = prompt.context.some(c => /plan/i.test(c.s)) || prompt.options.some(o => /plan/i.test(o.label));
-      bottom.innerHTML = promptCard(prompt, { plan: isPlan ? lastPlan() : "", planOpen });
+      if (typed && typed.sig !== prompt.sig) typed = null;  // a different question now
+      bottom.innerHTML = promptCard(prompt, { plan: isPlan ? lastPlan() : "", planOpen, canType: true, typing: typed });
       return;
     }
     if (s && !s.bg) {
@@ -768,7 +785,25 @@ function chatView(id, wake) {
   });
 
   app.addEventListener("input", onInput);
-  function onInput(e) { if (e.target.id === "draft") { draft = e.target.value; store(`plane:draft:${id}`, draft); grow(); } }
+  function onInput(e) {
+    if (e.target.id === "draft") { draft = e.target.value; store(`plane:draft:${id}`, draft); grow(); }
+    if (e.target.id === "typedIn" && typed) typed.text = e.target.value;
+  }
+  // a typed answer to "Type something.": Plane picks that row on the laptop, types it in, presses Enter
+  async function sendTyped() {
+    const box = $("#typedIn"), btn = $("[data-typesend]");
+    if (!typed || !box || !prompt) return;
+    const text = box.value.trim(), er = bottom.querySelector(".inline-err");
+    if (!text) { er.hidden = false; er.textContent = "Type your answer first."; box.focus(); return; }
+    btn.disabled = true; btn.textContent = "Sending…"; er.hidden = true;
+    try {
+      await api(`/api/session/${id}/answer`, { index: typed.i, sig: typed.sig, text });
+      box.blur();
+    } catch (e) {
+      if (btn.isConnected) { btn.disabled = false; btn.textContent = "Send"; }
+      er.hidden = false; er.textContent = e.message;
+    }
+  }
   // the keyboard: "Hide keyboard" while typing; tapping the conversation hides it too; Send keeps it up
   const onFocus = e => { if (e.target.id === "draft") { const c = $("#composer"); c && c.classList.toggle("typing", e.type === "focusin"); } };
   const onPress = e => {
@@ -780,6 +815,8 @@ function chatView(id, wake) {
   app.addEventListener("focusout", onFocus);
   app.addEventListener("pointerdown", onPress);
   app.addEventListener("change", onPick);
+  const onTypedKey = e => { if (e.target.id === "typedIn" && e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendTyped(); } };
+  app.addEventListener("keydown", onTypedKey);
   chat.addEventListener("click", () => { const d = $("#draft"); if (d && document.activeElement === d) d.blur(); });
   app.onclick = async e => {
     if (e.target.closest("#sendBtn")) return send();
@@ -794,6 +831,9 @@ function chatView(id, wake) {
     if (tg) { const i = +tg.dataset.toggle; open.has(i) ? open.delete(i) : open.add(i); renderChat(); return; }
     const ch = e.target.closest("[data-choose]");
     if (ch && prompt) return choose(bottom, `/api/session/${id}/choose`, +ch.dataset.choose, prompt.sig);
+    const ty = e.target.closest("[data-type]");
+    if (ty && prompt) { typed = { sig: prompt.sig, i: +ty.dataset.type, text: "" }; renderBottom(); $("#typedIn").focus(); return; }
+    if (e.target.closest("[data-typesend]")) return sendTyped();
     const a = e.target.closest("[data-act]");
     if (!a) return;
     if (a.dataset.act === "terminal") location.hash = `#t/${id}`;
@@ -813,6 +853,7 @@ function chatView(id, wake) {
       app.removeEventListener("input", onInput); app.removeEventListener("focusin", onFocus);
       app.removeEventListener("focusout", onFocus); app.removeEventListener("pointerdown", onPress);
       app.removeEventListener("change", onPick);
+      app.removeEventListener("keydown", onTypedKey);
     },
   };
 }
