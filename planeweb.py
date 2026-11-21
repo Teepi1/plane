@@ -142,6 +142,9 @@ def _indent(line):
     return len(line) - len(line.lstrip())
 
 
+TYPE_OWN = re.compile(r"^Type something\.?$", re.I)
+
+
 def parse_prompt(lines):
     """Find a menu Claude is showing: the options above an "Enter to select"/"Esc to cancel"
     line, and what it is asking above them. Returns None when there's no menu."""
@@ -251,6 +254,8 @@ def parse_prompt(lines):
             merged.append(dict(c))
     if len(merged) > 14:
         merged = [{"t": "text", "s": "…"}] + merged[-13:]
+    for o in opts:  # "Type something.": picking it opens a text box in the menu, for your own answer
+        o["type"] = bool(TYPE_OWN.match(o["label"]))
     selected = next((k for k, o in enumerate(opts) if o["selected"]), 0)
     body = json.dumps([merged, [o["label"] for o in opts]], ensure_ascii=False)
     return {"context": merged, "options": opts, "selected": selected, "hint": "" if bare else lines[hint].strip(),
@@ -433,6 +438,20 @@ class PtyScreen:
             time.sleep(0.06)
         time.sleep(0.1)
         self.write(b"\r")
+
+    def answer(self, index, sig, text):
+        """Type your own answer to a question: pick its "Type something." row, which turns
+        into a text box in the menu, paste the text into it and press Enter."""
+        with self.lock:
+            p = self.prompt
+            if not p or p["sig"] != sig:
+                raise LookupError("That question changed. The current one is showing now.")
+            if not p["options"][index].get("type"):
+                raise LookupError("That option doesn't take a typed answer.")
+        self.choose(index, sig)
+        time.sleep(0.4)
+        # the plain paste: not the session's re-press of Enter, which would land on the next screen
+        PtyScreen.send_text(self, text.replace("\r", "").replace("\n", " "), enter=True)
 
     def scroll(self, clicks):
         """Mouse-wheel clicks in the middle of the screen (SGR mouse): up (older) when
@@ -2050,6 +2069,14 @@ class Handler(BaseHTTPRequestHandler):
             if not a:
                 raise LookupError("The question isn't showing any more.")
             a.choose(int(b["index"]), str(b.get("sig")))
+        elif action == "answer":
+            text = str(b.get("text") or "").strip()
+            if not text:
+                return self.fail(400, "Type your answer first.")
+            a = hub.attach(job, create=False)
+            if not a:
+                raise LookupError("The question isn't showing any more.")
+            a.answer(int(b["index"]), str(b.get("sig")), text)
         elif action == "key":
             a = hub.attach(job)
             a.wait_ready()

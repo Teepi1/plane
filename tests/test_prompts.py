@@ -91,6 +91,38 @@ def test_sig_changes_with_options():
     assert a["sig"] == planeweb.parse_prompt(screen("permission"))["sig"]
 
 
+
+def test_type_something_is_marked():
+    p = planeweb.parse_prompt(screen("question"))
+    assert [o["type"] for o in p["options"]] == [False, False, True, False], p["options"]
+
+
+def test_type_something_picked():
+    # after pressing 3: the row is selected and becomes the text box (captured from Claude Code)
+    p = planeweb.parse_prompt(screen("question-typing"))
+    assert p and labels(p) == ["Tea", "Coffee", "Type something.", "Chat about this"], p and labels(p)
+    assert p["selected"] == 2 and p["options"][2]["type"]
+
+
+def test_answer_types_into_the_menu():
+    # picks the row by its number, then pastes the text and presses Enter
+    import threading
+    a = planeweb.PtyScreen.__new__(planeweb.PtyScreen)
+    a.lock, sent = threading.RLock(), []
+    a.write = sent.append
+    a.prompt = planeweb.parse_prompt(screen("question"))
+    planeweb.time.sleep, real = (lambda s: None), planeweb.time.sleep
+    try:
+        a.answer(2, a.prompt["sig"], "green tea\nplease")
+        try:
+            a.answer(0, a.prompt["sig"], "x")
+            assert False, "Tea isn't a typed answer"
+        except LookupError:
+            pass
+    finally:
+        planeweb.time.sleep = real
+    assert sent == ["3", b"\x1b[200~green tea please\x1b[201~", b"\r"], sent
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in list(globals().items()):
