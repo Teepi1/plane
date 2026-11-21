@@ -448,8 +448,12 @@ class PtyScreen:
                 raise LookupError("That question changed. The current one is showing now.")
             if not p["options"][index].get("type"):
                 raise LookupError("That option doesn't take a typed answer.")
-        self.choose(index, sig)
-        time.sleep(0.4)
+            # the cursor on that row means it's the text box already: its number would be
+            # typed into the answer ("3When I…")
+            there = p["selected"] == index
+        if not there:
+            self.choose(index, sig)
+            time.sleep(0.4)
         # the plain paste: not the session's re-press of Enter, which would land on the next screen
         PtyScreen.send_text(self, text.replace("\r", "").replace("\n", " "), enter=True)
 

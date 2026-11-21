@@ -122,6 +122,15 @@ def test_answer_types_into_the_menu():
     finally:
         planeweb.time.sleep = real
     assert sent == ["3", b"\x1b[200~green tea please\x1b[201~", b"\r"], sent
+    # already on that row (it's the text box): no number, or it lands in the answer
+    sent.clear()
+    a.prompt = planeweb.parse_prompt(screen("question-typing"))
+    planeweb.time.sleep = lambda s: None
+    try:
+        a.answer(2, a.prompt["sig"], "tea")
+    finally:
+        planeweb.time.sleep = real
+    assert sent == [b"\x1b[200~tea\x1b[201~", b"\r"], sent
 
 if __name__ == "__main__":
     fails = 0

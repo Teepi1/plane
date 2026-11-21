@@ -563,17 +563,20 @@ function promptCard(p, opts = {}) {
     rest = ctx.filter(c => c !== qi);
   }
   let firstYes = true;
+  // the box for a typed answer goes under the card, not in it: it stays put like the chat's
+  // message box, where in the card's scrolling list iOS kept scrolling it under the keyboard
+  let typedBar = "";
   const optHtml = p.options.map((o, i) => {
     let cls = "";
     if (/^yes\b/i.test(o.label)) { if (firstYes) cls = "yes"; firstYes = false; }
     else if (/^no\b/i.test(o.label)) cls = "no";
-    // "Type something.": a box to type the answer in, here on the card
+    // "Type something.": opens a box under the card to type the answer in
     if (o.type && opts.canType) {
-      const t = opts.typing && opts.typing.i === i ? opts.typing : null;
-      if (!t) return `<button class="opt" data-type="${i}"><b>${o.n ?? ""}</b><span>Type your own answer</span></button>`;
-      return `<div class="typed"><label class="label" for="typedIn">${o.n ? `${o.n}. ` : ""}Your answer</label>
-        <div class="inrow"><textarea class="field" id="typedIn" rows="2" enterkeyhint="send">${esc(t.text)}</textarea>
-        <button class="send" data-typesend="${i}">Send</button></div></div>`;
+      const on = opts.typing && opts.typing.i === i;
+      if (on) typedBar = `<div class="composer typedbar"><label class="label" for="typedIn">${o.n ? `${o.n}. ` : ""}Your answer</label>
+        <div class="inrow"><textarea class="field" id="typedIn" rows="2" enterkeyhint="send">${esc(opts.typing.text)}</textarea>
+        <button class="send" data-typesend="${i}">Send</button></div><span class="inline-err" id="typedErr" role="alert" hidden></span></div>`;
+      return `<button class="opt ${on ? "yes" : ""}" data-type="${i}" aria-pressed="${!!on}"><b>${o.n ?? ""}</b><span>${on ? "Your answer: type it below" : "Type your own answer"}</span></button>`;
     }
     return `<button class="opt ${cls}" data-choose="${i}"><b>${o.n ?? ""}</b><span>${esc(o.label)}</span>${o.desc ? `<small>${esc(o.desc)}</small>` : ""}</button>`;
   }).join("");
@@ -583,7 +586,7 @@ function promptCard(p, opts = {}) {
     <span class="k">Claude is asking</span><span class="q">${esc(q)}</span>
     ${rest.map(c => c.t === "code" ? `<div class="code">${esc(c.s)}</div>` : `<span class="c">${esc(c.s)}</span>`).join("")}
     ${plan}${optHtml}<span class="inline-err" role="alert" hidden></span>
-    ${opts.terminal === false ? "" : `<div class="subbar"><button data-act="terminal">Terminal</button></div>`}</div>`;
+    ${opts.terminal === false ? "" : `<div class="subbar"><button data-act="terminal">Terminal</button></div>`}</div>${typedBar}`;
 }
 
 async function choose(card, url, i, sig) {
@@ -625,7 +628,8 @@ function itemHtml(it, idx, open) {
 
 function chatView(id, wake) {
   let items = [], base = 0, pending = [], prompt = null, info = "", planOpen = false, atts = [];
-  let typed = null;  // {sig, i, text}: the answer being typed for "Type something."
+  let typed = null, lostMenu;  // typed {sig, i, text}: the answer being typed for "Type something."
+  const typingAnswer = () => !!typed && !!document.activeElement && document.activeElement.id === "typedIn";
   const open = new Set();
   const openedAt = Date.now();
   const late = setTimeout(() => header(), 4500);
@@ -779,9 +783,23 @@ function chatView(id, wake) {
     screen(v) {
       const before = prompt && prompt.sig;
       prompt = v.prompt;
-      if ((prompt && prompt.sig) !== before) { planOpen = false; renderBottom(); }
+      const now = prompt && prompt.sig;
+      if (now === before) return;
+      // While you type an answer, the laptop's screen can lose its menu for a moment as it
+      // redraws: rebuilding then took the box (and the keyboard) away mid-word. Wait to see
+      // whether it's gone, and leave the box alone when the same question comes back.
+      if (typingAnswer()) {
+        clearTimeout(lostMenu);
+        if (now === typed.sig) return;
+        if (!now) { lostMenu = setTimeout(() => { if (!prompt || prompt.sig !== (typed && typed.sig)) { planOpen = false; renderBottom(); } }, 2000); return; }
+      }
+      planOpen = false; renderBottom();
     },
-    info(v) { info = v.error || ""; renderBottom(); },
+    info(v) {
+      info = v.error || "";
+      if (typingAnswer()) { const er = $("#typedErr"); if (er && info) { er.hidden = false; er.textContent = info; } return; }
+      renderBottom();
+    },
   });
 
   app.addEventListener("input", onInput);
@@ -793,7 +811,7 @@ function chatView(id, wake) {
   async function sendTyped() {
     const box = $("#typedIn"), btn = $("[data-typesend]");
     if (!typed || !box || !prompt) return;
-    const text = box.value.trim(), er = bottom.querySelector(".inline-err");
+    const text = box.value.trim(), er = $("#typedErr");
     if (!text) { er.hidden = false; er.textContent = "Type your answer first."; box.focus(); return; }
     btn.disabled = true; btn.textContent = "Sending…"; er.hidden = true;
     try {
@@ -832,7 +850,10 @@ function chatView(id, wake) {
     const ch = e.target.closest("[data-choose]");
     if (ch && prompt) return choose(bottom, `/api/session/${id}/choose`, +ch.dataset.choose, prompt.sig);
     const ty = e.target.closest("[data-type]");
-    if (ty && prompt) { typed = { sig: prompt.sig, i: +ty.dataset.type, text: "" }; renderBottom(); $("#typedIn").focus(); return; }
+    if (ty && prompt) {
+      if (!typed || typed.sig !== prompt.sig) { typed = { sig: prompt.sig, i: +ty.dataset.type, text: "" }; renderBottom(); }
+      $("#typedIn").focus(); return;
+    }
     if (e.target.closest("[data-typesend]")) return sendTyped();
     const a = e.target.closest("[data-act]");
     if (!a) return;
@@ -853,7 +874,7 @@ function chatView(id, wake) {
       app.removeEventListener("input", onInput); app.removeEventListener("focusin", onFocus);
       app.removeEventListener("focusout", onFocus); app.removeEventListener("pointerdown", onPress);
       app.removeEventListener("change", onPick);
-      app.removeEventListener("keydown", onTypedKey);
+      app.removeEventListener("keydown", onTypedKey); clearTimeout(lostMenu);
     },
   };
 }

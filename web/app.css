@@ -253,4 +253,3 @@ textarea.field { max-height: 9.5em; }
 .sheet .gap { height: 10px; }
 .toast { position: fixed; left: 12px; right: 12px; top: calc(var(--top) + 8px); z-index: 9; background: var(--surface); border: 1px solid var(--line);
   border-radius: 16px; padding: 13px 15px; font-size: 15px; line-height: 1.4; box-shadow: 0 12px 30px -10px var(--shade); }
-.typed { display: grid; gap: 6px; }
