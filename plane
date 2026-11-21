@@ -238,16 +238,37 @@ def rename_project_folder(cwd, old, new):
     write_json(FOLDERS, data)
     for f in HANDOFFS.glob("*.json"):
         h = read_json(f)
-        if h and h.get("cwd") == cwd and h.get("folder") == old:
-            h["folder"] = new
+        if h and h.get("cwd") == cwd and old in handoff_folders(h):
+            set_handoff_folders(h, [new if n == old else n for n in handoff_folders(h)])
             write_json(f, h)
+
+
+def handoff_folders(h):
+    """The folders a handoff is filed in. A handoff can be in several (Launch and Printers,
+    say); it's still one handoff, so starting or discarding it takes it out of all of them.
+    Files from before several folders were possible have a single "folder"."""
+    names = h.get("folders")
+    if not isinstance(names, list):
+        names = [h.get("folder")]
+    return list(dict.fromkeys(n for n in names if isinstance(n, str) and n))
+
+
+def set_handoff_folders(h, names):
+    h.pop("folder", None)
+    names = list(dict.fromkeys(n for n in names if n))
+    if names:
+        h["folders"] = names
+    else:
+        h.pop("folders", None)
 
 
 def handoff_tree(handoffs, folders, is_open, rank=None):
     """The HANDOFFS section as rows of (kind, obj, depth): a project, then its folders (each
     listed only while it holds a handoff), then its handoffs that aren't in a folder, the way
-    a file tree lists folders before files. `handoffs` come in display order; projects are
-    ordered by `rank` (default: newest handoff first); folders keep the project's own order."""
+    a file tree lists folders before files. A handoff in several folders is listed in each;
+    its row is a copy with "_place" saying where (the folder's id, or the project's path).
+    `handoffs` come in display order; projects are ordered by `rank` (default: newest
+    handoff first); folders keep the project's own order."""
     by_proj = {}
     for h in handoffs:
         by_proj.setdefault(h.get("cwd") or "", []).append(h)
@@ -257,7 +278,8 @@ def handoff_tree(handoffs, folders, is_open, rank=None):
         hs, order = by_proj[p], folders.get(p, [])
         groups = {}
         for h in hs:
-            groups.setdefault(h.get("folder") or "", []).append(h)
+            for n in handoff_folders(h) or [""]:
+                groups.setdefault(n, []).append(h)
         names = [n for n in order if n in groups] + sorted((n for n in groups if n and n not in order), key=str.lower)
         node = {"id": p, "cwd": p, "name": Path(p).name or p, "count": len(hs), "folders": len(names),
                 "waiting": sum(1 for h in hs if not h.get("ready", True))}
@@ -270,8 +292,8 @@ def handoff_tree(handoffs, folders, is_open, rank=None):
             rows.append(("folder", {"id": fid, "cwd": p, "name": n, "count": len(fhs),
                                     "waiting": sum(1 for h in fhs if not h.get("ready", True))}, 1))
             if is_open(("folder", fid)):
-                rows += [("handoff", h, 2) for h in fhs]
-        rows += [("handoff", h, 1) for h in groups.get("", [])]
+                rows += [("handoff", dict(h, _place=fid), 2) for h in fhs]
+        rows += [("handoff", dict(h, _place=p), 1) for h in groups.get("", [])]
     return rows
 
 
@@ -287,17 +309,17 @@ def cmd_handoff_add(args):
     now = time.time()
     slug = re.sub(r"[^a-z0-9]+", "-", args.title.lower()).strip("-")[:40] or "handoff"
     hid = f"{datetime.now():%Y%m%d-%H%M%S}-{slug}"
-    folder = folder_name(cwd, args.folder) if args.folder else ""
-    if folder:
-        add_project_folder(cwd, folder)
+    folders = list(dict.fromkeys(folder_name(cwd, f) for f in args.folder or [] if f.strip()))
+    for f in folders:
+        add_project_folder(cwd, f)
     write_json(HANDOFFS / f"{hid}.json", {
         "id": hid, "title": args.title, "cwd": cwd, "prompt": prompt, "createdAt": now,
         "sourceSessionId": src.get("sessionId"), "sourceName": src.get("name"),
         "sourcePid": src.get("pid"), "sourceProcStart": src.get("procStart"),
-        **({"folder": folder} if folder else {}),
+        **({"folders": folders} if folders else {}),
     })
     origin = f" (from session '{src['name']}')" if src.get("name") else ""
-    where = f" under {Path(cwd).name} › {folder}" if folder else ""
+    where = f" under {Path(cwd).name} › {', '.join(folders)}" if folders else ""
     print(f"Queued handoff '{args.title}' in Plane{where}{origin}.")
 
 
@@ -1087,7 +1109,7 @@ PASTE_START, PASTE_END = "[200~", "\x1b[201~"
 FOCUS_IN, FOCUS_OUT = -1001, -1002  # what read() returns for the terminal's focus reports
 TONES = {"info": C_ACCENT, "warn": C_WARN, "bad": C_BAD}
 TREE = CACHE / "tree.json"  # the handoff projects and folders you left open
-NEW_FOLDER = "\0new"       # the "New folder…" choice in Move to folder
+NEW_FOLDER = "\0new"       # the "New folder…" choice in a handoff's Folders…
 
 
 def short_needs(text, limit=140):
@@ -1411,10 +1433,10 @@ class Sidebar:
         finally:
             self.set_timeout(400)
 
-    def choose(self, title, options, step=""):
+    def choose(self, title, options, step="", start=0, hint="esc cancels"):
         """Pick from a short list with arrows/Enter, or type. Returns str or None.
         Options are (label, value) or (label, value, note): the note is shown dim after it."""
-        idx = 0
+        idx = max(0, min(start, len(options) - 1))
         self.set_timeout(-1)
         try:
             while True:
@@ -1432,7 +1454,7 @@ class Sidebar:
                     if note and len(label) + 4 < w - 2:
                         self.put(3 + i, 3 + len(label), note[0][:w - len(label) - 5],
                                  curses.color_pair(C_DIM + SEL if sel else C_DIM) | curses.A_DIM)
-                self.put(4 + len(options), 1, "esc cancels", curses.A_DIM)
+                self.put(4 + len(options), 1, hint, curses.A_DIM)
                 self.scr.refresh()
                 ch = self.read()
                 if isinstance(ch, Paste):
@@ -1529,7 +1551,7 @@ class Sidebar:
             self.flash("that handoff was already started", "warn")
             self.store.poke()
             return
-        h2 = {k: v for k, v in h.items() if k not in ("path", "source", "ready")}
+        h2 = {k: v for k, v in h.items() if k not in ("path", "source", "ready", "_place")}
         h2["launchedAt"] = time.time()
         write_json(done, h2)
         with self.store.lock:
@@ -1666,46 +1688,53 @@ class Sidebar:
         self.save_tree()
 
     def move_handoff(self, h):
-        """File a handoff in one of its project's folders, a new one, or none."""
-        cwd, now = h.get("cwd", ""), h.get("folder") or ""
-        with self.store.lock:
-            used = {x.get("folder") for x in self.store.handoffs if x.get("cwd") == cwd and x.get("folder")}
-        names = project_folders(cwd)
-        names += sorted((n for n in used if n not in names), key=str.lower)
-        opts = [(n, n, "← it's here" if n == now else "") for n in names]
-        opts += [("New folder…", NEW_FOLDER)] + ([("No folder", "", "list it under the project")] if now else [])
+        """Choose which of its project's folders a handoff is in: ⏎ ticks or unticks one, and
+        each change is saved as it's made. A handoff can be in several folders at once."""
+        cwd, hid = h.get("cwd", ""), h.get("id")
         title = (h.get("title") or "handoff")[:30]
-        choice = self.choose(f"Move to which folder?", opts, step=f"{Path(cwd).name.upper()} · {title}")
-        if choice is None:
-            return
-        if choice == NEW_FOLDER:
-            choice = self.ask("New folder name", hint="⏎ creates it and moves the handoff · esc cancels")
-            if not choice:
+        at = 0
+        while True:
+            data = read_json(h["path"])
+            if not data:
+                self.flash("that handoff was started or discarded", "warn")
+                self.store.poke()
                 return
-            choice = folder_name(cwd, choice)
-            add_project_folder(cwd, choice)
-        if choice == now:
-            self.flash(f"already in {choice or Path(cwd).name}")
-            return
-        f = Path(h["path"])
-        data = read_json(f)
-        if not data:
-            self.flash("that handoff was started or discarded", "warn")
-            self.store.poke()
-            return
-        if choice:
-            data["folder"] = choice
-        else:
-            data.pop("folder", None)
-        write_json(f, data)
-        h["folder"] = choice  # the list shows it in its new place now, not at the next poll
+            now = handoff_folders(data)
+            with self.store.lock:
+                used = {n for x in self.store.handoffs if x.get("cwd") == cwd for n in handoff_folders(x)}
+            names = project_folders(cwd)
+            names += sorted((n for n in used | set(now) if n not in names), key=str.lower)
+            opts = [(f"[{'x' if n in now else ' '}] {n}", n) for n in names]
+            opts += [("+ New folder…", NEW_FOLDER), ("Done", None)]
+            choice = self.choose("Folders it's in (⏎ ticks)", opts, step=f"{Path(cwd).name.upper()} · {title}",
+                                 start=at, hint="each tick saves · esc or Done closes")
+            if choice is None:
+                break
+            if choice == NEW_FOLDER:
+                choice = self.ask("New folder name", hint="⏎ creates it and puts the handoff in it · esc cancels")
+                if not choice:
+                    continue
+                choice = folder_name(cwd, choice)
+                add_project_folder(cwd, choice)
+                now = [n for n in now if n != choice]  # so the toggle below adds it
+            at = next((i for i, (_l, v) in enumerate(opts) if v == choice), len(names))
+            on = choice not in now
+            set_handoff_folders(data, now + [choice] if on else [n for n in now if n != choice])
+            write_json(h["path"], data)
+            with self.store.lock:  # the list shows the change now, not at the next poll
+                for x in self.store.handoffs:
+                    if x.get("id") == hid:
+                        set_handoff_folders(x, handoff_folders(data))
+            if on:
+                self.tree_open.update({("project", cwd), ("folder", f"{cwd}\n{choice}")})
+            self.flash(f"{'in' if on else 'out of'} {choice}")
+        final = handoff_folders(read_json(h["path"]) or {})
         self.tree_open.add(("project", cwd))
-        if choice:
-            self.tree_open.add(("folder", f"{cwd}\n{choice}"))
         self.save_tree()
-        self.pending_key = ("handoff", h.get("id"))
+        place = f"{cwd}\n{final[0]}" if final else cwd
+        self.pending_key = ("handoff", f"{hid}\n{place}")
         self.own_change = True
-        self.flash(f"moved to {Path(cwd).name} › {choice}" if choice else f"moved out of {now}")
+        self.flash(f"in {', '.join(final)}" if final else f"in no folder: listed under {Path(cwd).name}")
         self.store.poke()
 
     def rename_folder(self, node):
@@ -1761,7 +1790,7 @@ class Sidebar:
         elif kind == "handoff":
             acts = [("Start", lambda: self.launch_handoff(obj)),
                     ("Read prompt", lambda: self.view_handoff(obj)),
-                    ("Move to folder…", lambda: self.move_handoff(obj)),
+                    ("Folders…", lambda: self.move_handoff(obj)),
                     ("Discard", lambda: self.discard_handoff(obj))]
         elif kind in ("project", "folder"):
             is_open = (kind, obj["id"]) in self.tree_open
@@ -1875,6 +1904,8 @@ class Sidebar:
 
     def item_key(self, item):
         kind, obj = item
+        if kind == "handoff" and "_place" in obj:  # one handoff can be listed in several folders
+            return kind, f"{obj.get('id')}\n{obj['_place']}"
         return kind, obj.get("id") or obj.get("sessionId") or obj.get("path")
 
     def row_look(self, kind, obj):
@@ -1900,7 +1931,14 @@ class Sidebar:
         if kind == "repo":
             return (*self.repo_look(obj), "")
         if obj["ready"]:  # handoffs: ready is the normal case, so only "not ready" gets a word
-            return "→", C_ACCENT, obj.get("title", "?"), "", C_ACCENT, ""
+            # in a folder, say which other folders it's in too (Launch work that's also Printers)
+            here = str(obj.get("_place", "")).split("\n", 1)[1:] or [""]
+            others = [n for n in handoff_folders(obj) if n != here[0]]
+            also = others[0].split(" & ")[0] if others else ""  # "Platform & Fleet" -> "Platform"
+            also = also if len(also) <= 11 else also[:10] + "…"
+            if len(others) > 1:
+                also += f" +{len(others) - 1}"
+            return "→", C_ACCENT, obj.get("title", "?"), also, C_DIM, ""
         return "…", C_WARN, obj.get("title", "?"), "not ready", C_WARN, "dim"
 
     def repo_look(self, r):
@@ -1996,7 +2034,7 @@ class Sidebar:
                 what += f" · {obj['waiting']} not ready"
             add(what)
             is_open = (kind, obj["id"]) in self.tree_open
-            add(("⏎ closes it" if is_open else "⏎ opens it") + " · right-click a handoff to move it")
+            add(("⏎ closes it" if is_open else "⏎ opens it") + " · m on a handoff picks its folders")
         elif kind == "repo":
             add(obj["path"].replace(str(HOME), "~"))
             branch = obj.get("branch") or "no branch (detached HEAD)"
@@ -2020,6 +2058,8 @@ class Sidebar:
             src = obj.get("source")
             state = "has ended" if not src else ("is still writing it" if src.get("status") == "busy" else "is done")
             add(f"from {obj.get('sourceName') or '?'}, which {state}")
+            if handoff_folders(obj):
+                add(f"in {' · '.join(handoff_folders(obj))}")
             add(f"{obj.get('cwd', '').replace(str(HOME), '~')} · queued {ago(obj.get('createdAt', time.time()))}")
             prompt = " ".join(obj.get("prompt", "").split())
             if prompt:
@@ -2053,7 +2093,15 @@ class Sidebar:
             # You're in the sidebar: rows keep the places you see them in, so a click can't
             # land on a row that just moved. States still update in place; anything new goes
             # to the end of its section; the fresh order applies once you leave the sidebar.
+            first = {}  # a handoff's place is where it was first listed (it can be in several)
+            for (k, kid), i in self.shown.items():
+                if k == "handoff":
+                    hid = kid.split("\n", 1)[0]
+                    first[hid] = min(i, first.get(hid, i))
+
             def hold(kind, group):
+                if kind == "handoff":
+                    return sorted(group, key=lambda o: first.get(o.get("id"), len(self.shown)))
                 return sorted(group, key=lambda o: self.shown.get(self.item_key((kind, o)), len(self.shown)))
             lost, mine, standby = hold("lost", lost), hold("session", mine), hold("lost", standby)
             paused, windows, handoffs = hold("session", paused), hold("session", windows), hold("handoff", handoffs)
@@ -2172,7 +2220,7 @@ class Sidebar:
             self.put(h - 2, 1, err[:w - 2], curses.color_pair(C_BAD))
         kind, obj = self.items[self.sel] if self.items else (None, None)
         if kind == "handoff":
-            hint = "v read  m move  x discard  n new  ? keys"
+            hint = "v read  m folders  x discard  n new  ? keys"
         elif kind in ("project", "folder"):
             hint = "⏎ open/close  ← up  n new  ? keys"
         elif kind == "repo":
@@ -2212,7 +2260,7 @@ class Sidebar:
             ("←", "close it, or go up"),
             ("⏎ 2×click", "start a handoff"),
             ("v", "read the prompt"),
-            ("m", "move to a folder"),
+            ("m", "its folders (several ok)"),
             ("x", "discard (u undoes)"),
             ("#", "SOURCE CONTROL"),
             ("⏎", "sync: pull, then push"),
@@ -2455,7 +2503,8 @@ def main():
     add = ho.add_parser("add", help="queue a handoff prompt read from stdin")
     add.add_argument("--title", required=True)
     add.add_argument("--cwd")
-    add.add_argument("--folder", help="file it in this folder of its project (created if new)")
+    add.add_argument("--folder", action="append",
+                     help="file it in this folder of its project (created if new); repeat for several")
     add.set_defaults(fn=cmd_handoff_add)
     fl = ho.add_parser("folders", help="list a project's handoff folders")
     fl.add_argument("--cwd")

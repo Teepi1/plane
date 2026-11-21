@@ -100,7 +100,7 @@ Closing or discarding asks once: press **y** to go ahead, anything else to back 
 | p | pause: the session stops but stays listed under PAUSED |
 | x | close: the session ends and leaves the list (the conversation is kept, `claude --resume` finds it) |
 | v | read a handoff's prompt |
-| m | move a handoff to another folder (or a new one) |
+| m | pick a handoff's folders (it can be in several, or a new one) |
 | ← | close a project or folder, or go up to it |
 | x on a handoff | discard it (kept in `handoffs/discarded/` for 14 days, then deleted) |
 | u | bring back the handoff you just discarded |
@@ -159,10 +159,14 @@ queue**.
 
 ### Handoff folders
 
-Each project can have its own folders, say one per area of its roadmap. Give a handoff
-one when you queue it with `--folder Orders` (a new name creates the folder), or later:
-right-click it, **Move to folder…**, and pick one or **New folder…**. Right-click a
-folder to rename it. `plane handoff folders` lists the current project's folders.
+Each project can have its own folders, say a Launch folder on top and one per area of its
+roadmap below. A handoff can be in several at once (Launch and Printers): it's listed in
+each, with its other folder named at the end of its row, and it's still one handoff, so
+starting or discarding it takes it out of all of them. File it when you queue it with
+`--folder Launch --folder Printers` (a new name creates the folder), or later: press **m**
+(or right-click, **Folders…**) and tick the folders it belongs in, or **New folder…**.
+Right-click a folder to rename it. `plane handoff folders` lists the current project's
+folders. Inside a folder, handoffs are newest first.
 
 The folders and their order live in `~/.local/share/plane/folders.json`, one list per
 project, which you can edit by hand:
