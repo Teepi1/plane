@@ -217,11 +217,35 @@ function fitViewport() {
   // gone: the app is drawn in place but taps land off by that much, so buttons and
   // scrolling stop answering. Put the page back.
   if (was && !keyboard) unscroll();
+  if (keyboard) revealField();
+}
+// a text box has focus, so the keyboard is up or on its way
+function typingNow() {
+  const el = document.activeElement;
+  return !!el && (el.tagName === "TEXTAREA" || (el.tagName === "INPUT" && el.type !== "file") || el.isContentEditable);
+}
+// With the app sized to what's above the keyboard, a field inside a scrolling list (the
+// new-session form) can still sit below its bottom edge: scroll that list, never the page.
+function revealField() {
+  const el = document.activeElement;
+  if (!typingNow()) return;
+  const box = el.closest(".scroll");
+  if (!box) return;
+  const r = el.getBoundingClientRect(), b = box.getBoundingClientRect(), pad = 12;
+  if (r.bottom > b.bottom - pad) box.scrollTop += r.bottom - b.bottom + pad;
+  else if (r.top < b.top + pad) box.scrollTop -= b.top + pad - r.top;
 }
 function unscroll() { if (window.scrollX || window.scrollY) window.scrollTo(0, 0); }
-// the page itself never scrolls (everything is inside #app); undo it whenever iOS does
-window.addEventListener("scroll", () => { if (!app.classList.contains("kb")) unscroll(); }, { passive: true });
-document.addEventListener("focusout", () => setTimeout(() => { if (!app.classList.contains("kb")) unscroll(); }, 300));
+// The page itself never scrolls (everything is inside #app); undo it whenever iOS does. But
+// not while a text box has focus: iOS scrolls the page to show the box before it reports the
+// keyboard, and undoing that left the box under the keyboard.
+window.addEventListener("scroll", () => {
+  if (typingNow() || app.classList.contains("kb")) fitViewport();
+  else unscroll();
+}, { passive: true });
+document.addEventListener("focusout", () => setTimeout(() => { if (!typingNow() && !app.classList.contains("kb")) unscroll(); }, 300));
+// moving between fields with the keyboard already up gives no viewport event
+document.addEventListener("focusin", () => setTimeout(() => { if (app.classList.contains("kb")) revealField(); }, 50));
 window.visualViewport && visualViewport.addEventListener("resize", fitViewport);
 window.visualViewport && visualViewport.addEventListener("scroll", fitViewport);
 
