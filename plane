@@ -5,7 +5,8 @@
   plane sidebar                   the sidebar TUI (runs inside the Plane window)
   plane start --cwd DIR           start a background session in the session pane
   plane focus left|right|up|down  move focus between Plane's panes (Super+arrows)
-  plane handoff add --title T     queue a handoff prompt read from stdin
+  plane handoff add --title T     queue a handoff prompt read from stdin (--folder F files it)
+  plane handoff folders           list this project's handoff folders
   plane statusline                Claude Code statusLine command; records usage
   plane track start|prompt|end    Claude Code hook: keep the ledger of running sessions
   plane recover                   at login: notify about interrupted sessions + handoffs
@@ -32,6 +33,7 @@ HANDOFFS = DATA / "handoffs"
 DONE = HANDOFFS / "done"
 DISCARDED = HANDOFFS / "discarded"  # discarded handoffs wait here, then are deleted
 DISCARD_KEEP_DAYS = 14
+FOLDERS = DATA / "folders.json"  # project path -> its handoff folders, in the order they're listed
 CACHE = HOME / ".cache/plane"
 USAGE = CACHE / "usage.json"
 NOTES = CACHE / "notes.json"    # session id -> id of its "your turn"/"needs you" notification
@@ -199,6 +201,80 @@ def repo_root(cwd):
     return cwd.split("/.worktrees/")[0].split("/.claude/worktrees/")[0]
 
 
+def all_folders():
+    """Every project's handoff folders, in the order they're listed: {project path: [names]}."""
+    data = read_json(FOLDERS, {}) or {}
+    return {p: [n for n in names if isinstance(n, str) and n.strip()]
+            for p, names in data.items() if isinstance(names, list)}
+
+
+def project_folders(cwd):
+    return all_folders().get(cwd, [])
+
+
+def folder_name(cwd, name):
+    """A typed folder name, spelled the way the project already spells it (Orders, not orders)."""
+    name = " ".join(str(name or "").split())
+    return next((n for n in project_folders(cwd) if n.lower() == name.lower()), name)
+
+
+def add_project_folder(cwd, name):
+    data = read_json(FOLDERS, {}) or {}
+    names = data.setdefault(cwd, [])
+    if name and name not in names:
+        names.append(name)
+        write_json(FOLDERS, data)
+
+
+def rename_project_folder(cwd, old, new):
+    """Rename a folder in a project's list and in every queued handoff filed under it."""
+    data = read_json(FOLDERS, {}) or {}
+    names = data.setdefault(cwd, [])
+    if old in names:
+        names[names.index(old)] = new
+    elif new not in names:
+        names.append(new)
+    data[cwd] = list(dict.fromkeys(names))  # renaming onto an existing folder merges the two
+    write_json(FOLDERS, data)
+    for f in HANDOFFS.glob("*.json"):
+        h = read_json(f)
+        if h and h.get("cwd") == cwd and h.get("folder") == old:
+            h["folder"] = new
+            write_json(f, h)
+
+
+def handoff_tree(handoffs, folders, is_open, rank=None):
+    """The HANDOFFS section as rows of (kind, obj, depth): a project, then its folders (each
+    listed only while it holds a handoff), then its handoffs that aren't in a folder, the way
+    a file tree lists folders before files. `handoffs` come in display order; projects are
+    ordered by `rank` (default: newest handoff first); folders keep the project's own order."""
+    by_proj = {}
+    for h in handoffs:
+        by_proj.setdefault(h.get("cwd") or "", []).append(h)
+    rank = rank or (lambda p, hs: -max((h.get("createdAt") or 0) for h in hs))
+    rows = []
+    for p in sorted(by_proj, key=lambda p: rank(p, by_proj[p])):
+        hs, order = by_proj[p], folders.get(p, [])
+        groups = {}
+        for h in hs:
+            groups.setdefault(h.get("folder") or "", []).append(h)
+        names = [n for n in order if n in groups] + sorted((n for n in groups if n and n not in order), key=str.lower)
+        node = {"id": p, "cwd": p, "name": Path(p).name or p, "count": len(hs), "folders": len(names),
+                "waiting": sum(1 for h in hs if not h.get("ready", True))}
+        rows.append(("project", node, 0))
+        if not is_open(("project", p)):
+            continue
+        for n in names:
+            fid = f"{p}\n{n}"
+            fhs = groups[n]
+            rows.append(("folder", {"id": fid, "cwd": p, "name": n, "count": len(fhs),
+                                    "waiting": sum(1 for h in fhs if not h.get("ready", True))}, 1))
+            if is_open(("folder", fid)):
+                rows += [("handoff", h, 2) for h in fhs]
+        rows += [("handoff", h, 1) for h in groups.get("", [])]
+    return rows
+
+
 def cmd_handoff_add(args):
     prompt = sys.stdin.read().strip()
     fence = re.match(r"^```[\w-]*\n(.*)\n```$", prompt, re.S)
@@ -211,13 +287,25 @@ def cmd_handoff_add(args):
     now = time.time()
     slug = re.sub(r"[^a-z0-9]+", "-", args.title.lower()).strip("-")[:40] or "handoff"
     hid = f"{datetime.now():%Y%m%d-%H%M%S}-{slug}"
+    folder = folder_name(cwd, args.folder) if args.folder else ""
+    if folder:
+        add_project_folder(cwd, folder)
     write_json(HANDOFFS / f"{hid}.json", {
         "id": hid, "title": args.title, "cwd": cwd, "prompt": prompt, "createdAt": now,
         "sourceSessionId": src.get("sessionId"), "sourceName": src.get("name"),
         "sourcePid": src.get("pid"), "sourceProcStart": src.get("procStart"),
+        **({"folder": folder} if folder else {}),
     })
     origin = f" (from session '{src['name']}')" if src.get("name") else ""
-    print(f"Queued handoff '{args.title}' in Plane{origin}.")
+    where = f" under {Path(cwd).name} › {folder}" if folder else ""
+    print(f"Queued handoff '{args.title}' in Plane{where}{origin}.")
+
+
+def cmd_handoff_folders(args):
+    """List a project's handoff folders, one per line (for the /handoff skill to pick from)."""
+    cwd = repo_root(os.path.abspath(args.cwd or os.getcwd()))
+    for name in project_folders(cwd):
+        print(name)
 
 
 # ---------------------------------------------------------------- session ledger
@@ -671,6 +759,187 @@ class Store:
             self.error = "" if out.returncode == 0 else (out.stderr.strip()[:80] or "claude agents failed")
 
 
+# ---------------------------------------------------------------- source control
+# Push and pull each project's main checkout, the way VS Code's Source Control does: the
+# branch, what's waiting to come down (↓) and go up (↑), uncommitted changes (*), and a
+# fetch every few minutes so ↓ stays true.
+
+AUTOFETCH_SECS = 180  # VS Code's git.autofetchPeriod
+
+
+def parse_git_status(text):
+    """`git status --porcelain=v2 --branch` -> branch, upstream, ahead, behind, changes."""
+    info = {"branch": "", "upstream": "", "ahead": 0, "behind": 0, "changes": 0}
+    for line in text.splitlines():
+        if line.startswith("# branch.head "):
+            head = line[len("# branch.head "):].strip()
+            info["branch"] = "" if head == "(detached)" else head
+        elif line.startswith("# branch.upstream "):
+            info["upstream"] = line[len("# branch.upstream "):].strip()
+        elif line.startswith("# branch.ab "):
+            for part in line.split()[2:]:
+                if part[:1] in "+-" and part[1:].isdigit():
+                    info["ahead" if part[0] == "+" else "behind"] = int(part[1:])
+        elif line and not line.startswith("#"):
+            info["changes"] += 1
+    return info
+
+
+def git_error(out):
+    """The line of git's output that says what went wrong, without its hint lines."""
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip() and not ln.lstrip().startswith("hint:")]
+    for ln in lines:
+        if ln.lower().startswith(("fatal:", "error:", "! [rejected]", "! [remote rejected]")):
+            return ln
+    return lines[-1] if lines else "git failed"
+
+
+def git(path, *args, timeout=20):
+    """Run git with no terminal to prompt on: a missing password or passphrase fails with a
+    message instead of hanging the sidebar (or writing over it)."""
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never", LC_ALL="C")
+    try:
+        r = subprocess.run(["git", "--no-optional-locks", "-C", path, *args], capture_output=True, text=True,
+                           timeout=timeout, env=env, stdin=subprocess.DEVNULL, start_new_session=True)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return 124, f"error: git {args[0]} took over {timeout} s (is the network up?)"
+    except OSError as exc:
+        return 127, f"error: {exc}"
+
+
+def git_toplevel(path):
+    """The main checkout a folder belongs to (a worktree counts as its main checkout), or ''."""
+    code, out = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir", timeout=5)
+    if code != 0 or not out:
+        return ""
+    common = Path(out.splitlines()[-1])
+    return str(common.parent) if common.name == ".git" else ""  # a bare repo has no checkout
+
+
+class Repos:
+    """Polls `git status` for every project with a session or a handoff, fetches every few
+    minutes, and runs pull/push/sync on their own threads so the sidebar never waits."""
+
+    def __init__(self, candidates, on_done):
+        self.lock = threading.Lock()
+        self.repos = {}      # main checkout path -> status dict
+        self.roots = {}      # folder -> its main checkout ('' when not in a repo)
+        self.candidates = candidates  # () -> folders sessions and handoffs are in
+        self.on_done = on_done        # (text, tone) when an action finishes
+        self._wake = threading.Event()
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def poke(self):
+        self._wake.set()
+
+    def snapshot(self):
+        with self.lock:
+            return sorted((dict(r) for r in self.repos.values()), key=lambda r: r["name"].lower())
+
+    def _loop(self):
+        while True:
+            try:  # one bad pass (a repo mid-rebase, a folder that vanished) must not end polling
+                self._refresh()
+            except Exception as exc:
+                dbg(f"repos refresh: {exc}")
+            self._wake.wait(5)
+            self._wake.clear()
+
+    def _refresh(self):
+        roots = set()
+        for folder in set(self.candidates()):
+            if folder not in self.roots:
+                self.roots[folder] = git_toplevel(folder) if Path(folder).is_dir() else ""
+            if self.roots[folder]:
+                roots.add(self.roots[folder])
+        for root in roots:
+            self._status(root)
+            with self.lock:
+                r = self.repos.get(root, {})
+                due = (r.get("remote") and not r.get("busy")
+                       and time.time() - r.get("fetchedAt", 0) > AUTOFETCH_SECS)
+            if due:  # quietly: a failed autofetch is retried next period, not reported
+                code, _ = git(root, "fetch", "--quiet", timeout=60)
+                with self.lock:
+                    self.repos[root]["fetchedAt"] = time.time()
+                    if code == 0:
+                        self.repos[root]["checkedAt"] = time.time()
+                self._status(root)
+        with self.lock:
+            for gone in set(self.repos) - roots:
+                if not self.repos[gone].get("busy"):
+                    del self.repos[gone]
+
+    def _status(self, root):
+        code, out = git(root, "status", "--porcelain=v2", "--branch", timeout=10)
+        rcode, remotes = git(root, "remote", timeout=5)
+        names = remotes.split() if rcode == 0 else []
+        with self.lock:
+            r = self.repos.setdefault(root, {"id": root, "path": root, "name": Path(root).name or root,
+                                             "busy": "", "error": "", "fetchedAt": 0, "checkedAt": 0})
+            if code == 0:
+                r.update(parse_git_status(out))
+            r["remote"] = "origin" if "origin" in names else (names[0] if names else "")
+
+    def run(self, root, action):
+        """Start pull / push / sync / fetch on `root`. False when it's already busy."""
+        with self.lock:
+            r = self.repos.get(root)
+            if not r or r.get("busy"):
+                return False
+            r["busy"], r["error"] = action, ""
+        threading.Thread(target=self._run, args=(root, action), daemon=True).start()
+        return True
+
+    def _run(self, root, action):
+        name = Path(root).name
+        with self.lock:
+            r = dict(self.repos.get(root, {}))
+        steps = []
+        if action == "fetch":
+            steps = [("fetch", ["fetch", "--prune"])]
+        elif not r.get("upstream"):
+            if action in ("push", "sync") and r.get("remote") and r.get("branch"):
+                # VS Code's "Publish Branch": push it and set it to track the remote
+                steps = [("publish", ["push", "-u", r["remote"], r["branch"]])]
+        else:
+            if action in ("pull", "sync"):
+                steps.append(("pull", ["pull"]))
+            if action in ("push", "sync"):
+                steps.append(("push", ["push"]))
+        if not steps:
+            why = ("it has no remote to push to" if not r.get("remote") else
+                   "it isn't on a branch" if not r.get("branch") else "its branch isn't on GitHub yet: push publishes it")
+            self._finish(root, "", f"{name}: nothing to {action}, {why}", "warn")
+            return
+        before = (r.get("behind", 0), r.get("ahead", 0))
+        for step, args in steps:
+            code, out = git(root, *args, timeout=120)
+            if code != 0:
+                err = git_error(out)
+                self._finish(root, err, f"{name}: {step} failed · {err}", "bad")
+                return
+        self._status(root)
+        with self.lock:
+            now = self.repos.get(root, {})
+            now["checkedAt"] = now["fetchedAt"] = time.time()
+            after = (now.get("behind", 0), now.get("ahead", 0))
+        done = {"fetch": f"fetched · ↓{after[0]} ↑{after[1]}", "pull": f"pulled {before[0]}" if before[0] else "pulled (was up to date)",
+                "push": f"pushed {before[1]}" if before[1] else "pushed (nothing new)",
+                "sync": "in sync" if after == (0, 0) else f"↓{after[0]} ↑{after[1]} left"}
+        text = "published" if steps[0][0] == "publish" else done[action]
+        self._finish(root, "", f"{name}: {text}", "info")
+
+    def _finish(self, root, error, text, tone):
+        self._status(root)
+        self.on_done(text, tone)
+        with self.lock:  # last, so the row stops saying "pulling…" only once it's all done
+            r = self.repos.get(root)
+            if r:
+                r["busy"], r["error"] = "", error
+
+
 # ---------------------------------------------------------------- kitty
 
 def dbg(text):
@@ -817,7 +1086,8 @@ SEL = 10  # pair + SEL: the same color on the selected row's band
 PASTE_START, PASTE_END = "[200~", "\x1b[201~"
 FOCUS_IN, FOCUS_OUT = -1001, -1002  # what read() returns for the terminal's focus reports
 TONES = {"info": C_ACCENT, "warn": C_WARN, "bad": C_BAD}
-HANDOFFS_SHOWN = 4  # newest handoffs listed before "N more handoffs"
+TREE = CACHE / "tree.json"  # the handoff projects and folders you left open
+NEW_FOLDER = "\0new"       # the "New folder…" choice in Move to folder
 
 
 def short_needs(text, limit=140):
@@ -895,7 +1165,8 @@ class Sidebar:
         self.msg, self.msg_at, self.msg_tone = "", 0, "info"
         self.sel_key = None       # the selected item's identity, so a refresh can't move the selection
         self.last_discard = None  # path in discarded/, for u to bring it back
-        self.handoffs_open = False  # the handoff list shows HANDOFFS_SHOWN until you open the rest
+        self.tree_open = {tuple(k) for k in read_json(TREE, []) or [] if isinstance(k, list) and len(k) == 2}
+        self.depths = []            # each item's depth in the handoff tree (0 elsewhere)
         self.pending_key = None     # an item to select on the next draw
         self.last_click = (None, 0)
         self.attached = None
@@ -903,6 +1174,7 @@ class Sidebar:
         self.notes = {}           # session id -> its notification's id, so a newer one replaces it
         self.clear_stale_notes()
         self.store = Store(self.notify_ready, self.notify_waiting, self.clear_note)
+        self.repos = Repos(self.repo_folders, self.flash)
         curses.curs_set(0)
         curses.use_default_colors()
         # The selected row sits on a band of the theme's color 0, a step up from the
@@ -927,6 +1199,7 @@ class Sidebar:
         self.focused = True  # it starts focused: it's the window that was just opened
         self.shown = {}      # item key -> its position on screen, last time it was drawn
         self.last_keys, self.prev_keys, self.moved_at = [], [], 0.0  # the list's order, and when it last changed
+        self.own_change = False  # the next change to the list is one you just made
         self.resized_at = 0
         self.split_total = None  # both panes' width when last settled: tells a drag from a window resize
 
@@ -1380,6 +1653,94 @@ class Sidebar:
         self.flash("handoff back in the queue")
         self.store.poke()
 
+    # -- handoff folders
+    def save_tree(self):
+        write_json(TREE, sorted(list(k) for k in self.tree_open))
+
+    def toggle_node(self, kind, obj, want=None):
+        """Open or close a project or folder row in the handoff tree."""
+        key = (kind, obj["id"])
+        is_open = key in self.tree_open if want is None else not want
+        (self.tree_open.discard if is_open else self.tree_open.add)(key)
+        self.own_change = True
+        self.save_tree()
+
+    def move_handoff(self, h):
+        """File a handoff in one of its project's folders, a new one, or none."""
+        cwd, now = h.get("cwd", ""), h.get("folder") or ""
+        with self.store.lock:
+            used = {x.get("folder") for x in self.store.handoffs if x.get("cwd") == cwd and x.get("folder")}
+        names = project_folders(cwd)
+        names += sorted((n for n in used if n not in names), key=str.lower)
+        opts = [(n, n, "← it's here" if n == now else "") for n in names]
+        opts += [("New folder…", NEW_FOLDER)] + ([("No folder", "", "list it under the project")] if now else [])
+        title = (h.get("title") or "handoff")[:30]
+        choice = self.choose(f"Move to which folder?", opts, step=f"{Path(cwd).name.upper()} · {title}")
+        if choice is None:
+            return
+        if choice == NEW_FOLDER:
+            choice = self.ask("New folder name", hint="⏎ creates it and moves the handoff · esc cancels")
+            if not choice:
+                return
+            choice = folder_name(cwd, choice)
+            add_project_folder(cwd, choice)
+        if choice == now:
+            self.flash(f"already in {choice or Path(cwd).name}")
+            return
+        f = Path(h["path"])
+        data = read_json(f)
+        if not data:
+            self.flash("that handoff was started or discarded", "warn")
+            self.store.poke()
+            return
+        if choice:
+            data["folder"] = choice
+        else:
+            data.pop("folder", None)
+        write_json(f, data)
+        h["folder"] = choice  # the list shows it in its new place now, not at the next poll
+        self.tree_open.add(("project", cwd))
+        if choice:
+            self.tree_open.add(("folder", f"{cwd}\n{choice}"))
+        self.save_tree()
+        self.pending_key = ("handoff", h.get("id"))
+        self.own_change = True
+        self.flash(f"moved to {Path(cwd).name} › {choice}" if choice else f"moved out of {now}")
+        self.store.poke()
+
+    def rename_folder(self, node):
+        cwd, old = node["cwd"], node["name"]
+        new = self.ask(f"Rename folder '{old[:24]}'", default=old, hint="⏎ renames · esc cancels")
+        if not new or new == old:
+            return
+        new = folder_name(cwd, new)
+        rename_project_folder(cwd, old, new)
+        if ("folder", node["id"]) in self.tree_open:
+            self.tree_open.add(("folder", f"{cwd}\n{new}"))
+        self.pending_key = ("folder", f"{cwd}\n{new}")
+        self.flash(f"renamed to {new}")
+        self.store.poke()
+
+    # -- source control
+    def repo_folders(self):
+        """Folders to look for git repos in: every session's and every handoff's (poll thread)."""
+        with self.store.lock:
+            return [x.get("cwd") for x in self.store.sessions + self.store.handoffs if x.get("cwd")]
+
+    def git_action(self, repo, action):
+        if action == "sync" and repo.get("upstream"):
+            b, a = repo.get("behind", 0), repo.get("ahead", 0)
+            if not self.confirm(f"Sync {repo['upstream'][:20]}: pull {b}, push {a}?", "sync"):
+                return
+        elif action == "sync" and not repo.get("upstream") and repo.get("remote") and repo.get("branch"):
+            if not self.confirm(f"Publish {repo['branch'][:18]} to {repo['remote']}?", "publish"):
+                return
+        if self.repos.run(repo["path"], action):
+            word = {"fetch": "fetching", "pull": "pulling", "push": "pushing", "sync": "syncing"}[action]
+            self.flash(f"{repo['name']}: {word}…")
+        else:
+            self.flash(f"{repo['name']} is still busy", "warn")
+
     def actions_for(self, kind, obj):
         """The right-click menu: (label, action) for the clicked row."""
         if kind == "session" and not obj["bg"]:
@@ -1400,9 +1761,19 @@ class Sidebar:
         elif kind == "handoff":
             acts = [("Start", lambda: self.launch_handoff(obj)),
                     ("Read prompt", lambda: self.view_handoff(obj)),
+                    ("Move to folder…", lambda: self.move_handoff(obj)),
                     ("Discard", lambda: self.discard_handoff(obj))]
-        elif kind == "more":
-            acts = [("Show all handoffs" if obj["hidden"] else "Show fewer", self.toggle_handoffs)]
+        elif kind in ("project", "folder"):
+            is_open = (kind, obj["id"]) in self.tree_open
+            acts = [("Close" if is_open else "Open", lambda: self.toggle_node(kind, obj))]
+            if kind == "folder":
+                acts.append(("Rename folder…", lambda: self.rename_folder(obj)))
+        elif kind == "repo":
+            sync = "Sync (pull, then push)" if obj.get("upstream") else "Publish branch"
+            acts = [(sync, lambda: self.git_action(obj, "sync")),
+                    ("Pull", lambda: self.git_action(obj, "pull")),
+                    ("Push", lambda: self.git_action(obj, "push")),
+                    ("Fetch", lambda: self.git_action(obj, "fetch"))]
         else:
             acts = []
         return acts + ([(None, None)] if acts else []) + [("New session…", self.new_session)]
@@ -1522,13 +1893,34 @@ class Sidebar:
             return "○", C_ACCENT, lost_label(obj), "your turn", C_ACCENT, ""
         if kind == "lost":
             return "↯", C_WARN, lost_label(obj), {"crashed": "crash"}.get(obj["cause"], obj["cause"]), C_WARN, ""
-        if kind == "more":
-            if obj["hidden"]:
-                return "+", C_DIM, f"{obj['hidden']} more handoffs", "", C_DIM, "dim"
-            return "−", C_DIM, "show fewer", "", C_DIM, "dim"
+        if kind in ("project", "folder"):
+            chevron = "▾" if (kind, obj["id"]) in self.tree_open else "▸"
+            return chevron, C_ACCENT if kind == "project" else C_DIM, obj["name"], str(obj["count"]), C_DIM, \
+                "bold" if kind == "project" else ""
+        if kind == "repo":
+            return (*self.repo_look(obj), "")
         if obj["ready"]:  # handoffs: ready is the normal case, so only "not ready" gets a word
             return "→", C_ACCENT, obj.get("title", "?"), "", C_ACCENT, ""
         return "…", C_WARN, obj.get("title", "?"), "not ready", C_WARN, "dim"
+
+    def repo_look(self, r):
+        """(icon, icon color, name, state, state color) for a Source Control row, read like
+        VS Code's status bar: branch, * for uncommitted changes, ↓ to pull, ↑ to push."""
+        branch = r.get("branch") or "detached"
+        branch = branch if len(branch) <= 12 else branch[:11] + "…"
+        if r.get("busy"):
+            word = {"fetch": "fetching…", "pull": "pulling…", "push": "pushing…", "sync": "syncing…"}[r["busy"]]
+            return "⟳", C_ACCENT, r["name"], word, C_ACCENT
+        if r.get("error"):
+            return "✕", C_BAD, r["name"], "failed", C_BAD
+        star = "*" if r.get("changes") else ""
+        if not r.get("upstream"):
+            return "⎇", C_DIM, r["name"], f"{branch}{star} · {'publish' if r.get('remote') else 'local'}", C_DIM
+        b, a = r.get("behind", 0), r.get("ahead", 0)
+        if not (a or b):
+            return "⎇", C_DIM, r["name"], f"{branch}{star} ✓", C_DIM
+        counts = " ".join(filter(None, [f"↓{b}" if b else "", f"↑{a}" if a else ""]))
+        return "⎇", C_WARN if b else C_ACCENT, r["name"], f"{branch}{star} {counts}", C_WARN if b else C_ACCENT
 
     def draw_item(self, y, w, idx):
         kind, obj = self.items[idx]
@@ -1536,17 +1928,18 @@ class Sidebar:
         band = SEL if sel else 0
         icon, icolor, name, state, scolor, emph = self.row_look(kind, obj)
         attached = kind == "session" and obj.get("id") and obj.get("id") == self.attached
+        indent = 2 * (self.depths[idx] if idx < len(self.depths) else 0)
         self.put(y, 0, " " * (w - 1), curses.color_pair(C_TEXT + band))
         if sel:
             self.put(y, 0, "▌", curses.color_pair(C_ACCENT + band))
         if attached:  # the session showing on the right
             self.put(y, 1, "▶", curses.color_pair(C_ACCENT + band))
-        self.put(y, 2, icon, curses.color_pair(icolor + band) | curses.A_BOLD)
+        self.put(y, 2 + indent, icon, curses.color_pair(icolor + band) | curses.A_BOLD)
         weight = curses.A_BOLD if sel or attached or emph == "bold" else 0
         dim = curses.A_DIM if emph == "dim" and not sel else 0
-        room = w - 5 - (len(state) + 2 if state else 0)
+        room = w - 5 - indent - (len(state) + 2 if state else 0)
         shown = name if len(name) <= room else name[:max(3, room - 1)].rstrip() + "…"
-        self.put(y, 4, shown, curses.color_pair(C_TEXT + band) | weight | dim)
+        self.put(y, 4 + indent, shown, curses.color_pair(C_TEXT + band) | weight | dim)
         if state:
             self.put(y, w - len(state) - 2, state, curses.color_pair(scolor + band) | dim)
 
@@ -1592,8 +1985,37 @@ class Sidebar:
                 add(f"cut off by {cause}" + (f" {ago(when)}" if when else ""), "warn")
             if obj.get("lastPrompt"):
                 add(f"last ask: {obj['lastPrompt']}")
-        elif kind == "more":
-            add("open it to list every handoff" if obj["hidden"] else "open it to show only the newest")
+        elif kind in ("project", "folder"):
+            n = obj["count"]
+            where = obj["cwd"].replace(str(HOME), "~")
+            add(where if kind == "project" else f"{Path(obj['cwd']).name} › {obj['name']}")
+            what = f"{n} handoff{'s' * (n != 1)}"
+            if kind == "project" and obj["folders"]:
+                what += f" in {obj['folders']} folder{'s' * (obj['folders'] != 1)}"
+            if obj.get("waiting"):
+                what += f" · {obj['waiting']} not ready"
+            add(what)
+            is_open = (kind, obj["id"]) in self.tree_open
+            add(("⏎ closes it" if is_open else "⏎ opens it") + " · right-click a handoff to move it")
+        elif kind == "repo":
+            add(obj["path"].replace(str(HOME), "~"))
+            branch = obj.get("branch") or "no branch (detached HEAD)"
+            if obj.get("upstream"):
+                add(f"{branch} → {obj['upstream']}", max_lines=1)
+                b, a = obj.get("behind", 0), obj.get("ahead", 0)
+                add(" · ".join(filter(None, [f"↓ {b} to pull" if b else "", f"↑ {a} to push" if a else ""]))
+                    or "in sync", "warn" if b else "", 1)
+            elif obj.get("remote"):
+                add(f"{branch} · not on {obj['remote']} yet: ⏎ publishes it")
+            else:
+                add(f"{branch} · no remote: nothing to push to")
+            c = obj.get("changes", 0)
+            if c:
+                add(f"* {c} uncommitted change{'s' * (c != 1)} (not pushed until committed)")
+            if obj.get("checkedAt"):
+                add(f"checked {obj.get('remote') or 'remote'} {ago(obj['checkedAt'])}", max_lines=1)
+            if obj.get("error"):
+                add(obj["error"], "warn", 4)
         else:
             src = obj.get("source")
             state = "has ended" if not src else ("is still writing it" if src.get("status") == "busy" else "is done")
@@ -1635,11 +2057,14 @@ class Sidebar:
                 return sorted(group, key=lambda o: self.shown.get(self.item_key((kind, o)), len(self.shown)))
             lost, mine, standby = hold("lost", lost), hold("session", mine), hold("lost", standby)
             paused, windows, handoffs = hold("session", paused), hold("session", windows), hold("handoff", handoffs)
-        # only the first few handoffs unless you open the rest
-        hand_rows = [("handoff", x) for x in handoffs]
-        if len(handoffs) > HANDOFFS_SHOWN + 1:
-            hidden = 0 if self.handoffs_open else len(handoffs) - HANDOFFS_SHOWN
-            hand_rows = hand_rows[:len(handoffs) - hidden] + [("more", {"id": "handoffs", "hidden": hidden})]
+        # handoffs as a tree: project › folder › handoff, opened and closed like a file tree
+        rank = None
+        if self.focused and self.shown:  # projects hold their places too; a new one goes last
+            def rank(p, hs):
+                return self.shown.get(("project", p), len(self.shown)), -max((h.get("createdAt") or 0) for h in hs)
+        tree = handoff_tree(handoffs, all_folders(), lambda k: k in self.tree_open, rank)
+        hand_rows = [(k, o) for k, o, _ in tree]
+        repo_rows = [("repo", r) for r in self.repos.snapshot()]
         # self.sel indexes the list as it was last drawn: carry the selection to the same
         # item in the fresh list, so a session coming or going doesn't move it
         old = self.items
@@ -1648,11 +2073,15 @@ class Sidebar:
         # standby sessions are parked by Claude while they wait on you: they're listed with
         # the running ones, below them
         self.items = ([("lost", r) for r in lost] + [("session", s) for s in mine] + [("lost", r) for r in standby]
-                      + [("session", s) for s in paused + windows] + hand_rows)
+                      + [("session", s) for s in paused + windows] + hand_rows + repo_rows)
+        self.depths = [0] * (len(self.items) - len(hand_rows) - len(repo_rows)) + [d for _, _, d in tree] + [0] * len(repo_rows)
         keys = [self.item_key(it) for it in self.items]
         self.shown = {k: i for i, k in enumerate(keys)}
         if keys != self.last_keys:  # remember the order before a change, for click()
-            self.prev_keys, self.last_keys, self.moved_at = self.last_keys, keys, time.time()
+            # a change you made yourself (opening a folder) isn't one to guard clicks against
+            self.prev_keys, self.last_keys = self.last_keys, keys
+            self.moved_at = 0.0 if self.own_change else time.time()
+        self.own_change = False
         self.sel = keys.index(key) if key in keys else max(0, min(self.sel, len(self.items) - 1))
         self.rows = {}
 
@@ -1676,7 +2105,8 @@ class Sidebar:
                                             "none running · n starts one"),
                                            ("PAUSED", paused, len(paused), None),
                                            ("IN OTHER WINDOWS", windows, len(windows), None),
-                                           ("HANDOFFS", hand_rows, len(handoffs), "none queued")):
+                                           ("HANDOFFS", hand_rows, len(handoffs), "none queued"),
+                                           ("SOURCE CONTROL", repo_rows, len(repo_rows), None)):
             if not group and empty is None:
                 continue
             if body:
@@ -1742,7 +2172,12 @@ class Sidebar:
             self.put(h - 2, 1, err[:w - 2], curses.color_pair(C_BAD))
         kind, obj = self.items[self.sel] if self.items else (None, None)
         if kind == "handoff":
-            hint = "v read  x discard  n new  ? keys"
+            hint = "v read  m move  x discard  n new  ? keys"
+        elif kind in ("project", "folder"):
+            hint = "⏎ open/close  ← up  n new  ? keys"
+        elif kind == "repo":
+            hint = ("⏎ sync  p pull  P push  f fetch  ? keys" if obj.get("upstream")
+                    else "⏎ publish  f fetch  ? keys" if obj.get("remote") else "n new session  ? keys")
         elif kind == "lost" or (kind == "session" and obj["bg"] and obj.get("stopped")):
             hint = "x close  n new  ? keys"
         elif kind == "session" and obj["bg"]:
@@ -1772,9 +2207,17 @@ class Sidebar:
             ("", "conversation kept"),
             ("p", "pause: stays listed"),
             ("#", "HANDOFFS"),
-            ("⏎ 2×click", "start it"),
+            ("⏎ click", "open/close a project"),
+            ("", "or folder"),
+            ("←", "close it, or go up"),
+            ("⏎ 2×click", "start a handoff"),
             ("v", "read the prompt"),
+            ("m", "move to a folder"),
             ("x", "discard (u undoes)"),
+            ("#", "SOURCE CONTROL"),
+            ("⏎", "sync: pull, then push"),
+            ("p / P", "pull / push"),
+            ("f", "fetch (auto every 3m)"),
             ("#", "PLANE"),
             ("n", "new session"),
             ("super ←→", "sidebar ⇄ session"),
@@ -1811,18 +2254,22 @@ class Sidebar:
             self.launch_handoff(obj)
         elif kind == "lost":
             self.resume_lost(obj)
-        elif kind == "more":
-            self.toggle_handoffs()
+        elif kind in ("project", "folder"):
+            self.toggle_node(kind, obj)
+        elif kind == "repo":
+            self.git_action(obj, "sync")
 
-    def toggle_handoffs(self):
-        """Open the rest of the handoff list (selecting the first one it shows), or fold it."""
-        self.handoffs_open = not self.handoffs_open
-        if self.handoffs_open:
-            shown = [o for k, o in self.items if k == "handoff"]
-            with self.store.lock:
-                rest = sorted(self.store.handoffs, key=lambda x: -(x.get("createdAt") or 0))[len(shown):]
-            if rest:
-                self.pending_key = ("handoff", rest[0].get("id"))
+    def tree_left(self):
+        """← in the handoff tree: close an open project or folder, or step up to the row it's in."""
+        kind, obj = self.current()
+        if kind in ("project", "folder") and (kind, obj["id"]) in self.tree_open:
+            self.toggle_node(kind, obj, want=False)
+            return
+        depth = self.depths[self.sel] if self.sel < len(self.depths) else 0
+        if kind in ("handoff", "folder") and depth:
+            parent = next((i for i in range(self.sel - 1, -1, -1) if self.depths[i] < depth), None)
+            if parent is not None:
+                self.sel = parent
 
     def click(self, row):
         # A handoff starts a whole session, so it needs a double-click (or ⏎) to start.
@@ -1842,7 +2289,9 @@ class Sidebar:
             return  # the same physical click reported twice (pressed + clicked)
         self.last_click = (key, now)
         self.sel = row
-        if kind != "handoff":
+        if kind == "repo":
+            pass  # a click only selects: pull and push reach GitHub, so they take ⏎ or the menu
+        elif kind != "handoff":
             self.activate()
         elif key == prev_key and now - prev_at < 0.5:
             self.last_click = (None, 0)
@@ -1900,8 +2349,25 @@ class Sidebar:
                 self.sel = 0
             elif ch in (curses.KEY_END, ord("G")):
                 self.sel = len(self.items) - 1
+            elif ch in (curses.KEY_RIGHT, ord("l")) and kind in ("project", "folder"):
+                if (kind, obj["id"]) not in self.tree_open:
+                    self.toggle_node(kind, obj, want=True)
+                elif self.sel + 1 < len(self.items):
+                    self.sel += 1  # already open: step into it
+            elif ch in (curses.KEY_RIGHT, ord("l")) and kind == "repo":
+                pass  # → never syncs; ⏎ does, after asking
             elif ch in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT, ord("l")):
                 self.activate()
+            elif ch in (curses.KEY_LEFT, ord("h")):
+                self.tree_left()
+            elif ch == ord("m") and kind == "handoff":
+                self.move_handoff(obj)
+            elif ch == ord("p") and kind == "repo":
+                self.git_action(obj, "pull")
+            elif ch == ord("P") and kind == "repo":
+                self.git_action(obj, "push")
+            elif ch == ord("f") and kind == "repo":
+                self.git_action(obj, "fetch")
             elif ch == ord("n"):
                 self.new_session()
             elif ch in (ord("x"), ord("X"), ord("d")):
@@ -1989,7 +2455,11 @@ def main():
     add = ho.add_parser("add", help="queue a handoff prompt read from stdin")
     add.add_argument("--title", required=True)
     add.add_argument("--cwd")
+    add.add_argument("--folder", help="file it in this folder of its project (created if new)")
     add.set_defaults(fn=cmd_handoff_add)
+    fl = ho.add_parser("folders", help="list a project's handoff folders")
+    fl.add_argument("--cwd")
+    fl.set_defaults(fn=cmd_handoff_folders)
     args = ap.parse_args()
     (getattr(args, "fn", None) or cmd_open)(args)
 

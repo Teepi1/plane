@@ -29,6 +29,8 @@ one [kitty](https://sw.kovidgoyal.net/kitty/) window:
 - **Recover from crashes and reboots.** Sessions cut off mid-work are listed so you can
   resume them in one step, and you get a reminder at login.
 - **Watch your usage.** Bars for the 5-hour and weekly limits, with reset times.
+- **Keep projects in step with GitHub.** A Source Control list, like VS Code's: each
+  project's branch, what's waiting to pull (↓) and push (↑), and sync in one key.
 
 <table>
   <tr>
@@ -98,6 +100,8 @@ Closing or discarding asks once: press **y** to go ahead, anything else to back 
 | p | pause: the session stops but stays listed under PAUSED |
 | x | close: the session ends and leaves the list (the conversation is kept, `claude --resume` finds it) |
 | v | read a handoff's prompt |
+| m | move a handoff to another folder (or a new one) |
+| ← | close a project or folder, or go up to it |
 | x on a handoff | discard it (kept in `handoffs/discarded/` for 14 days, then deleted) |
 | u | bring back the handoff you just discarded |
 | r / R | refresh / reload Plane's own code in place |
@@ -123,8 +127,13 @@ trigger sidebar keys.
 - **PAUSED:** sessions you paused. Open one to continue it.
 - **IN OTHER WINDOWS:** Claude Code sessions running in ordinary terminals. Opening one
   switches to its window (on Hyprland).
-- **HANDOFFS:** queued prompts waiting to start as new sessions, newest first. Only the
-  newest four are listed until you open the "N more handoffs" row.
+- **HANDOFFS:** queued prompts waiting to start as new sessions, in a tree like a file
+  explorer: each project, then its folders, then the handoffs, newest first. Click a
+  project or folder to open or close it; Plane remembers which are open. A folder is
+  listed only while it holds a handoff, and handoffs in no folder sit under the project.
+  See [Handoff folders](#handoff-folders).
+- **SOURCE CONTROL:** every git project that has a session or a handoff. See
+  [Source control](#source-control).
 
 A session that ends its turn while one of its own tasks still runs (a background shell, a CI
 watch) shows *needs you* when it asked you something, and *working* when it's only waiting
@@ -148,9 +157,47 @@ is still working. Starting it opens a new session with the prompt as its first m
 If you start one by accident, right-click the new session and choose **Put back in
 queue**.
 
+### Handoff folders
+
+Each project can have its own folders, say one per area of its roadmap. Give a handoff
+one when you queue it with `--folder Orders` (a new name creates the folder), or later:
+right-click it, **Move to folder…**, and pick one or **New folder…**. Right-click a
+folder to rename it. `plane handoff folders` lists the current project's folders.
+
+The folders and their order live in `~/.local/share/plane/folders.json`, one list per
+project, which you can edit by hand:
+
+```json
+{ "/home/you/code/web-app": ["Checkout", "Accounts", "Infra"] }
+```
+
 [`skills/handoff/SKILL.md`](skills/handoff/SKILL.md) is a Claude Code skill that writes a
 handoff and queues it for you. Copy it into `~/.claude/skills/handoff/` (or a project's
 `.claude/skills/`) and type `/handoff` in a session.
+
+## Source control
+
+The SOURCE CONTROL section lists each git project that has a session (running, paused
+or in another window) or a queued handoff, and reads like VS Code's status bar:
+
+| Row | Means |
+|-----|-------|
+| `main ✓` | in step with GitHub |
+| `main ↓2 ↑1` | 2 commits to pull, 1 to push |
+| `main*` | uncommitted changes (they're pushed once you commit them) |
+| `topic · publish` | the branch isn't on GitHub yet |
+| `pulling…`, `failed` | an action running, or git's reason it failed (in the details) |
+
+Select a project and press **⏎** to sync (pull, then push, after one confirmation, the
+way VS Code does), **p** to pull, **P** to push and **f** to fetch, or right-click for
+the same. A branch with no upstream gets **Publish branch** instead, which pushes it and
+sets it to track. A worktree's session counts as its main checkout, so this keeps the
+main checkout itself in step. Plane fetches every 3 minutes, so ↓ shows what's new on
+GitHub before you pull.
+
+It runs your own `git`, with your credentials and your `pull` settings. git gets no
+terminal to ask on, so a missing password or SSH passphrase fails with git's message
+instead of waiting.
 
 ## Usage bars
 
@@ -269,6 +316,7 @@ session, swapped out with `kitty @ launch` whenever you pick another one.
 | Path | What's there |
 |------|--------------|
 | `~/.local/share/plane/handoffs/` | queued handoffs; started ones move to `done/` |
+| `~/.local/share/plane/folders.json` | each project's handoff folders, in order |
 | `~/.local/share/plane/live/` | the running-session records used for crash recovery |
 | `~/.cache/plane/usage.json` | the latest usage numbers from the status line |
 
