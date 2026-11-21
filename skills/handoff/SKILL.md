@@ -46,8 +46,11 @@ that fits:
 command -v plane >/dev/null && plane handoff folders --cwd "$(git rev-parse --show-toplevel)"
 ```
 
-Pick the folder whose area the work belongs to, and leave `--folder` off when none
-fits (don't invent one unless the user asks). Then pass the block's contents verbatim:
+Pick the folder whose area the work belongs to. A handoff can be in more than one:
+pass `--folder` once per folder, for example `--folder Launch --folder Printers` for
+launch work on printers.
+Leave `--folder` off when none fits (don't invent one unless the user asks). Then pass
+the block's contents verbatim:
 
 ```bash
 command -v plane >/dev/null && plane handoff add --title "<short title>" --folder "<folder>" --cwd "$(git rev-parse --show-toplevel)" <<'HANDOFF'

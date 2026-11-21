@@ -74,19 +74,45 @@ def test_folder_files_add_rename():
     P.write_json(P.HANDOFFS / "y.json", h("y", SITE, 1, "Printers"))  # another project: untouched
     P.rename_project_folder(FARM, "Printers", "Orders")  # onto an existing one: they merge
     assert P.project_folders(FARM) == ["Orders"]
-    assert P.read_json(P.HANDOFFS / "x.json")["folder"] == "Orders"
+    assert P.handoff_folders(P.read_json(P.HANDOFFS / "x.json")) == ["Orders"]
     assert P.read_json(P.HANDOFFS / "y.json")["folder"] == "Printers"
+    # a handoff in several folders: renaming one keeps the others, and merging drops the twin
+    P.write_json(P.HANDOFFS / "z.json", {**h("z", FARM, 1), "folders": ["Launch", "Orders", "Bugs"]})
+    P.rename_project_folder(FARM, "Bugs", "Launch")
+    assert P.read_json(P.HANDOFFS / "z.json")["folders"] == ["Launch", "Orders"]
+    for name in ("x", "y", "z"):
+        (P.HANDOFFS / f"{name}.json").unlink()
+
+
+def test_several_folders_list_the_handoff_in_each():
+    both = {**h("a", FARM, 5), "folders": ["Launch", "Printers"]}
+    hs = [both, h("b", FARM, 4, "Printers"), h("c", FARM, 3)]
+    opened = {("project", FARM), ("folder", f"{FARM}\nLaunch"), ("folder", f"{FARM}\nPrinters")}
+    rows = P.handoff_tree(hs, {FARM: ["Launch", "Printers"]}, lambda k: k in opened)
+    got = [(k, o.get("name") or o["id"], d) for k, o, d in rows]
+    assert got == [("project", "farm app", 0), ("folder", "Launch", 1), ("handoff", "a", 2),
+                   ("folder", "Printers", 1), ("handoff", "a", 2), ("handoff", "b", 2),
+                   ("handoff", "c", 1)], got
+    assert rows[0][1]["count"] == 3  # the project counts each handoff once
+    places = [o["_place"] for k, o, _ in rows if k == "handoff"]
+    assert places == [f"{FARM}\nLaunch", f"{FARM}\nPrinters", f"{FARM}\nPrinters", FARM], places
+    assert "_place" not in both  # rows are copies: the stored handoff isn't changed
+    x = {"folder": "Old"}
+    P.set_handoff_folders(x, ["A", "A", "", "B"])
+    assert x == {"folders": ["A", "B"]}
+    P.set_handoff_folders(x, [])
+    assert x == {}
 
 
 def test_handoff_add_with_folder():
     env = dict(os.environ, HOME=str(TMP / "home"))
     r = subprocess.run([sys.executable, str(HERE.parent / "plane"), "handoff", "add", "--title", "Fix it",
-                        "--cwd", FARM, "--folder", "orders"], input="do the thing", text=True,
-                       capture_output=True, env=env)
+                        "--cwd", FARM, "--folder", "orders", "--folder", "Launch"], input="do the thing",
+                       text=True, capture_output=True, env=env)
     assert r.returncode == 0, r.stderr
-    assert "farm app › Orders" in r.stdout, r.stdout
+    assert "farm app › Orders, Launch" in r.stdout, r.stdout
     made = [P.read_json(f) for f in P.HANDOFFS.glob("*fix-it.json")]
-    assert made and made[0]["folder"] == "Orders", made
+    assert made and made[0]["folders"] == ["Orders", "Launch"], made
     r = subprocess.run([sys.executable, str(HERE.parent / "plane"), "handoff", "folders", "--cwd", FARM],
                        text=True, capture_output=True, env=env)
     assert r.stdout.split("\n")[0] == "Orders", r.stdout
