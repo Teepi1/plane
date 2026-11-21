@@ -39,10 +39,18 @@ them by path.
 
 ## 3. Queue it in Plane
 
-Give it a 2–5 word title and pass the block's contents verbatim:
+Give it a 2–5 word title. If the project has handoff folders, file it in the one
+that fits:
 
 ```bash
-command -v plane >/dev/null && plane handoff add --title "<short title>" --cwd "$(git rev-parse --show-toplevel)" <<'HANDOFF'
+command -v plane >/dev/null && plane handoff folders --cwd "$(git rev-parse --show-toplevel)"
+```
+
+Pick the folder whose area the work belongs to, and leave `--folder` off when none
+fits (don't invent one unless the user asks). Then pass the block's contents verbatim:
+
+```bash
+command -v plane >/dev/null && plane handoff add --title "<short title>" --folder "<folder>" --cwd "$(git rev-parse --show-toplevel)" <<'HANDOFF'
 <the prompt, exactly as in the fenced block>
 HANDOFF
 ```
