@@ -2083,8 +2083,11 @@ class Handler(BaseHTTPRequestHandler):
             a.answer(int(b["index"]), str(b.get("sig")), text)
         elif action == "key":
             a = hub.attach(job)
-            a.wait_ready()
             key = b.get("key")
+            # Scrolling doesn't wait for a quiet screen: each scroll redraws Claude's screen, so
+            # waiting held every next step until the last redraw settled (choppy, slow scrolling).
+            if key != "scroll":
+                a.wait_ready()
             if key == "text":
                 a.send_text(str(b.get("text") or ""), enter=bool(b.get("enter")))
             elif key == "scroll":  # the phone's terminal: Claude full screen scrolls on the mouse wheel
