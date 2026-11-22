@@ -26,9 +26,10 @@ use crate::store::{Snap, Store};
 use crate::text::{ago, esc, fmt_reset, now, short_needs, tilde};
 use crate::{icons, term, theme};
 use plane_core::files;
+use plane_core::folders::{self, Node};
 
-/// Newest handoffs listed before "N more handoffs" (the list folds above 5).
-const HANDOFFS_SHOWN: usize = 4;
+/// How far each level of the handoff tree is set in (px).
+const TREE_INDENT: i32 = 14;
 /// Sessions kept attached in tabs at once. Each `claude attach` holds about 150 MB, so
 /// opening one more reuses the tab you looked at longest ago.
 const MAX_ATTACHED: usize = 4;
@@ -126,7 +127,10 @@ enum Kind {
     Session,
     Lost,
     Handoff,
-    More,
+    /// A project in the handoff tree: click to open or close it.
+    Project,
+    /// One of a project's handoff folders.
+    Folder,
     Note,
 }
 
@@ -136,6 +140,8 @@ struct Item {
     kind: Kind,
     section: Section,
     sub: u8,
+    /// How deep in the handoff tree (0 elsewhere).
+    depth: u8,
     obj: Value,
 }
 
@@ -302,7 +308,10 @@ pub struct App {
     order: Rc<RefCell<HashMap<String, (u8, u8, usize)>>>,
     placed: RefCell<HashMap<String, (usize, f64)>>,
     tabs: RefCell<Vec<Rc<Tab>>>,
-    handoffs_open: Cell<bool>,
+    /// The handoff projects and folders left open: ("project" | "folder", id).
+    tree_open: RefCell<HashSet<(String, String)>>,
+    /// The next list change is one you made (opening a folder): it isn't held in place.
+    own_change: Cell<bool>,
     last_discard: RefCell<Option<PathBuf>>,
     confirm: RefCell<Option<Confirm>>,
     flash: RefCell<Option<(String, &'static str, f64)>>,
@@ -349,6 +358,27 @@ fn sval<'a>(v: &'a Value, k: &str) -> &'a str {
     v.get(k).and_then(Value::as_str).unwrap_or("")
 }
 
+/// A handoff row in a folder names the other folders it's in, short: "Platform +1" for
+/// Launch work that's also in Platform & Fleet and Printers (as the kitty sidebar does).
+fn also_in(h: &Value) -> String {
+    let here = sval(h, "_place").split_once('\n').map(|(_, n)| n).unwrap_or("");
+    let others: Vec<String> = folders::handoff_folders(h).into_iter().filter(|n| n != here).collect();
+    let Some(first) = others.first() else { return String::new() };
+    let mut also = first.split(" & ").next().unwrap_or(first).to_owned();
+    if also.chars().count() > 11 {
+        also = also.chars().take(10).collect::<String>() + "…";
+    }
+    if others.len() > 1 {
+        also += &format!(" +{}", others.len() - 1);
+    }
+    also
+}
+
+/// The tree.json key of a project or folder row.
+fn node_key(item: &Item) -> (String, String) {
+    (if item.kind == Kind::Project { "project" } else { "folder" }.to_owned(), sval(&item.obj, "id").to_owned())
+}
+
 /// The job id `claude --bg` prints: "… backgrounded · 655d7b29".
 fn backgrounded_id(text: &str) -> Option<String> {
     let mut rest = text;
@@ -368,6 +398,7 @@ fn backgrounded_id(text: &str) -> Option<String> {
 impl App {
     pub fn build(app: &gtk::Application, commands: Arc<Mutex<Vec<(String, UnixStream)>>>) -> Rc<App> {
         let env = Env::from_env();
+        let tree_open: HashSet<(String, String)> = folders::read_tree(&env).into_iter().collect();
         let home = env.home.to_string_lossy().into_owned();
         let provider = gtk::CssProvider::new();
         let defines = theme::defines();
@@ -737,7 +768,8 @@ impl App {
             order: Rc::new(RefCell::new(HashMap::new())),
             placed: RefCell::new(HashMap::new()),
             tabs: RefCell::new(vec![]),
-            handoffs_open: Cell::new(false),
+            tree_open: RefCell::new(tree_open),
+            own_change: Cell::new(false),
             last_discard: RefCell::new(None),
             confirm: RefCell::new(None),
             flash: RefCell::new(None),
@@ -871,6 +903,40 @@ impl App {
                     entry.set_text(&text.replace('_', " "));
                     go();
                 }
+            } else if let Some(folder) = name.strip_prefix("tick:") {
+                // a click on a folder in the open Folders… checklist
+                fn find(w: &gtk::Widget, name: &str) -> Option<gtk::CheckButton> {
+                    if let Some(c) = w.downcast_ref::<gtk::CheckButton>() {
+                        if c.label().as_deref() == Some(name) {
+                            return Some(c.clone());
+                        }
+                    }
+                    let mut ch = w.first_child();
+                    while let Some(c) = ch {
+                        if let Some(hit) = find(&c, name) {
+                            return Some(hit);
+                        }
+                        ch = c.next_sibling();
+                    }
+                    None
+                }
+                if let Some(c) = find(app.sidebar.upcast_ref(), &folder.replace('_', " ")) {
+                    c.set_active(!c.is_active());
+                }
+            } else if let Some(out) = name.strip_prefix("rows:") {
+                // what the sessions list shows, one row per line: depth, key, name, caption
+                let mut text = String::new();
+                let mut i = 0;
+                while let Some(row) = app.list.row_at_index(i) {
+                    let key = row.widget_name().to_string();
+                    if let (Some(it), Some(r)) = (app.item(&key), app.rows.borrow().get(&key)) {
+                        let sel = if app.list.selected_row().as_ref() == Some(&row) { "*" } else { " " };
+                        text.push_str(&format!("{sel}{}\t{}\t{}\t{}\n", it.depth, key.replace('\n', " | "), r.name.text(), if r.caption.is_visible() { r.caption.text().to_string() } else { String::new() }));
+                    }
+                    i += 1;
+                }
+                text.push_str(&format!("message\t{}\n", app.message.text()));
+                let _ = std::fs::write(out, text);
             } else if let Some(sec) = name.strip_prefix("toggle:") {
                 if let Some(s) = Section::ALL.into_iter().find(|s| s.key().eq_ignore_ascii_case(sec)) {
                     app.toggle_section(s);
@@ -1248,16 +1314,18 @@ impl App {
         let loaded = self.snap.borrow().loaded;
         let mut items = vec![];
         // `sub` orders rows inside a section; 0 is the heading's
-        let mut push = |kind, section, sub, obj: Value| {
+        let mut push_at = |kind, section, sub, depth, obj: Value| {
             let id = match kind {
                 Kind::Lost => py_str(pget(&obj, "sessionId")),
-                Kind::More => "handoffs".into(),
                 Kind::Note => format!("{section:?}"),
+                // one handoff can be listed in several folders: a row for each place
+                Kind::Handoff if obj.get("_place").is_some() => format!("{}\n{}", py_str(pget(&obj, "id")), py_str(pget(&obj, "_place"))),
                 _ => py_str(pget(&obj, "id")),
             };
             let key = format!("{kind:?}:{id}");
-            items.push(Item { key, kind, section, sub, obj });
+            items.push(Item { key, kind, section, sub, depth, obj });
         };
+        let mut push = |kind, section, sub, obj: Value| push_at(kind, section, sub, 0, obj);
         for r in lost {
             push(Kind::Lost, Section::Lost, 1, r);
         }
@@ -1278,17 +1346,22 @@ impl App {
         for s in windows {
             push(Kind::Session, Section::Windows, 1, s);
         }
+        // handoffs as a tree: project › folder › handoff, opened and closed like a file tree
         let total = handoffs.len();
-        let fold = total > HANDOFFS_SHOWN + 1;
-        let hidden = if fold && !self.handoffs_open.get() { total - HANDOFFS_SHOWN } else { 0 };
-        for h in handoffs.into_iter().take(total - hidden) {
-            push(Kind::Handoff, Section::Handoffs, 1, h);
-        }
-        if fold {
-            push(Kind::More, Section::Handoffs, 2, serde_json::json!({ "hidden": hidden }));
+        let open = self.tree_open.borrow();
+        let tree = folders::handoff_tree(&handoffs, &folders::all_folders(&self.env), |k, id| {
+            open.contains(&(if k == Node::Project { "project" } else { "folder" }.to_owned(), id.to_owned()))
+        });
+        for (node, obj, depth) in tree {
+            let kind = match node {
+                Node::Project => Kind::Project,
+                Node::Folder => Kind::Folder,
+                Node::Handoff => Kind::Handoff,
+            };
+            push_at(kind, Section::Handoffs, 1, depth, obj);
         }
         if total == 0 && loaded {
-            push(Kind::Note, Section::Handoffs, 10, Value::String("None queued.".into()));
+            push_at(Kind::Note, Section::Handoffs, 10, 0, Value::String("None queued.".into()));
         }
         // each section with rows gets a heading row; a folded section shows only its heading
         let collapsed = self.collapsed.borrow();
@@ -1298,9 +1371,9 @@ impl App {
             if rows.is_empty() {
                 continue;
             }
-            let count = if sec == Section::Handoffs { total } else { rows.iter().filter(|i| !matches!(i.kind, Kind::Note | Kind::More)).count() };
+            let count = if sec == Section::Handoffs { total } else { rows.iter().filter(|i| i.kind != Kind::Note).count() };
             let folded = collapsed.contains(&sec.key());
-            out.push(Item { key: format!("Head:{sec:?}"), kind: Kind::Head, section: sec, sub: 0, obj: serde_json::json!({ "count": count, "folded": folded }) });
+            out.push(Item { key: format!("Head:{sec:?}"), kind: Kind::Head, section: sec, sub: 0, depth: 0, obj: serde_json::json!({ "count": count, "folded": folded }) });
             if !folded {
                 out.extend(rows);
             }
@@ -1343,13 +1416,10 @@ impl App {
                 let cause = sval(o, "cause");
                 ("svg:crash".into(), "warn", lost_label(o), if cause == "crashed" { "crash".into() } else { cause.into() }, "warn", "")
             }
-            Kind::More => {
-                let hidden = num(pget(o, "hidden")) as usize;
-                if hidden > 0 {
-                    ("+".into(), "dim", format!("{hidden} more handoffs"), String::new(), "dim", "dim")
-                } else {
-                    ("−".into(), "dim", "show fewer".into(), String::new(), "dim", "dim")
-                }
+            Kind::Project | Kind::Folder => {
+                let chevron = if self.node_open(item) { "▾" } else { "▸" };
+                let tone = if item.kind == Kind::Project { "accent" } else { "dim" };
+                (chevron.into(), tone, sval(o, "name").to_owned(), py_str(pget(o, "count")), "dim", "")
             }
             Kind::Handoff if truthy(pget(o, "ready")) => ("svg:ready".into(), "accent", sval(o, "title").to_owned(), "ready to start".into(), "accent", ""),
             Kind::Handoff => ("svg:waiting".into(), "warn", sval(o, "title").to_owned(), "not ready".into(), "warn", "dim"),
@@ -1397,6 +1467,20 @@ impl App {
             caption.set_ellipsize(pango::EllipsizeMode::End);
             caption.set_visible(true);
         }
+        if matches!(item.kind, Kind::Project | Kind::Folder) {
+            row.add_css_class("tree-node");
+            if item.kind == Kind::Project {
+                row.add_css_class("tree-project");
+            }
+            icon.add_css_class("chevron");
+            state.add_css_class("count");
+            state.set_valign(gtk::Align::Center);
+        }
+        if item.kind == Kind::Handoff {
+            caption.add_css_class("also"); // the other folders it's in
+        }
+        // set in under its project or folder (the row's own padding stays, for the selection bar)
+        b.set_margin_start(TREE_INDENT * item.depth as i32);
         if item.kind == Kind::Note {
             row.add_css_class("note");
             row.set_selectable(false);
@@ -1433,6 +1517,17 @@ impl App {
             r.name.set_tooltip_text(Some(if truthy(pget(&item.obj, "folded")) { "Click to show this section" } else { "Click to fold this section" }));
             return;
         }
+        if matches!(item.kind, Kind::Project | Kind::Folder) {
+            r.state.set_visible(true); // how many handoffs are in it
+            let n = num(pget(&item.obj, "count")) as usize;
+            r.name.set_tooltip_text(Some(&format!("{name} · {n} handoff{} · click to {}", if n == 1 { "" } else { "s" }, if self.node_open(item) { "close" } else { "open" })));
+            return;
+        }
+        if item.kind == Kind::Handoff {
+            let also = also_in(&item.obj);
+            r.caption.set_text(&also);
+            r.caption.set_visible(!also.is_empty());
+        }
         // the state in words: the icon's tooltip, the row's tooltip and the details panel
         r.state.set_visible(false);
         r.glyph.set_tooltip_text((!state.is_empty()).then_some(state.as_str()));
@@ -1442,6 +1537,70 @@ impl App {
         for (class, on) in [("dimmed", emph == "dim"), ("urgent", emph == "bold")] {
             if on { r.row.add_css_class(class) } else { r.row.remove_css_class(class) }
         }
+    }
+
+    /// `key` itself when there's a row for it, else the first handoff row it names.
+    fn first_row_for(&self, key: &str) -> String {
+        if self.rows.borrow().contains_key(key) || !key.starts_with("Handoff:") {
+            return key.to_owned();
+        }
+        let prefix = format!("{key}\n");
+        self.items.borrow().iter().find(|i| i.key.starts_with(&prefix)).map(|i| i.key.clone()).unwrap_or_else(|| key.to_owned())
+    }
+
+    fn node_open(&self, item: &Item) -> bool {
+        self.tree_open.borrow().contains(&node_key(item))
+    }
+
+    /// Opens or closes a project or folder row (remembered in tree.json, shared with the
+    /// kitty sidebar), and keeps it selected.
+    fn toggle_node(self: &Rc<Self>, item: &Item, want: Option<bool>) {
+        let key = node_key(item);
+        let is_open = self.tree_open.borrow().contains(&key);
+        if want == Some(is_open) {
+            return;
+        }
+        if is_open {
+            self.tree_open.borrow_mut().remove(&key);
+        } else {
+            self.tree_open.borrow_mut().insert(key);
+        }
+        self.save_tree();
+        self.own_change.set(true);
+        *self.pending_key.borrow_mut() = Some(item.key.clone());
+        self.sync();
+        self.focus_list();
+    }
+
+    fn save_tree(&self) {
+        if std::env::var_os("PLANE_SHOT").is_some() {
+            return; // off-screen pictures don't change your saved choices
+        }
+        let open: Vec<(String, String)> = self.tree_open.borrow().iter().cloned().collect();
+        folders::write_tree(&self.env, &mut Fs::new(Mode::Real), &open);
+    }
+
+    /// ← in the handoff tree: close an open project or folder, or step up to the row it's in.
+    /// Anywhere else (and on a closed project) it folds the section.
+    fn tree_left(self: &Rc<Self>, item: &Item) {
+        if matches!(item.kind, Kind::Project | Kind::Folder) && self.node_open(item) {
+            self.toggle_node(item, Some(false));
+            return;
+        }
+        if item.section == Section::Handoffs && item.depth > 0 {
+            let items = self.items.borrow().clone();
+            if let Some(at) = items.iter().position(|i| i.key == item.key) {
+                if let Some(parent) = items[..at].iter().rev().find(|i| i.depth < item.depth && i.kind != Kind::Head) {
+                    let row = self.rows.borrow().get(&parent.key).map(|r| r.row.clone());
+                    if let Some(row) = row {
+                        self.list.select_row(Some(&row));
+                        row.grab_focus();
+                    }
+                    return;
+                }
+            }
+        }
+        self.fold_section(item.section, true);
     }
 
     fn selected_key(&self) -> Option<String> {
@@ -1462,12 +1621,14 @@ impl App {
         let items = self.build_items();
         let selected = self.selected_key();
         let sel_index = self.list.selected_row().map(|r| r.index()).unwrap_or(0);
-        let frozen = self.focus_in.get() || self.hover.get();
+        // a change you made yourself (opening a folder) isn't held in place: its rows go
+        // under the row you clicked, not to the end
+        let frozen = (self.focus_in.get() || self.hover.get()) && !self.own_change.replace(false);
         // the rows as they'd look: when that's unchanged, only the small things need updating
         let shown_id = self.shown_session();
         let mut print = format!("{frozen}|{shown_id:?}|{}|{}\n", self.snap.borrow().handoffs.len(), self.pending_key.borrow().is_some());
         for it in &items {
-            print.push_str(&format!("{}|{:?}|{}|{:?}\n", it.key, it.section, it.sub, self.row_look(it)));
+            print.push_str(&format!("{}|{:?}|{}|{:?}|{}\n", it.key, it.section, it.sub, self.row_look(it), also_in(&it.obj)));
         }
         if *self.shown_print.borrow() == print {
             *self.items.borrow_mut() = items; // fresh data behind the same rows, for actions
@@ -1529,6 +1690,8 @@ impl App {
         let pending = self.pending_key.borrow_mut().take();
         // a heading the app fell back to (nothing else was there yet) gives way to a row
         let selected = selected.filter(|k| !(self.auto_head.get() && k.starts_with("Head:")));
+        // "Handoff:ID" means that handoff wherever it's listed: its first row
+        let pending = pending.map(|k| self.first_row_for(&k));
         let want = pending.or(selected).filter(|k| self.rows.borrow().contains_key(k));
         match want {
             Some(k) => {
@@ -1812,9 +1975,23 @@ impl App {
                     out.push((format!("last ask: {}", py_str(pget(o, "lastPrompt"))), "", 2));
                 }
             }
-            Kind::More => {
-                let hidden = num(pget(o, "hidden")) > 0.0;
-                out.push((if hidden { "open it to list every handoff" } else { "open it to show only the newest" }.into(), "", 2));
+            Kind::Project | Kind::Folder => {
+                let n = num(pget(o, "count")) as usize;
+                let mut what = format!("{n} handoff{}", if n == 1 { "" } else { "s" });
+                let f = num(pget(o, "folders")) as usize;
+                if item.kind == Kind::Project && f > 0 {
+                    what += &format!(" in {f} folder{}", if f == 1 { "" } else { "s" });
+                }
+                let waiting = num(pget(o, "waiting")) as usize;
+                if waiting > 0 {
+                    what += &format!(" · {waiting} not ready");
+                }
+                out.push((what, "", 2));
+                if item.kind == Kind::Project {
+                    out.push((tilde(sval(o, "cwd"), home), "", 2));
+                }
+                let verb = if self.node_open(item) { "close" } else { "open" };
+                out.push((format!("Click or Enter to {verb} it. On a handoff, m picks its folders."), "", 3));
             }
             Kind::Handoff => {
                 let src = pget(o, "source");
@@ -1823,6 +2000,8 @@ impl App {
                 out.push((format!("from {from}, which {state}"), "", 2));
                 let created = if truthy(pget(o, "createdAt")) { num(pget(o, "createdAt")) } else { now() };
                 out.push((format!("{} · queued {}", tilde(sval(o, "cwd"), home), ago(created)), "", 2));
+                let filed = folders::handoff_folders(o);
+                out.push((if filed.is_empty() { "in no folder · m to file it".into() } else { format!("in {}", filed.join(" · ")) }, "", 2));
                 let prompt = sval(o, "prompt").split_whitespace().collect::<Vec<_>>().join(" ");
                 if !prompt.is_empty() {
                     out.push((prompt, "", 5));
@@ -1858,7 +2037,9 @@ impl App {
     fn show_hints(&self, item: Option<&Item>) {
         let hint = match item.map(|i| (i.kind, &i.obj)) {
             Some((Kind::Head, _)) => "←→ fold  n new  ? keys",
-            Some((Kind::Handoff, _)) => "v read  x discard  n new  ? keys",
+            Some((Kind::Handoff, _)) => "v read  m folders  x discard  ? keys",
+            Some((Kind::Folder, _)) => "←→ close/open  F2 rename  ? keys",
+            Some((Kind::Project, _)) => "←→ close/open  n new  ? keys",
             Some((Kind::Lost, _)) => "x close  n new  ? keys",
             Some((Kind::Session, o)) if truthy(pget(o, "bg")) && truthy(pget(o, "stopped")) => "x close  f files  n new  ? keys",
             Some((Kind::Session, o)) if truthy(pget(o, "bg")) => "x close  p pause  f files  ? keys",
@@ -1928,6 +2109,11 @@ impl App {
                 self.toggle_section(item.section);
                 return;
             }
+            if matches!(item.kind, Kind::Project | Kind::Folder) {
+                self.list.select_row(Some(&row));
+                self.toggle_node(&item, None);
+                return;
+            }
             self.list.select_row(Some(&row));
             if item.kind == Kind::Session && truthy(pget(&item.obj, "bg")) {
                 // a click on a session points Files at it, even over a folder picked by hand
@@ -1937,9 +2123,6 @@ impl App {
                 row.grab_focus();
                 self.say("double-click or press Enter to start", "info");
             } else {
-                if item.kind == Kind::More {
-                    row.grab_focus();
-                }
                 self.activate(&item);
             }
         } else if n == 2 && item.kind == Kind::Handoff && self.press.borrow().0 == key {
@@ -2006,14 +2189,34 @@ impl App {
                     self.fold_section(i.section, false);
                 }
             }
+            K::Right | K::l if matches!(kind, Some(Kind::Project | Kind::Folder)) => {
+                if let Some(i) = item {
+                    self.toggle_node(&i, Some(true));
+                }
+            }
             K::Left | K::h => {
                 if let Some(i) = item {
-                    self.fold_section(i.section, true);
+                    self.tree_left(&i);
+                }
+            }
+            K::m => {
+                if let (Some(Kind::Handoff), Some(i)) = (kind, item) {
+                    self.folders_popover(&i);
+                }
+            }
+            K::F2 => {
+                if let (Some(Kind::Folder), Some(i)) = (kind, item) {
+                    self.rename_folder(&i);
                 }
             }
             K::space if kind == Some(Kind::Head) => {
                 if let Some(i) = item {
                     self.toggle_section(i.section);
+                }
+            }
+            K::space if matches!(kind, Some(Kind::Project | Kind::Folder)) => {
+                if let Some(i) = item {
+                    self.toggle_node(&i, None);
                 }
             }
             K::Return | K::KP_Enter | K::Right | K::l => {
@@ -2069,23 +2272,9 @@ impl App {
             Kind::Session => self.attach(&item.obj),
             Kind::Handoff => self.launch_handoff(&item.obj),
             Kind::Lost => self.resume_lost(&item.obj),
-            Kind::More => self.toggle_handoffs(),
+            Kind::Project | Kind::Folder => self.toggle_node(item, None),
             Kind::Note => {}
         }
-    }
-
-    fn toggle_handoffs(self: &Rc<Self>) {
-        let open = !self.handoffs_open.get();
-        self.handoffs_open.set(open);
-        if open {
-            // select the first handoff that was hidden
-            let (_, _, _, _, _, handoffs) = self.snap_lists();
-            if let Some(h) = handoffs.get(HANDOFFS_SHOWN) {
-                *self.pending_key.borrow_mut() = Some(format!("Handoff:{}", py_str(pget(h, "id"))));
-            }
-        }
-        self.sync();
-        self.focus_list();
     }
 
     // ------------------------------------------------------------------ confirm
@@ -2157,9 +2346,15 @@ impl App {
                 Kind::Handoff => {
                     acts.append(Some("Start"), Some("row.open"));
                     acts.append(Some("Read prompt"), Some("row.read"));
+                    acts.append(Some("Folders…"), Some("row.folders"));
                     acts.append(Some("Discard"), Some("row.close"));
                 }
-                Kind::More => acts.append(Some(if num(pget(o, "hidden")) > 0.0 { "Show all handoffs" } else { "Show fewer" }), Some("row.open")),
+                Kind::Project | Kind::Folder => {
+                    acts.append(Some(if self.node_open(i) { "Close" } else { "Open" }), Some("row.open"));
+                    if i.kind == Kind::Folder {
+                        acts.append(Some("Rename folder…"), Some("row.rename-folder"));
+                    }
+                }
                 Kind::Head => acts.append(Some(if truthy(pget(o, "folded")) { "Show this section" } else { "Fold this section" }), Some("row.open")),
                 Kind::Note => {}
             }
@@ -2209,6 +2404,8 @@ impl App {
         add("close-all", |app, i| app.close_lost(&i.obj, true));
         add("requeue", |app, i| app.requeue(&i.obj));
         add("read", |app, i| app.view_handoff(&i.obj));
+        add("folders", |app, i| app.folders_popover(i));
+        add("rename-folder", |app, i| app.rename_folder(i));
         add("files", |app, i| app.files_for_session(&i.obj));
         let a = gio::SimpleAction::new("new", None);
         let weak = Rc::downgrade(self);
@@ -2751,6 +2948,256 @@ impl App {
             }
             _ => self.say("nothing to bring back", "warn"),
         }
+    }
+
+    // ------------------------------------------------------------------ handoff folders
+
+    /// Where a list row is, in the sidebar's coordinates (for a popover pointing at it).
+    fn row_rect(&self, key: &str) -> gdk::Rectangle {
+        let row = self.rows.borrow().get(key).map(|r| r.row.clone());
+        row.and_then(|r| r.compute_bounds(&self.sidebar))
+            .map(|b| gdk::Rectangle::new(b.x() as i32 + 24, b.y() as i32, (b.width() as i32 - 48).max(1), b.height() as i32))
+            .unwrap_or_else(|| gdk::Rectangle::new(40, 40, 1, 1))
+    }
+
+    /// Puts a queued handoff in or takes it out of one folder of its project, saved at once.
+    /// False when the handoff is gone (started or discarded meanwhile).
+    fn set_in_folder(self: &Rc<Self>, path: &Path, cwd: &str, name: &str, on: bool) -> bool {
+        let Some(data) = plane_core::read_json(path).filter(Value::is_object) else {
+            self.say("that handoff was started or discarded", "warn");
+            self.store.poke();
+            return false;
+        };
+        let mut names = folders::handoff_folders(&data);
+        names.retain(|n| n != name);
+        if on {
+            names.push(name.to_owned());
+        }
+        let mut fs = Fs::new(Mode::Real);
+        let Some(saved) = folders::file_handoff(&self.env, &mut fs, path, &names) else {
+            self.say("that handoff was started or discarded", "warn");
+            return false;
+        };
+        let id = py_str(pget(&saved, "id"));
+        for h in self.snap.borrow_mut().handoffs.iter_mut().filter(|h| py_str(pget(h, "id")) == id) {
+            folders::set_handoff_folders(h, &names); // the list shows it now, not at the next refresh
+        }
+        if on {
+            let mut open = self.tree_open.borrow_mut();
+            open.insert(("project".into(), cwd.to_owned()));
+            open.insert(("folder".into(), folders::folder_id(cwd, name)));
+        }
+        self.save_tree();
+        self.own_change.set(true);
+        *self.pending_key.borrow_mut() = Some(format!("Handoff:{id}"));
+        self.sync();
+        self.say(&if on { format!("in {name}") } else if names.is_empty() { format!("out of {name} · now in no folder") } else { format!("out of {name}") }, "info");
+        true
+    }
+
+    /// `m` or Folders…: a checklist of the handoff's project folders. Each tick saves at once;
+    /// a handoff can be in several. New folder makes one and puts the handoff in it.
+    fn folders_popover(self: &Rc<Self>, item: &Item) {
+        let h = &item.obj;
+        let path = PathBuf::from(sval(h, "path"));
+        let cwd = sval(h, "cwd").to_owned();
+        let now = folders::handoff_folders(h);
+        let mut names = folders::project_folders(&self.env, &cwd);
+        let mut extra: Vec<String> = self
+            .snap
+            .borrow()
+            .handoffs
+            .iter()
+            .filter(|x| sval(x, "cwd") == cwd)
+            .flat_map(folders::handoff_folders)
+            .chain(now.iter().cloned())
+            .filter(|n| !names.contains(n))
+            .collect();
+        extra.sort_by_key(|n| n.to_lowercase());
+        extra.dedup();
+        names.extend(extra);
+
+        let pop = gtk::Popover::new();
+        pop.add_css_class("name-pop");
+        let b = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        b.append(&label("Folders it's in", &["name-title"]));
+        let what = label(&format!("{} · {}", Path::new(&cwd).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), sval(h, "title")), &["dim"]);
+        what.set_ellipsize(pango::EllipsizeMode::End);
+        what.set_max_width_chars(34);
+        b.append(&what);
+        let checks = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        scroll.set_propagate_natural_height(true);
+        scroll.set_max_content_height(340);
+        // tall enough for every folder (up to a point): the popover goes above the row when
+        // there's no room below, rather than squeezing the list into a few lines
+        scroll.set_min_content_height((names.len().max(1) as i32 * 28).min(300));
+        scroll.set_child(Some(&checks));
+        b.append(&scroll);
+        if names.is_empty() {
+            checks.append(&label("No folders yet: make the first one below.", &["dim"]));
+        }
+        let add_check = {
+            let (weak, checks, path, cwd) = (Rc::downgrade(self), checks.clone(), path.clone(), cwd.clone());
+            Rc::new(move |name: &str, active: bool| -> gtk::CheckButton {
+                let c = gtk::CheckButton::with_label(name);
+                c.set_active(active); // before the handler: setting it up isn't a tick
+                c.add_css_class("folder-check");
+                clickable(&c);
+                let (weak, path, cwd, name) = (weak.clone(), path.clone(), cwd.clone(), name.to_owned());
+                c.connect_toggled(move |c| {
+                    if let Some(app) = weak.upgrade() {
+                        if !app.set_in_folder(&path, &cwd, &name, c.is_active()) {
+                            c.set_sensitive(false);
+                        }
+                    }
+                });
+                checks.append(&c);
+                c
+            })
+        };
+        for n in &names {
+            add_check(n, now.contains(n));
+        }
+        b.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        b.append(&label("New folder", &["dim"]));
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let entry = gtk::Entry::new();
+        entry.set_width_chars(20);
+        entry.set_hexpand(true);
+        let add = gtk::Button::with_label("Add");
+        clickable(&add);
+        row.append(&entry);
+        row.append(&add);
+        b.append(&row);
+        let err = label("", &["error"]);
+        err.set_visible(false);
+        b.append(&err);
+        let done = gtk::Button::with_label("Done");
+        done.add_css_class("suggested-action");
+        done.set_halign(gtk::Align::End);
+        clickable(&done);
+        b.append(&done);
+        pop.set_child(Some(&b));
+        pop.set_parent(&self.sidebar);
+        let at = self.row_rect(&item.key);
+        // a row low in the sidebar gets the list above it, where there's room
+        let low = at.y() > self.sidebar.height() / 2;
+        pop.set_position(if low { gtk::PositionType::Top } else { gtk::PositionType::Bottom });
+        pop.set_pointing_to(Some(&at));
+
+        let create = {
+            let (weak, entry, err, checks, cwd) = (Rc::downgrade(self), entry.clone(), err.clone(), checks.clone(), cwd.clone());
+            Rc::new(move || {
+                let Some(app) = weak.upgrade() else { return };
+                let name = folders::folder_name(&app.env, &cwd, &entry.text());
+                if name.is_empty() {
+                    err.set_text("type a name for the folder");
+                    err.set_visible(true);
+                    entry.grab_focus();
+                    return;
+                }
+                err.set_visible(false);
+                entry.set_text("");
+                // a folder that's already listed: tick it there
+                let mut child = checks.first_child();
+                while let Some(w) = child {
+                    if let Some(c) = w.downcast_ref::<gtk::CheckButton>() {
+                        if c.label().as_deref() == Some(name.as_str()) {
+                            c.set_active(true);
+                            return;
+                        }
+                    }
+                    child = w.next_sibling();
+                }
+                folders::add_project_folder(&app.env, &mut Fs::new(Mode::Real), &cwd, &name);
+                if let Some(l) = checks.first_child().filter(|w| w.is::<gtk::Label>()) {
+                    checks.remove(&l); // "No folders yet"
+                }
+                let c = add_check(&name, false);
+                c.set_active(true); // files it, through the tick's own handler
+            })
+        };
+        let c = create.clone();
+        entry.connect_activate(move |_| c());
+        let c = create.clone();
+        add.connect_clicked(move |_| c());
+        *self.name_pop.borrow_mut() = Some((entry.clone(), create.clone())); // for the `name:` picture key
+        let p = pop.clone();
+        done.connect_clicked(move |_| p.popdown());
+        let (weak, id) = (Rc::downgrade(self), py_str(pget(h, "id")));
+        pop.connect_closed(move |p| {
+            let p = p.clone();
+            let (weak, id) = (weak.clone(), id.clone());
+            glib::idle_add_local_once(move || {
+                p.unparent();
+                if let Some(app) = weak.upgrade() {
+                    *app.name_pop.borrow_mut() = None;
+                    *app.pending_key.borrow_mut() = Some(format!("Handoff:{id}"));
+                    app.own_change.set(true);
+                    app.sync();
+                    app.focus_list();
+                    app.store.poke();
+                }
+            });
+        });
+        pop.popup();
+        match checks.first_child() {
+            Some(first) if first.is::<gtk::CheckButton>() => {
+                first.grab_focus();
+            }
+            _ => {
+                entry.grab_focus();
+            }
+        }
+    }
+
+    /// F2 or Rename folder…: renames it in its project and in every handoff filed under it.
+    /// A name that's already a folder merges the two.
+    fn rename_folder(self: &Rc<Self>, item: &Item) {
+        let (cwd, old) = (sval(&item.obj, "cwd").to_owned(), sval(&item.obj, "name").to_owned());
+        let at = self.row_rect(&item.key);
+        let was_open = self.node_open(item);
+        let title = format!("Rename folder '{}'", old.chars().take(24).collect::<String>());
+        self.ask_name(
+            &title,
+            &old.clone(),
+            false,
+            "Rename",
+            at,
+            Rc::new(move |app, typed| {
+                let new = folders::folder_name(&app.env, &cwd, typed);
+                if new.is_empty() {
+                    return Err("type a name for the folder".into());
+                }
+                if new == old {
+                    return Ok(());
+                }
+                let merged = folders::project_folders(&app.env, &cwd).contains(&new);
+                folders::rename_project_folder(&app.env, &mut Fs::new(Mode::Real), &cwd, &old, &new);
+                for h in app.snap.borrow_mut().handoffs.iter_mut().filter(|h| sval(h, "cwd") == cwd) {
+                    let names: Vec<String> = folders::handoff_folders(h).into_iter().map(|n| if n == old { new.clone() } else { n }).collect();
+                    folders::set_handoff_folders(h, &names);
+                }
+                let new_id = folders::folder_id(&cwd, &new);
+                {
+                    let mut open = app.tree_open.borrow_mut();
+                    open.remove(&("folder".to_owned(), folders::folder_id(&cwd, &old)));
+                    if was_open {
+                        open.insert(("folder".into(), new_id.clone()));
+                    }
+                }
+                app.save_tree();
+                app.own_change.set(true);
+                *app.pending_key.borrow_mut() = Some(format!("Folder:{new_id}"));
+                app.sync();
+                app.focus_list();
+                app.say(&if merged { format!("merged into {new}") } else { format!("renamed to {new}") }, "info");
+                app.store.poke();
+                Ok(())
+            }),
+        );
     }
 
     fn view_handoff(self: &Rc<Self>, h: &Value) {
@@ -4407,7 +4854,11 @@ fn help_page() -> (gtk::Widget, gtk::Widget) {
         ("#", "HANDOFFS"),
         ("Enter / 2× click", "start it"),
         ("v", "read the prompt"),
+        ("m", "its folders (several ok)"),
         ("x", "discard (u undoes)"),
+        ("Enter / click", "on a project or folder: open / close"),
+        ("←", "close it, or step up to its folder"),
+        ("F2", "on a folder: rename it"),
         ("#", "PLANE"),
         ("n", "new session"),
         ("super ←→", "sidebar ⇄ session"),

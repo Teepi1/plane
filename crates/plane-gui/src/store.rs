@@ -66,6 +66,7 @@ fn changes_signature(env: &Env) -> Vec<(String, std::time::SystemTime)> {
     files.extend(glob_json(&env.live()));
     files.extend(glob_json(&env.handoffs()));
     files.push(env.usage());
+    files.push(env.folders_file()); // a folder renamed in the kitty sidebar
     let mut sig: Vec<_> = files
         .into_iter()
         .filter_map(|f| f.metadata().and_then(|m| m.modified()).ok().map(|t| (f.to_string_lossy().into_owned(), t)))
