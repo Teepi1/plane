@@ -1235,6 +1235,8 @@ impl App {
     }
 
     fn tick(self: &Rc<Self>) {
+        // nobody looking (hidden, or another window has focus, as when minimized): the store slows its backstop; looking again refreshes at once
+        self.store.set_seen(self.window.is_visible() && self.window.is_active());
         if let Some(fresh) = self.store.take() {
             {
                 let mut snap = self.snap.borrow_mut();
