@@ -8,6 +8,7 @@
 pub mod actions;
 pub mod control;
 pub mod files;
+pub mod folders;
 pub mod hypr;
 pub mod ledger;
 pub mod snapshot;

@@ -81,6 +81,11 @@ list.sessions row.head-row .chevron { color: @plane_dim; min-width: 12px; }
 list.sessions row.head-row.warn .title, list.sessions row.head-row.warn .chevron { color: @plane_warn; }
 list.sessions row.head-row .count { font-size: 0.85em; font-weight: bold; color: @plane_fg; background: alpha(@plane_dim, 0.22); border-radius: 9px; padding: 0 7px; min-width: 8px; }
 list.sessions row.head-row .caption { color: @plane_dim; font-size: 0.9em; }
+/* the handoff tree: projects and folders open and close; a handoff's other folders, dim */
+list.sessions row.tree-node .chevron { min-width: 12px; }
+list.sessions row.tree-project .name { font-weight: bold; }
+list.sessions row.tree-node .count { font-size: 0.8em; color: @plane_dim; }
+list.sessions row .also { color: @plane_dim; font-size: 0.85em; }
 /* the header counts, as buttons */
 button.count-btn { padding: 1px 8px; min-height: 20px; border-radius: 10px; font-weight: bold; font-size: 0.85em; background: transparent; border: 1px solid transparent; box-shadow: none; }
 button.count-btn.needs { background: @plane_warn; color: @plane_bg; }

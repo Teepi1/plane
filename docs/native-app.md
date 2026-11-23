@@ -114,6 +114,22 @@ To act on a row:
 - Right-click any row for everything you can do with it.
 - Use **+ New** to start a session.
 
+**Handoff folders.** Handoffs are listed as a tree, as in the kitty sidebar: each
+project, then its folders, then its handoffs that aren't in a folder. A folder is listed
+only while it holds a handoff.
+- Click a project or folder, or press Enter or →, to open it. ← closes it, or steps up
+  from a handoff to its folder. Which rows are open is remembered in
+  `~/.cache/plane/tree.json`, which both versions share.
+- `m` (or right-click › *Folders…*) on a handoff lists its project's folders as
+  checkboxes. Each tick saves at once, and a handoff can be in several folders. It's
+  still one handoff: starting or discarding it takes it out of all of them. A handoff in
+  several folders names the others, dimmed, at the end of its row. *New folder* makes a
+  folder and puts the handoff in it.
+- `F2` (or right-click › *Rename folder…*) on a folder renames it, in every handoff filed
+  there too. Renaming it to the name of another folder merges the two.
+- The folders are the kitty version's `~/.local/share/plane/folders.json`, and
+  `plane handoff add --folder F` files a new handoff as it's queued.
+
 ### Files
 
 Click **Files** (or press `f`). It shows the files of the session you last clicked, or of
