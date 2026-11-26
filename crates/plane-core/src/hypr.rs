@@ -57,6 +57,21 @@ pub fn ppid_of(pid: i64) -> i64 {
         .unwrap_or(0)
 }
 
+/// A session started from the phone app's Terminal tab: an ancestor is `plane web`.
+/// It has no desktop window to switch to.
+pub fn in_phone_terminal(pid: i64) -> bool {
+    let mut p = pid;
+    while p > 1 {
+        let cmd = std::fs::read(format!("/proc/{p}/cmdline")).unwrap_or_default();
+        let args: Vec<&[u8]> = cmd.split(|b| *b == 0).collect();
+        if args.iter().any(|a| a.ends_with(b"plane")) && args.iter().any(|a| *a == b"web") {
+            return true;
+        }
+        p = ppid_of(p);
+    }
+    false
+}
+
 /// Focus the window a process runs in (a session in its own terminal window): the nearest
 /// ancestor that Hyprland knows as a window. False when there's none.
 pub fn focus_process_window(pid: i64) -> bool {

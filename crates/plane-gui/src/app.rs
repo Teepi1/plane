@@ -2438,7 +2438,9 @@ impl App {
     fn attach(self: &Rc<Self>, s: &Value) {
         if !truthy(pget(s, "bg")) {
             let pid = pget(s, "pid").as_i64().unwrap_or(0);
-            if !hypr::available() {
+            if hypr::in_phone_terminal(pid) {
+                self.say("it's running in the phone app's Terminal tab", "info");
+            } else if !hypr::available() {
                 self.say("it's in another window (switching to it needs Hyprland)", "info");
             } else if !hypr::focus_process_window(pid) {
                 self.say("couldn't find that session's window", "bad");
