@@ -73,6 +73,19 @@ def ppid_of(pid):
         return 0
 
 
+def in_phone_terminal(pid):
+    """Started from the phone app's Terminal tab (an ancestor is `plane web`): no desktop window."""
+    while pid > 1:
+        try:
+            args = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        except OSError:
+            return False
+        if b"web" in args and any(a.endswith(b"plane") for a in args):
+            return True
+        pid = ppid_of(pid)
+    return False
+
+
 def hypr(*args):
     """Hyprland is optional: without it, window focusing outside Plane is skipped."""
     try:
@@ -1487,7 +1500,9 @@ class Sidebar:
             pid, pids = s["pid"], {c.get("pid") for c in hypr_clients()}
             while pid > 1 and pid not in pids:
                 pid = ppid_of(pid)
-            if pid > 1:
+            if in_phone_terminal(s["pid"]):
+                self.flash("it's running in the phone app's Terminal tab")
+            elif pid > 1:
                 hypr_focus(f"pid:{pid}")
             elif not shutil.which("hyprctl"):
                 self.flash("it's in another window (switching to it needs Hyprland)")
